@@ -547,6 +547,12 @@ function main(): void {
       row.addEventListener("click", () => acceptSuggestion(i));
       suggestEl.appendChild(row);
     }
+
+    const active = suggestEl.querySelector(".suggestItem.active") as HTMLElement | null;
+    if (active) {
+      // Keep the active item visible when navigating with keyboard.
+      active.scrollIntoView({ block: "nearest" });
+    }
   }
 
   function currentPrefixedToken(
