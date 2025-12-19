@@ -120,6 +120,21 @@ function main(): void {
   const tabsEl = mustGet("tabs");
   const suggestEl = mustGet("suggest");
 
+  // Chat auto-scroll:
+  // - While the user is near the bottom, new content keeps the log pinned to the bottom.
+  // - Once the user scrolls up, stop forcing scroll (free mode) until they scroll back near bottom.
+  let stickLogToBottom = true;
+  const isLogNearBottom = (): boolean => {
+    const slackPx = 40;
+    return (
+      logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= slackPx
+    );
+  };
+  logEl.addEventListener("scroll", () => {
+    stickLogToBottom = isLogNearBottom();
+  });
+
+
   // Assign a short session number (runtime-only) to avoid showing long thread-id-like suffixes in tabs.
   // This resets on extension host reload / webview reload (no storage).
   const sessionSeqById = new Map<string, number>();
@@ -740,6 +755,7 @@ function main(): void {
 
   function render(s: ChatViewState): void {
     state = s;
+    const shouldAutoScroll = stickLogToBottom && isLogNearBottom();
     titleEl.textContent = s.activeSession
       ? getSessionDisplayTitle(s.activeSession).label
       : "Codex UI（セッション未選択）";
@@ -776,6 +792,8 @@ function main(): void {
       domSessionId = s.activeSession ? s.activeSession.id : null;
       blockElByKey.clear();
       logEl.replaceChildren();
+      // New session / fresh log should start pinned.
+      stickLogToBottom = true;
     }
 
     approvalsEl.innerHTML = "";
@@ -1192,9 +1210,13 @@ function main(): void {
     }
 
     updateSuggestions();
+
+    if (shouldAutoScroll) {
+      logEl.scrollTop = logEl.scrollHeight;
+    }
   }
 
-  function sendCurrentInput(): void {
+function sendCurrentInput(): void {
     if (!state.activeSession) return;
     if (state.sending) return;
     const text = inputEl.value;
