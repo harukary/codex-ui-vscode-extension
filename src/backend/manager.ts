@@ -62,11 +62,7 @@ export class BackendManager implements vscode.Disposable {
     if (existing) {
       this.output.appendLine(
         `Backend already running for ${folder.uri.fsPath}`,
-      );
-      void vscode.window.showInformationMessage(
-        "Backend は既に起動しています。",
-      );
-      return;
+      );      return;
     }
 
     const cfg = vscode.workspace.getConfiguration("codexMine", folder.uri);
