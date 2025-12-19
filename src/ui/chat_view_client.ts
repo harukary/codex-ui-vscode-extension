@@ -144,7 +144,7 @@ function main(): void {
   const getSessionDisplayTitle = (sess: Session): { label: string; tooltip: string } => {
     const title = String(sess.title || "").trim();
     const m = title.match(defaultTitleRe);
-    if (!m) return { label: title || "（無題）", tooltip: title };
+    if (!m) return { label: title || "Untitled", tooltip: title };
 
     const base = (m[1] || "").trim();
     const seq = sessionSeqById.get(sess.id) ?? (() => {
@@ -233,29 +233,29 @@ function main(): void {
     {
       insert: "/new ",
       label: "/new",
-      detail: "新しいセッション",
+      detail: "New session",
       kind: "slash",
     },
     {
       insert: "/diff ",
       label: "/diff",
-      detail: "Latest Diff を開く",
+      detail: "Open Latest Diff",
       kind: "slash",
     },
     {
       insert: "/rename ",
       label: "/rename",
-      detail: "セッション名変更",
+      detail: "Rename session",
       kind: "slash",
     },
-    { insert: "/help ", label: "/help", detail: "ヘルプ表示", kind: "slash" },
+    { insert: "/help ", label: "/help", detail: "Show help", kind: "slash" },
   ];
 
   const atSuggestions: SuggestItem[] = [
     {
       insert: "@selection ",
       label: "@selection",
-      detail: "選択範囲を添付",
+      detail: "Insert selection reference",
       kind: "at",
     },
   ];
@@ -685,7 +685,7 @@ function main(): void {
           items = items.concat([
             {
               insert: "",
-              label: "（indexing…）",
+              label: "(indexing…)",
               detail: "",
               kind: "file",
             },
@@ -736,7 +736,7 @@ function main(): void {
   function acceptSuggestion(idx: number): void {
     const it = suggestItems[idx];
     if (!it || !activeReplace) return;
-    if (it.insert === "" && it.label === "（indexing…）") return;
+    if (it.insert === "" && it.label === "(indexing…)") return;
 
     const text = inputEl.value;
     const next =
@@ -758,7 +758,7 @@ function main(): void {
     const shouldAutoScroll = stickLogToBottom && isLogNearBottom();
     titleEl.textContent = s.activeSession
       ? getSessionDisplayTitle(s.activeSession).label
-      : "Codex UI（セッション未選択）";
+      : "Codex UI (no session selected)";
     const st = String(s.statusText || "").trim();
     statusTextEl.textContent = st;
     statusTextEl.style.display = st ? "" : "none";
@@ -915,8 +915,8 @@ function main(): void {
 
       const div = ensureDiv("noSession", "msg system");
       const pre = ensurePre(div, "body");
-      if (pre.textContent !== "Sessions からセッションを選択してください。") {
-        pre.textContent = "Sessions からセッションを選択してください。";
+      if (pre.textContent !== "Select a session in Sessions.") {
+        pre.textContent = "Select a session in Sessions.";
       }
       return;
     }
@@ -1436,7 +1436,7 @@ function sendCurrentInput(): void {
   setTimeout(() => {
     if (!receivedState) {
       statusTextEl.textContent =
-        "state の受信待ち…（Extension Host のログを確認してください）";
+        "Waiting for state… (check Extension Host logs)";
       statusTextEl.style.display = "";
     }
   }, 1000);

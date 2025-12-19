@@ -20,7 +20,7 @@ function main() {
 
   if (!ok) {
     console.error(
-      "[check-generated] protocol 生成物が見つかりません。`pnpm run regen:protocol -- --codex-bin ../codex-rs/target/debug/codex` を実行してください。",
+      "[check-generated] Generated protocol files are missing. Run `pnpm run regen:protocol` (optionally: `pnpm run regen:protocol -- --codex-bin <path-to-codex>` or set `CODEX_BIN`).",
     );
     process.exit(1);
   }

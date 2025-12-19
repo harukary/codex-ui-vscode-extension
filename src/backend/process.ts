@@ -178,8 +178,8 @@ export class BackendProcess implements vscode.Disposable {
     }
 
     const choice = await vscode.window.showWarningMessage(
-      `Codex が承認を要求しています: ${req.method}`,
-      { modal: true, detail: "内容を確認して許可/拒否を選んでください。" },
+      `Codex is requesting approval: `,
+      { modal: true, detail: "Review the request and choose Accept or Decline." },
       "Accept",
       "Accept (For Session)",
       "Decline",

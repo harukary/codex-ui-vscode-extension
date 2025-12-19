@@ -25,7 +25,7 @@ export class DiffDocumentProvider
 
   public provideTextDocumentContent(uri: vscode.Uri): string {
     const state = this.diffs.get(uri.toString());
-    if (!state) return "diff がまだありません。";
+    if (!state) return "No diff available yet.";
     return state.diff;
   }
 }

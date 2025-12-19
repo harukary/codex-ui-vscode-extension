@@ -170,7 +170,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await vscode.env.openExternal(vscode.Uri.parse(url));
       } catch (err) {
         void vscode.window.showErrorMessage(
-          `URL を開けませんでした: ${url} (${String(err)})`,
+          `Failed to open URL: ${url} (${String(err)})`,
         );
       }
       return;
@@ -211,7 +211,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else {
         if (!active) {
           void vscode.window.showErrorMessage(
-            `ファイルを開けませんでした（アクティブなセッションがありません）: ${filePath}`,
+            `Cannot open file (no active session): ${filePath}`,
           );
           return;
         }
@@ -223,7 +223,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           : rootFsPath + path.sep;
         if (!(resolved === rootFsPath || resolved.startsWith(prefix))) {
           void vscode.window.showErrorMessage(
-            `ワークスペース外のパスは開けません: ${filePath}`,
+            `Cannot open paths outside the workspace: ${filePath}`,
           );
           return;
         }
@@ -245,7 +245,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       } catch (err) {
         void vscode.window.showErrorMessage(
-          `ファイルを開けませんでした: ${uri.fsPath} (${String(err)})`,
+          `Failed to open file: ${uri.fsPath} (${String(err)})`,
         );
       }
       return;
@@ -460,7 +460,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="approvals" class="approvals" style="display:none"></div>
     <div id="log" class="log"></div>
     <div class="composer">
-      <textarea id="input" rows="2" placeholder="メッセージを入力（Enterで送信 / Shift+Enterで改行）"></textarea>
+      <textarea id="input" rows="2" placeholder="Type a message (Enter to send / Shift+Enter for newline)"></textarea>
       <button id="send">Send</button>
       <div id="suggest" class="suggest"></div>
     </div>

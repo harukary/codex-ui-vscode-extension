@@ -55,7 +55,7 @@ export class SessionStore {
         description: s.threadId,
         session: s,
       })),
-      { title: "Codex UI: セッションを選択" },
+      { title: "Codex UI: Select a session" },
     );
     return picked?.session ?? null;
   }

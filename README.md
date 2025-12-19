@@ -1,44 +1,68 @@
-# Codex UI VS Code Extension
+# Codex UI (VS Code Extension)
 
-Codex CLI（`codex app-server`）を VS Code の右側ペインで使うための拡張です。
+Use **Codex CLI** (via `codex app-server`) inside VS Code.
 
-## 前提（Codex CLI）
+This extension:
+- Starts / connects to the Codex CLI app-server per workspace folder
+- Manages sessions (create, switch, rename, hide)
+- Shows chat output including tool events (commands, file changes, diffs, approvals)
 
-この拡張は **Codex CLI 本体を同梱しません**。ローカルに Codex CLI をインストールしてください。
+## Prerequisites (Codex CLI)
 
-- npm: `npm i -g @openai/codex`
-- Homebrew: `brew install --cask codex`
+This extension **does not bundle Codex CLI**.
 
-## 使い方（ユーザー向け）
+- Install Codex CLI separately and make sure `codex` is available in your `PATH`.
+- Or set the full path via settings (`codexMine.backend.command`).
 
-1. Activity Bar の `Codex UI` を開く
-2. `Chat` で `New` を押してセッション作成
-3. 下の入力欄から送信（Enter=送信 / Shift+Enter=改行）
-4. `Sessions` からセッションを選択して再開/切り替え
+## Usage
 
-### 設定
+1. Open the Activity Bar view: **Codex UI**
+2. Click **New** to create a session
+3. Type in the input box (Enter = send, Shift+Enter = newline)
+4. Switch sessions from **Sessions** or the chat tab bar
 
-- `codexMine.backend.command`（default: `codex`）
-  - PATH に `codex` がいない場合、フルパスを指定できます
-- `codexMine.backend.args`（default: `["app-server"]`）
+### Settings
 
-## 開発者向け（この repo で開発する）
+- `codexMine.backend.command`
+  - Default: `codex`
+  - If `codex` is not in your `PATH`, set an absolute path.
+- `codexMine.backend.args`
+  - Default: `["app-server"]`
 
-1. 依存インストール
-   - `pnpm install`
-2. ビルド
-   - `pnpm run compile`
-3. VS Code で `vscode-extension/` を開き、`Run Extension (Codex UI)` を選んで F5
+## Development
 
-## 公開（Marketplace / Maintainership）
+1. Install dependencies
 
-この repo は単独の VS Code 拡張リポジトリです。
+   ```bash
+   pnpm install
+   ```
 
-1. `package.json` の `publisher` を自分の Publisher ID に合わせて更新
-2. バージョン更新（`version`）
-3. `pnpm run compile`
-4. `npx @vscode/vsce package`（`.vsix` を作成。`pnpm run vsix:package` でも可）
-5. `npx @vscode/vsce publish`（Publisher でログイン済みであること）
+2. Build
 
-補足:
-- 仕様（現状実装の言語化）は `docs/spec.md` を参照
+   ```bash
+   pnpm run compile
+   ```
+
+3. Run in VS Code
+
+   - Open this repo in VS Code
+   - Run the debug configuration: **Run Extension (Codex UI)**
+
+## Publishing (VS Code Marketplace)
+
+1. Update `package.json` (`version`)
+2. Package
+
+   ```bash
+   pnpm run vsix:package
+   ```
+
+3. Publish
+
+   ```bash
+   npx @vscode/vsce publish
+   ```
+
+## Specification
+
+See `docs/spec.md`.

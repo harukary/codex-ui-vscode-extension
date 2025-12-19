@@ -132,7 +132,7 @@ export function activate(context: vscode.ExtensionContext): void {
         ? sessions.getById(activeSessionId)
         : null;
       if (!session) {
-        void vscode.window.showErrorMessage("セッションが選択されていません。");
+        void vscode.window.showErrorMessage("No session selected.");
         return;
       }
 
@@ -173,7 +173,7 @@ export function activate(context: vscode.ExtensionContext): void {
         ? sessions.getById(activeSessionId)
         : null;
       if (!session) {
-        void vscode.window.showErrorMessage("セッションが選択されていません。");
+        void vscode.window.showErrorMessage("No session selected.");
         return;
       }
       await vscode.commands.executeCommand("codexMine.openLatestDiff", {
@@ -222,7 +222,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!sessions) throw new Error("sessions is not initialized");
         const session = parseSessionArg(args, sessions);
         if (!session) {
-          void vscode.window.showErrorMessage("sessionId が見つかりません。");
+          void vscode.window.showErrorMessage("Session not found.");
           return;
         }
 
@@ -256,7 +256,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!sessions) throw new Error("sessions is not initialized");
         const session = parseSessionArg(args, sessions);
         if (!session) {
-          void vscode.window.showErrorMessage("sessionId が見つかりません。");
+          void vscode.window.showErrorMessage("Session not found.");
           return;
         }
 
@@ -289,7 +289,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const session = parseSessionArg(args, sessions);
         if (!session) {
-          void vscode.window.showErrorMessage("sessionId が見つかりません。");
+          void vscode.window.showErrorMessage("Session not found.");
           return;
         }
 
@@ -353,7 +353,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const session = parseSessionArg(args, sessions);
         if (!session) {
-          void vscode.window.showErrorMessage("sessionId が見つかりません。");
+          void vscode.window.showErrorMessage("Session not found.");
           return;
         }
 
@@ -377,13 +377,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const session = parseSessionArg(args, sessions);
         if (!session) {
-          void vscode.window.showErrorMessage("sessionId が見つかりません。");
+          void vscode.window.showErrorMessage("Session not found.");
           return;
         }
 
         const diff = backendManager.latestDiff(session);
         if (!diff) {
-          void vscode.window.showInformationMessage("まだ diff がありません。");
+          void vscode.window.showInformationMessage("No diff available yet.");
           return;
         }
 
@@ -405,7 +405,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const session = parseSessionArg(args, sessions);
         if (!session) {
-          void vscode.window.showErrorMessage("sessionId が見つかりません。");
+          void vscode.window.showErrorMessage("Session not found.");
           return;
         }
 
@@ -433,17 +433,17 @@ export function activate(context: vscode.ExtensionContext): void {
           (activeSessionId ? sessions.getById(activeSessionId) : null);
         if (!active) {
           void vscode.window.showErrorMessage(
-            "セッションが選択されていません。",
+            "No session selected.",
           );
           return;
         }
 
         const next = await vscode.window.showInputBox({
-          title: "Codex UI: セッション名を変更",
+          title: "Codex UI: Rename session",
           value: active.title,
-          prompt: "上部タブ名/一覧に表示されるタイトルを変更します。",
+          prompt: "Change the title shown in the chat tabs and Sessions list.",
           validateInput: (v) =>
-            v.trim() ? null : "空のタイトルは指定できません。",
+            v.trim() ? null : "Title cannot be empty.",
         });
         if (next === undefined) return;
 
@@ -502,7 +502,7 @@ async function pickWorkspaceFolder(): Promise<vscode.WorkspaceFolder | null> {
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 0) {
     void vscode.window.showErrorMessage(
-      "ワークスペースフォルダが見つかりません。フォルダを開いてから再実行してください。",
+      "No workspace folder found. Open a folder and try again.",
     );
     return null;
   }
@@ -514,7 +514,7 @@ async function pickWorkspaceFolder(): Promise<vscode.WorkspaceFolder | null> {
       description: f.uri.fsPath,
       folder: f,
     })),
-    { title: "Codex UI: 対象フォルダを選択" },
+    { title: "Codex UI: Select a workspace folder" },
   );
   return picked?.folder ?? null;
 }
@@ -590,14 +590,14 @@ async function handleSlashCommand(
       title: "Help",
       text: [
         "Slash commands:",
-        "- /new: 新しいセッション",
-        "- /diff: Latest Diff を開く",
-        "- /rename <title>: セッション名変更",
+        "- /new: New session",
+        "- /diff: Open Latest Diff",
+        "- /rename <title>: Rename session",
         "",
         "Mentions:",
-        "- @selection: 選択中ファイルのパス + 行範囲を挿入",
-        "- @relative/path: ファイルパスを送信（内容は展開しない）",
-        "- @file:relative/path: (互換) @relative/path と同じ",
+        "- @selection: Insert selected file path + line range",
+        "- @relative/path: Send file path (does not inline contents)",
+        "- @file:relative/path: (legacy) Same as @relative/path",
       ].join("\n"),
     });
     chatView?.refresh();
@@ -605,7 +605,7 @@ async function handleSlashCommand(
   }
 
   void vscode.window.showErrorMessage(
-    `不明なコマンドです: /${cmd}（/help を参照）`,
+    `Unknown command: / (see /help)`,
   );
   return true;
 }
@@ -627,7 +627,7 @@ async function expandMentions(
     if (!selected.trim()) {
       return {
         ok: false,
-        error: "@selection が空です（選択範囲を作ってください）。",
+        error: "@selection is empty (select a range first).",
       };
     }
 
@@ -636,7 +636,7 @@ async function expandMentions(
       return {
         ok: false,
         error:
-          "ワークスペースフォルダが見つからないため @selection を展開できません。",
+          "Cannot expand @selection because no workspace folder is available.",
       };
     }
 
@@ -645,7 +645,7 @@ async function expandMentions(
       return {
         ok: false,
         error:
-          "アクティブなエディタが見つからないため @selection を展開できません。",
+          "Cannot expand @selection because there is no active editor.",
       };
     }
 
@@ -656,7 +656,7 @@ async function expandMentions(
     if (!relPath || relPath.startsWith("../") || path.isAbsolute(relPath)) {
       return {
         ok: false,
-        error: "@selection のファイルがワークスペース外です。",
+        error: " file is outside the workspace.",
       };
     }
 
@@ -683,7 +683,7 @@ async function expandMentions(
   if (!folder) {
     return {
       ok: false,
-      error: "ワークスペースフォルダが見つからないため @ を検証できません。",
+      error: "Cannot validate @ mentions because no workspace folder is available.",
     };
   }
 
@@ -705,7 +705,7 @@ async function expandMentions(
     if (rel.startsWith("/") || rel.includes(":")) {
       return {
         ok: false,
-        error: `@ は相対パスのみ対応です: ${rel}`,
+        error: `@ mentions only support relative paths: ${rel}`,
       };
     }
 
@@ -715,13 +715,13 @@ async function expandMentions(
       if ((stat.type & vscode.FileType.File) === 0) {
         return {
           ok: false,
-          error: `@ はファイルのみ対応です: ${rel}`,
+          error: `@ mentions only support files: ${rel}`,
         };
       }
     } catch (err) {
       return {
         ok: false,
-        error: `@ の参照に失敗: ${rel} (${String(err)})`,
+        error: `Failed to resolve @ mention: ${rel} (${String(err)})`,
       };
     }
   }
@@ -1438,25 +1438,22 @@ function applyGlobalNotification(n: AnyServerNotification): void {
       }
 
       const lines: string[] = [];
-      if (cwd) lines.push(`cwd: \`${cwd}\``);
-      if (cliVersion) lines.push(`cliVersion: \`${cliVersion}\``);
-      if (originUrl) lines.push(`originUrl: ${originUrl}`);
+      if (cwd) lines.push(`Working directory: \`${cwd}\``);
+      if (cliVersion) lines.push(`CLI version: \`${cliVersion}\``);
+      if (originUrl) lines.push(`Git origin: ${originUrl}`);
 
       // De-dupe: `New` creates a new thread and emits `thread/started` again, but for the same cwd we only
       // want one "Thread started" notice.
       const globalId = cwd
-        ? `global:threadStarted:cwd:`
-        : `global:threadStarted:thread:`;
-      if (cwd) {
-        removeGlobalWhere(
-          (b) =>
-            b.id.startsWith("global:threadStarted:") &&
-            b.id !== globalId &&
-            b.type === "info" &&
-            b.title === "Thread started" &&
-            b.text.includes(`cwd: \`\``),
-        );
-      }
+        ? `global:threadStarted:cwd:${cwd}`
+        : `global:threadStarted:thread:${id}`;
+      removeGlobalWhere(
+        (b) =>
+          b.id.startsWith("global:threadStarted:") &&
+          b.id !== globalId &&
+          b.type === "info" &&
+          b.title === "Thread started",
+      );
       upsertGlobal({
         id: globalId,
         type: "info",
