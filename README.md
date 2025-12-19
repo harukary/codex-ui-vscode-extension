@@ -3,6 +3,7 @@
 Use **Codex CLI** (via `codex app-server`) inside VS Code.
 
 This extension:
+
 - Starts / connects to the Codex CLI app-server per workspace folder
 - Manages sessions (create, switch, rename, hide)
 - Shows chat output including tool events (commands, file changes, diffs, approvals)
@@ -15,6 +16,8 @@ This extension **does not bundle Codex CLI**.
 - Or set the full path via settings (`codexMine.backend.command`).
 
 ## Usage
+
+![screenshot](assets/image.png)
 
 1. Open the Activity Bar view: **Codex UI**
 2. Click **New** to create a session
@@ -44,7 +47,6 @@ This extension **does not bundle Codex CLI**.
    ```
 
 3. Run in VS Code
-
    - Open this repo in VS Code
    - Run the debug configuration: **Run Extension (Codex UI)**
 

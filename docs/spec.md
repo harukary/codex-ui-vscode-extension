@@ -46,11 +46,13 @@ The extension contributes a **Codex UI** activity bar container with:
 
 - There are two distinct behaviors:
 
-1) **Hide Tab** (Chat tab bar)
+1. **Hide Tab** (Chat tab bar)
+
 - Hides the session tab from the Chat tab bar.
 - The session remains visible in Sessions and can be re-opened.
 
-2) **Close Session (Hide from Sessions)** (Sessions view)
+2. **Close Session (Hide from Sessions)** (Sessions view)
+
 - Hides the session from the Sessions list.
 - The underlying Codex CLI log files are NOT deleted.
 
