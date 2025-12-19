@@ -1395,6 +1395,21 @@ function formatParamsForDisplay(params: unknown): string {
   return `${json.slice(0, limit)}\n...(truncated ${json.length - limit} chars)`;
 }
 
+function removeGlobalWhere(pred: (b: ChatBlock) => boolean): void {
+  const next: ChatBlock[] = [];
+  for (const b of globalRuntime.blocks) {
+    if (!pred(b)) next.push(b);
+  }
+  globalRuntime.blocks.length = 0;
+  globalRuntime.blocks.push(...next);
+  globalRuntime.blockIndexById.clear();
+  for (let i = 0; i < next.length; i++) {
+    const b = next[i];
+    if (!b) continue;
+    globalRuntime.blockIndexById.set(b.id, i);
+  }
+}
+
 function applyGlobalNotification(n: AnyServerNotification): void {
   switch (n.method) {
     case "thread/started": {
@@ -1426,8 +1441,24 @@ function applyGlobalNotification(n: AnyServerNotification): void {
       if (cwd) lines.push(`cwd: \`${cwd}\``);
       if (cliVersion) lines.push(`cliVersion: \`${cliVersion}\``);
       if (originUrl) lines.push(`originUrl: ${originUrl}`);
+
+      // De-dupe: `New` creates a new thread and emits `thread/started` again, but for the same cwd we only
+      // want one "Thread started" notice.
+      const globalId = cwd
+        ? `global:threadStarted:cwd:`
+        : `global:threadStarted:thread:`;
+      if (cwd) {
+        removeGlobalWhere(
+          (b) =>
+            b.id.startsWith("global:threadStarted:") &&
+            b.id !== globalId &&
+            b.type === "info" &&
+            b.title === "Thread started" &&
+            b.text.includes(`cwd: \`\``),
+        );
+      }
       upsertGlobal({
-        id: `global:threadStarted:${id}`,
+        id: globalId,
         type: "info",
         title: "Thread started",
         text: lines.join("\n") || "(no details)",
