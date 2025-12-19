@@ -92,7 +92,6 @@ export class BackendManager implements vscode.Disposable {
     proc.onNotification = (n) => this.onServerNotification(key, n);
     proc.onApprovalRequest = async (req) => this.handleApprovalRequest(req);
 
-    void vscode.window.showInformationMessage("Backend を起動しました。");
   }
 
   public async newSession(folder: vscode.WorkspaceFolder): Promise<Session> {
