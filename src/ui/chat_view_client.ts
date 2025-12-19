@@ -1217,7 +1217,11 @@ function main(): void {
 
   inputEl.addEventListener("input", () => updateSuggestions());
   inputEl.addEventListener("click", () => updateSuggestions());
-  inputEl.addEventListener("keyup", () => updateSuggestions());
+  inputEl.addEventListener("keyup", (e) => {
+    const key = (e as KeyboardEvent).key;
+    if ((key === "ArrowDown" || key === "ArrowUp") && suggestItems.length > 0) return;
+    updateSuggestions();
+  });
   inputEl.addEventListener("compositionstart", () => {
     isComposing = true;
   });
