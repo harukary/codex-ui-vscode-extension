@@ -81,6 +81,12 @@ type ChatViewState = {
     detail: string;
     canAcceptForSession: boolean;
   }>;
+  customPrompts?: Array<{
+    name: string;
+    description: string | null;
+    argumentHint: string | null;
+    source: string;
+  }>;
 };
 
 type SuggestItem = {
@@ -229,7 +235,8 @@ function main(): void {
     vscode.setState({ detailsState });
   }
 
-  const slashSuggestions: SuggestItem[] = [
+  const baseSlashSuggestions: SuggestItem[] = [];
+  const uiSlashSuggestions: SuggestItem[] = [
     {
       insert: "/new ",
       label: "/new",
@@ -250,6 +257,29 @@ function main(): void {
     },
     { insert: "/help ", label: "/help", detail: "Show help", kind: "slash" },
   ];
+
+  function buildSlashSuggestions(): SuggestItem[] {
+    const reserved = new Set(
+      [...baseSlashSuggestions, ...uiSlashSuggestions].map((s) =>
+        s.label.replace(/^\//, ""),
+      ),
+    );
+    const custom = (state.customPrompts ?? [])
+      .map((p) => {
+        const name = String(p.name || "").trim();
+        if (!name || reserved.has(name)) return null;
+        const hint = p.argumentHint ? " " + p.argumentHint : "";
+        const detail = p.description || p.argumentHint || "Custom prompt";
+        return {
+          insert: "/prompts:" + name + hint + " ",
+          label: "/prompts:" + name,
+          detail,
+          kind: "slash",
+        } as SuggestItem;
+      })
+      .filter(Boolean) as SuggestItem[];
+    return [...baseSlashSuggestions, ...custom, ...uiSlashSuggestions];
+  }
 
   const atSuggestions: SuggestItem[] = [
     {
@@ -608,7 +638,12 @@ function main(): void {
     const scored = items
       .map((it) => {
         const label = it.label.toLowerCase();
-        const idx = label.indexOf(q);
+        const altLabel = label.startsWith("/prompts:")
+          ? ("/" + label.slice("/prompts:".length))
+          : label;
+        const useAlt = !q.includes("prompts:");
+        const hay = useAlt ? altLabel : label;
+        const idx = hay.indexOf(q);
         const score = idx === 0 ? 0 : idx > 0 ? 1 : 2;
         return { it, score, idx };
       })
@@ -621,12 +656,37 @@ function main(): void {
     return scored.map((s) => s.it);
   }
 
+  function slashMatches(label: string, query: string): boolean {
+    const raw = label.toLowerCase();
+    const alt = raw.startsWith("/prompts:")
+      ? "/" + raw.slice("/prompts:".length)
+      : raw;
+    return raw.startsWith("/" + query) || alt.startsWith("/" + query);
+  }
+
+  function isSameSuggestList(a: SuggestItem[], b: SuggestItem[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      const x = a[i];
+      const y = b[i];
+      if (!x || !y) return false;
+      if (x.label !== y.label) return false;
+      if (x.insert !== y.insert) return false;
+      if (x.kind !== y.kind) return false;
+    }
+    return true;
+  }
+
   function updateSuggestions(): void {
     if (!state.activeSession) {
       suggestItems = [];
       renderSuggest();
       return;
     }
+
+    const prevItems = suggestItems;
+    const prevIndex = suggestIndex;
+    const prevReplace = activeReplace;
 
     const cursor = inputEl.selectionStart ?? 0;
     const before = inputEl.value.slice(0, cursor);
@@ -694,9 +754,19 @@ function main(): void {
       }
 
       const ranked = query ? rankByPrefix(items, query) : items;
+      const nextReplace = { from: atTok.start, to: atTok.end, inserted: "" };
       suggestItems = ranked;
-      suggestIndex = 0;
-      activeReplace = { from: atTok.start, to: atTok.end, inserted: "" };
+      activeReplace = nextReplace;
+      if (
+        prevReplace &&
+        prevReplace.from === nextReplace.from &&
+        prevReplace.to === nextReplace.to &&
+        isSameSuggestList(prevItems, ranked)
+      ) {
+        suggestIndex = Math.min(ranked.length - 1, Math.max(0, prevIndex));
+      } else {
+        suggestIndex = 0;
+      }
       renderSuggest();
       return;
     }
@@ -708,20 +778,31 @@ function main(): void {
       const slashTok = currentPrefixedToken("/");
       if (slashTok) {
         const query = slashTok.token.slice(1);
+        const allSlash = buildSlashSuggestions();
         if (
           query.length === 0 ||
-          slashSuggestions.some((s) => s.label.startsWith("/" + query))
+          allSlash.some((s) => slashMatches(s.label, query))
         ) {
           const ranked = query
-            ? rankByPrefix(slashSuggestions, "/" + query)
-            : slashSuggestions;
-          suggestItems = ranked;
-          suggestIndex = 0;
-          activeReplace = {
+            ? rankByPrefix(allSlash, "/" + query)
+            : allSlash;
+          const nextReplace = {
             from: slashTok.start,
             to: slashTok.end,
             inserted: "",
           };
+          suggestItems = ranked;
+          activeReplace = nextReplace;
+          if (
+            prevReplace &&
+            prevReplace.from === nextReplace.from &&
+            prevReplace.to === nextReplace.to &&
+            isSameSuggestList(prevItems, ranked)
+          ) {
+            suggestIndex = Math.min(ranked.length - 1, Math.max(0, prevIndex));
+          } else {
+            suggestIndex = 0;
+          }
           renderSuggest();
           return;
         }

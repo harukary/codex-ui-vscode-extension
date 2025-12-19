@@ -70,16 +70,27 @@ The extension contributes a **Codex UI** activity bar container with:
 
 ## 6. Slash commands
 
-Supported commands:
+Supported commands (handled by the extension):
 
 - `/new` - create a new session
 - `/diff` - open latest diff
 - `/rename <title>` - rename session
 - `/help` - show help
 
-Unknown commands show an error.
+Custom prompts:
+
+- Loaded from `$CODEX_HOME/prompts` (defaults to `~/.codex/prompts`)
+- Only `.md` files are loaded
+- If the backend sends `list_custom_prompts_response`, the list is replaced with that payload
+- Commands are invoked as `/prompts:<prompt-name>`
+- The prompt body is expanded before sending (supports `$1..$9`, `$ARGUMENTS`, and `$NAME` placeholders)
+
+Unknown commands are passed through to the backend (no local error).
+Custom prompts only execute via `/prompts:<name>`; UI commands (`/new`, `/diff`, `/rename`, `/help`)
+keep their local behavior even if a prompt shares the same name.
 
 ## 7. Mentions
+
 
 Mentions follow a CLI-like rule: `@...` must start on a whitespace boundary.
 
@@ -103,7 +114,9 @@ Mentions follow a CLI-like rule: `@...` must start on a whitespace boundary.
 
 The webview provides in-input suggestions for:
 
-- Slash commands (`/new`, `/diff`, `/rename`, `/help`)
+- Slash commands, in this order:
+  1) Custom prompts from `$CODEX_HOME/prompts`
+  2) UI commands (`/new`, `/diff`, `/rename`, `/help`)
 - Mentions (`@selection`, file paths)
 
 ### 8.1 File suggestions

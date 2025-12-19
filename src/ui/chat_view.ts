@@ -53,6 +53,12 @@ export type ChatBlock =
   | { id: string; type: "system"; title: string; text: string };
 
 export type ChatViewState = {
+  customPrompts?: Array<{
+    name: string;
+    description: string | null;
+    argumentHint: string | null;
+    source: string;
+  }>;
   globalBlocks?: ChatBlock[];
   sessions: Session[];
   activeSession: Session | null;

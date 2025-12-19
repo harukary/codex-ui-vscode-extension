@@ -1,4 +1,6 @@
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as vscode from "vscode";
 import { BackendManager } from "./backend/manager";
 import type { AnyServerNotification } from "./backend/types";
@@ -29,6 +31,14 @@ let extensionContext: vscode.ExtensionContext | null = null;
 const HIDDEN_TAB_SESSIONS_KEY = "codexMine.hiddenTabSessions.v1";
 const hiddenTabSessionIds = new Set<string>();
 
+type CustomPromptSummary = {
+  name: string;
+  description: string | null;
+  argumentHint: string | null;
+  content: string;
+  source: "disk" | "server";
+};
+
 type SessionRuntime = {
   blocks: ChatBlock[];
   latestDiff: string | null;
@@ -55,6 +65,8 @@ const globalRuntime: Pick<SessionRuntime, "blocks" | "blockIndexById"> = {
   blockIndexById: new Map<string, number>(),
 };
 let globalStatusText: string | null = null;
+let customPrompts: CustomPromptSummary[] = [];
+const PROMPTS_CMD_PREFIX = "prompts";
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
@@ -66,6 +78,7 @@ export function activate(context: vscode.ExtensionContext): void {
   for (const s of sessions.listAll()) ensureRuntime(s.id);
   loadRuntimes(context, sessions);
   loadHiddenTabSessions(context);
+  refreshCustomPromptsFromDisk();
 
   backendManager = new BackendManager(output, sessions);
   backendManager.onServerEvent = (session, n) => {
@@ -144,28 +157,7 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(expanded.error);
         return;
       }
-
-      const rt = ensureRuntime(session.id);
-      rt.sending = true;
-      upsertBlock(session.id, { id: newLocalId("user"), type: "user", text });
-      chatView?.refresh();
-      schedulePersistRuntime(session.id);
-
-      try {
-        await backendManager.sendMessage(session, expanded.text);
-      } catch (err) {
-        rt.sending = false;
-        upsertBlock(session.id, {
-          id: newLocalId("error"),
-          type: "error",
-          title: "Send failed",
-          text: String(err),
-        });
-        chatView?.refresh();
-        schedulePersistRuntime(session.id);
-        throw err;
-      }
-      schedulePersistRuntime(session.id);
+      await sendUserText(session, expanded.text);
     },
     async () => {
       if (!sessions) throw new Error("sessions is not initialized");
@@ -547,6 +539,208 @@ function parseSessionArg(args: unknown, store: SessionStore): Session | null {
   return null;
 }
 
+type PromptExpansion =
+  | { kind: "none" }
+  | { kind: "expanded"; text: string }
+  | { kind: "error"; message: string };
+
+function parseSlashName(line: string): { name: string; rest: string } | null {
+  const trimmed = line.trimStart();
+  if (!trimmed.startsWith("/")) return null;
+  const stripped = trimmed.slice(1);
+  let nameEnd = stripped.length;
+  for (let i = 0; i < stripped.length; i += 1) {
+    if (/\s/.test(stripped[i] || "")) {
+      nameEnd = i;
+      break;
+    }
+  }
+  const name = stripped.slice(0, nameEnd);
+  if (!name) return null;
+  const rest = stripped.slice(nameEnd).trimStart();
+  return { name, rest };
+}
+
+function splitArgs(input: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  let escape = false;
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i] ?? "";
+    if (escape) {
+      cur += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (!inQuotes && /\s/.test(ch)) {
+      if (cur) {
+        out.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function promptArgumentNames(content: string): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  const re = /\$[A-Z][A-Z0-9_]*/g;
+  for (const match of content.matchAll(re)) {
+    const idx = match.index ?? 0;
+    if (idx > 0 && content[idx - 1] === "$") continue;
+    const name = match[0]?.slice(1) ?? "";
+    if (!name || name === "ARGUMENTS") continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+function expandNumericPlaceholders(content: string, args: string[]): string {
+  let out = "";
+  let i = 0;
+  let cachedArgs: string | null = null;
+  while (i < content.length) {
+    const off = content.indexOf("$", i);
+    if (off === -1) {
+      out += content.slice(i);
+      break;
+    }
+    out += content.slice(i, off);
+    const rest = content.slice(off);
+    const b1 = rest[1];
+    if (b1 === "$") {
+      out += "$$";
+      i = off + 2;
+      continue;
+    }
+    if (b1 && b1 >= "1" && b1 <= "9") {
+      const idx = b1.charCodeAt(0) - "1".charCodeAt(0);
+      out += args[idx] ?? "";
+      i = off + 2;
+      continue;
+    }
+    if (rest.slice(1).startsWith("ARGUMENTS")) {
+      if (args.length > 0) {
+        if (!cachedArgs) cachedArgs = args.join(" ");
+        out += cachedArgs;
+      }
+      i = off + 1 + "ARGUMENTS".length;
+      continue;
+    }
+    out += "$";
+    i = off + 1;
+  }
+  return out;
+}
+
+function expandCustomPromptIfAny(
+  text: string,
+  prompts: CustomPromptSummary[],
+): PromptExpansion {
+  const parsed = parseSlashName(text);
+  if (!parsed) return { kind: "none" };
+  const { name, rest } = parsed;
+  const prefix = `${PROMPTS_CMD_PREFIX}:`;
+  if (!name.startsWith(prefix)) return { kind: "none" };
+  const promptName = name.slice(prefix.length);
+  if (!promptName) return { kind: "none" };
+  const prompt = prompts.find((p) => p.name === promptName);
+  if (!prompt) return { kind: "none" };
+  if (!prompt.content) {
+    return {
+      kind: "error",
+      message: `Prompt '/${name}' is missing content.`,
+    };
+  }
+
+  const required = promptArgumentNames(prompt.content);
+  if (required.length > 0) {
+    const inputs = new Map<string, string>();
+    if (rest.trim()) {
+      for (const token of splitArgs(rest)) {
+        const eq = token.indexOf("=");
+        if (eq < 0) {
+          return {
+            kind: "error",
+            message:
+              `Could not parse /${name}: expected key=value but found '${token}'. ` +
+              "Wrap values in double quotes if they contain spaces.",
+          };
+        }
+        const key = token.slice(0, eq);
+        const value = token.slice(eq + 1);
+        if (!key) {
+          return {
+            kind: "error",
+            message: `Could not parse /${name}: expected a name before '=' in '${token}'.`,
+          };
+        }
+        inputs.set(key, value);
+      }
+    }
+    const missing = required.filter((k) => !inputs.has(k));
+    if (missing.length > 0) {
+      return {
+        kind: "error",
+        message:
+          `Missing required args for /${name}: ${missing.join(", ")}. ` +
+          "Provide as key=value (quote values with spaces).",
+      };
+    }
+    const re = /\$[A-Z][A-Z0-9_]*/g;
+    const replaced = prompt.content.replace(re, (match, offset) => {
+      if (offset > 0 && prompt.content[offset - 1] === "$") return match;
+      const key = match.slice(1);
+      return inputs.get(key) ?? match;
+    });
+    return { kind: "expanded", text: replaced };
+  }
+
+  const posArgs = splitArgs(rest);
+  const expanded = expandNumericPlaceholders(prompt.content, posArgs);
+  return { kind: "expanded", text: expanded };
+}
+
+async function sendUserText(session: Session, text: string): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  const rt = ensureRuntime(session.id);
+  rt.sending = true;
+  upsertBlock(session.id, { id: newLocalId("user"), type: "user", text });
+  chatView?.refresh();
+  schedulePersistRuntime(session.id);
+
+  try {
+    await backendManager.sendMessage(session, text);
+  } catch (err) {
+    rt.sending = false;
+    upsertBlock(session.id, {
+      id: newLocalId("error"),
+      type: "error",
+      title: "Send failed",
+      text: String(err),
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    throw err;
+  }
+  schedulePersistRuntime(session.id);
+}
+
 async function handleSlashCommand(
   context: vscode.ExtensionContext,
   session: Session,
@@ -557,6 +751,30 @@ async function handleSlashCommand(
 
   const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
   const arg = rest.join(" ").trim();
+
+  if (cmd === "compact") {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    await backendManager.compactSession(session);
+    return true;
+  }
+
+  const expandedPrompt = expandCustomPromptIfAny(trimmed, customPrompts);
+  if (expandedPrompt.kind === "expanded") {
+    await sendUserText(session, expandedPrompt.text);
+    return true;
+  }
+  if (expandedPrompt.kind === "error") {
+    const rt = ensureRuntime(session.id);
+    upsertBlock(rt, {
+      id: newLocalId("promptError"),
+      type: "error",
+      title: "Custom prompt error",
+      text: expandedPrompt.message,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    return true;
+  }
 
   if (cmd === "new") {
     await vscode.commands.executeCommand("codexMine.newSession");
@@ -584,6 +802,12 @@ async function handleSlashCommand(
   }
   if (cmd === "help") {
     const rt = ensureRuntime(session.id);
+    const customList = customPrompts
+      .map((p) => {
+        const hint = p.argumentHint ? " " + p.argumentHint : "";
+        return "- /prompts:" + p.name + hint;
+      })
+      .join("\n");
     upsertBlock(rt, {
       id: newLocalId("help"),
       type: "system",
@@ -593,21 +817,23 @@ async function handleSlashCommand(
         "- /new: New session",
         "- /diff: Open Latest Diff",
         "- /rename <title>: Rename session",
+        "- /help: Show help",
+        customList ? "\nCustom prompts:" : null,
+        customList || null,
         "",
         "Mentions:",
         "- @selection: Insert selected file path + line range",
         "- @relative/path: Send file path (does not inline contents)",
         "- @file:relative/path: (legacy) Same as @relative/path",
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     });
     chatView?.refresh();
     return true;
   }
 
-  void vscode.window.showErrorMessage(
-    `Unknown command: / (see /help)`,
-  );
-  return true;
+  return false;
 }
 
 type ExpandMentionsResult =
@@ -819,6 +1045,101 @@ function saveHiddenTabSessions(context: vscode.ExtensionContext): void {
   ]);
 }
 
+
+function setCustomPrompts(next: CustomPromptSummary[]): void {
+  customPrompts = next;
+  chatView?.refresh();
+}
+
+function resolveCodexHome(): string {
+  const env = process.env["CODEX_HOME"];
+  if (env && env.trim()) return env.trim();
+  return path.join(os.homedir(), ".codex");
+}
+
+function parsePromptFrontmatter(content: string): {
+  description: string | null;
+  argumentHint: string | null;
+  body: string;
+} {
+  const lines = content.split(/\r?\n/);
+  if ((lines[0] ?? "").trim() !== "---") {
+    return { description: null, argumentHint: null, body: content };
+  }
+
+  let desc: string | null = null;
+  let hint: string | null = null;
+  let i = 1;
+  for (; i < lines.length; i += 1) {
+    const raw = lines[i] ?? "";
+    const trimmed = raw.trim();
+    if (trimmed === "---") {
+      i += 1;
+      break;
+    }
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf(":");
+    if (idx <= 0) continue;
+    const key = trimmed.slice(0, idx).trim().toLowerCase();
+    let val = trimmed.slice(idx + 1).trim();
+    if (val.length >= 2) {
+      const first = val[0];
+      const last = val[val.length - 1];
+      if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+        val = val.slice(1, -1);
+      }
+    }
+    if (key === "description") desc = val;
+    if (key === "argument-hint" || key === "argument_hint") hint = val;
+  }
+
+  if (i <= 1 || i > lines.length) {
+    return { description: null, argumentHint: null, body: content };
+  }
+
+  const body = lines.slice(i).join("\n");
+  return { description: desc, argumentHint: hint, body };
+}
+
+async function loadCustomPromptsFromDisk(): Promise<CustomPromptSummary[]> {
+  const dir = path.join(resolveCodexHome(), "prompts");
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const out: CustomPromptSummary[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const ext = path.extname(entry.name);
+      if (!ext || ext.toLowerCase() !== ".md") continue;
+      const name = path.parse(entry.name).name.trim();
+      if (!name) continue;
+      const fullPath = path.join(dir, entry.name);
+      const content = await fs.readFile(fullPath, "utf8").catch(() => null);
+      if (content === null) continue;
+      const parsed = parsePromptFrontmatter(content);
+      out.push({
+        name,
+        description: parsed.description,
+        argumentHint: parsed.argumentHint,
+        content: parsed.body,
+        source: "disk",
+      });
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function refreshCustomPromptsFromDisk(): void {
+  void loadCustomPromptsFromDisk()
+    .then((next) => {
+      if (customPrompts.some((p) => p.source === "server")) return;
+      setCustomPrompts(next);
+    })
+    .catch(() => {});
+}
+
 function ensureRuntime(sessionId: string): SessionRuntime {
   const existing = runtimeBySessionId.get(sessionId);
   if (existing) return existing;
@@ -840,6 +1161,12 @@ function ensureRuntime(sessionId: string): SessionRuntime {
 }
 
 function buildChatState(): ChatViewState {
+  const promptSummaries = customPrompts.map((p) => ({
+    name: p.name,
+    description: p.description,
+    argumentHint: p.argumentHint,
+    source: p.source,
+  }));
   if (!sessions)
     return {
       globalBlocks: globalRuntime.blocks,
@@ -850,6 +1177,7 @@ function buildChatState(): ChatViewState {
       sending: false,
       statusText: globalStatusText,
       approvals: [],
+      customPrompts: promptSummaries,
     };
 
   const tabSessions = sessions
@@ -866,6 +1194,7 @@ function buildChatState(): ChatViewState {
       sending: false,
       statusText: globalStatusText,
       approvals: [],
+      customPrompts: promptSummaries,
     };
 
   const rt = ensureRuntime(active.id);
@@ -894,6 +1223,7 @@ function buildChatState(): ChatViewState {
       detail: v.detail,
       canAcceptForSession: v.canAcceptForSession,
     })),
+    customPrompts: promptSummaries,
   };
 }
 
@@ -1682,6 +2012,28 @@ function applyCodexEvent(
   const type = typeof msg?.type === "string" ? msg.type : null;
   if (!type) {
     appendUnhandledEvent(rt, `Legacy event: ${method}`, params);
+    return;
+  }
+
+  if (type === "list_custom_prompts_response") {
+    const raw = Array.isArray(msg.custom_prompts)
+      ? (msg.custom_prompts as Array<{
+          name?: unknown;
+          description?: unknown;
+          argument_hint?: unknown;
+          content?: unknown;
+        }>)
+      : [];
+    const next = raw
+      .map((p) => ({
+        name: typeof p?.name === "string" ? p.name.trim() : "",
+        description: typeof p?.description === "string" ? p.description : null,
+        argumentHint: typeof p?.argument_hint === "string" ? p.argument_hint : null,
+        content: typeof p?.content === "string" ? p.content : "",
+      }))
+      .filter((p) => !!p.name)
+      .map((p) => ({ ...p, source: "server" as const }));
+    setCustomPrompts(next);
     return;
   }
 
