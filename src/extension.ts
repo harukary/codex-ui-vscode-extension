@@ -726,7 +726,7 @@ async function expandMentions(
     }
   }
 
-  // NOTE: @ は「ファイルパスのみ」を送る。内容はここで展開しない。
+  // NOTE: @ mentions send file paths only. Do not expand file contents here.
   return { ok: true, text: out };
 }
 

@@ -909,11 +909,15 @@ function main(): void {
     }
 
     if (!s.activeSession) {
-      const div = el("div", "msg system");
-      const pre = el("pre") as HTMLPreElement;
-      pre.textContent = "Sessions からセッションを選択してください。";
-      div.appendChild(pre);
-      logEl.appendChild(div);
+      domSessionId = null;
+      blockElByKey.clear();
+      logEl.replaceChildren();
+
+      const div = ensureDiv("noSession", "msg system");
+      const pre = ensurePre(div, "body");
+      if (pre.textContent !== "Sessions からセッションを選択してください。") {
+        pre.textContent = "Sessions からセッションを選択してください。";
+      }
       return;
     }
 
