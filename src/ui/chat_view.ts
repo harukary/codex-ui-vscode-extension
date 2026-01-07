@@ -3,20 +3,46 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 
 import type { Session } from "../sessions";
-import { listAgentsFromDisk } from "../agents_disk";
 
 export type ChatBlock =
   | { id: string; type: "user"; text: string }
   | { id: string; type: "assistant"; text: string; streaming?: boolean }
-  | { id: string; type: "divider"; text: string }
+  | {
+      id: string;
+      type: "divider";
+      text: string;
+      status?: "inProgress" | "completed" | "failed";
+    }
   | { id: string; type: "note"; text: string }
   | {
       id: string;
       type: "image";
       title: string;
       src: string;
+      // Offloaded images omit `src` and use `imageKey` to request data on-demand.
+      imageKey?: string;
+      mimeType?: string;
+      byteLength?: number;
+      autoLoad?: boolean;
       alt: string;
       caption: string | null;
+      role: "user" | "assistant" | "tool" | "system";
+    }
+  | {
+      id: string;
+      type: "imageGallery";
+      title: string;
+      images: Array<{
+        title: string;
+        src: string;
+        // Offloaded images omit `src` and use `imageKey` to request data on-demand.
+        imageKey?: string;
+        mimeType?: string;
+        byteLength?: number;
+        autoLoad?: boolean;
+        alt: string;
+        caption: string | null;
+      }>;
       role: "user" | "assistant" | "tool" | "system";
     }
   | { id: string; type: "info"; title: string; text: string }
@@ -84,7 +110,9 @@ export type ChatViewState = {
   blocks: ChatBlock[];
   latestDiff: string | null;
   sending: boolean;
+  reloading: boolean;
   statusText?: string | null;
+  statusTooltip?: string | null;
   modelState?: {
     model: string | null;
     provider: string | null;
@@ -95,7 +123,10 @@ export type ChatViewState = {
     model: string;
     displayName: string;
     description: string;
-    supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>;
+    supportedReasoningEfforts: Array<{
+      reasoningEffort: string;
+      description: string;
+    }>;
     defaultReasoningEffort: string;
     isDefault: boolean;
   }> | null;
@@ -105,6 +136,10 @@ export type ChatViewState = {
     detail: string;
     canAcceptForSession: boolean;
   }>;
+};
+
+type RewindRequest = {
+  turnIndex: number;
 };
 
 let sessionModelState: {
@@ -137,10 +172,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "codexMine.chatView";
 
   private view: vscode.WebviewView | null = null;
-  private readonly fileSearchCancellationTokenBySessionId = new Map<string, string>();
+  private refreshTimer: NodeJS.Timeout | null = null;
+  private blockAppendFlushTimer: NodeJS.Timeout | null = null;
+  private readonly pendingBlockAppends = new Map<
+    string,
+    {
+      sessionId: string;
+      blockId: string;
+      field: "assistantText" | "commandOutput" | "fileChangeDetail";
+      delta: string;
+      streaming: boolean | null;
+    }
+  >();
+  private statePostInFlight = false;
+  private statePostDirty = false;
+  private lastStatePostSeq = 0;
+  private lastStateAckSeq = 0;
+  private stateAckTimeout: NodeJS.Timeout | null = null;
+  private blocksSessionIdSynced: string | null = null;
+  private readonly fileSearchCancellationTokenBySessionId = new Map<
+    string,
+    string
+  >();
 
   public insertIntoInput(text: string): void {
     this.view?.webview.postMessage({ type: "insertText", text });
+  }
+
+  public toast(kind: "info" | "success" | "error", message: string): void {
+    this.view?.webview.postMessage({ type: "toast", kind, message });
   }
 
   public constructor(
@@ -149,12 +209,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly onSend: (
       text: string,
       images?: Array<{ name: string; url: string }>,
+      rewind?: RewindRequest | null,
     ) => Promise<void>,
     private readonly onFileSearch: (
       sessionId: string,
       query: string,
       cancellationToken: string,
     ) => Promise<string[]>,
+    private readonly onListAgents: (sessionId: string) => Promise<string[]>,
+    private readonly onListSkills: (sessionId: string) => Promise<
+      Array<{
+        name: string;
+        description: string | null;
+        scope: string;
+        path: string;
+      }>
+    >,
+    private readonly onLoadImage: (
+      imageKey: string,
+    ) => Promise<{ mimeType: string; base64: string }>,
     private readonly onOpenLatestDiff: () => Promise<void>,
     private readonly onUiError: (message: string) => void,
   ) {}
@@ -164,7 +237,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   public refresh(): void {
-    this.postState();
+    // Avoid flooding the Webview with full-state updates (especially during streaming).
+    this.statePostDirty = true;
+    if (this.statePostInFlight) return;
+    if (this.refreshTimer) return;
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      this.postControlState();
+    }, 16);
+  }
+
+  public syncBlocksForActiveSession(): void {
+    if (!this.view) return;
+    const st = this.getState();
+    const active = st.activeSession;
+    if (!active) return;
+    this.blocksSessionIdSynced = active.id;
+    void this.view.webview
+      .postMessage({
+        type: "blocksReset",
+        sessionId: active.id,
+        blocks: st.blocks,
+      })
+      .then(undefined, (err) => {
+        this.onUiError(`Failed to post blocks to webview: ${String(err)}`);
+      });
+  }
+
+  public postBlockUpsert(sessionId: string, block: ChatBlock): void {
+    if (!this.view) return;
+    const st = this.getState();
+    const active = st.activeSession;
+    if (!active || active.id !== sessionId) return;
+    void this.view.webview
+      .postMessage({ type: "blockUpsert", sessionId, block })
+      .then(undefined, (err) => {
+        this.onUiError(
+          `Failed to post block update to webview: ${String(err)}`,
+        );
+      });
+  }
+
+  public postBlockAppend(
+    sessionId: string,
+    blockId: string,
+    field: "assistantText" | "commandOutput" | "fileChangeDetail",
+    delta: string,
+    opts?: { streaming?: boolean },
+  ): void {
+    if (!this.view) return;
+    const st = this.getState();
+    const active = st.activeSession;
+    if (!active || active.id !== sessionId) return;
+    const key = `${sessionId}:${blockId}:${field}`;
+    const prev = this.pendingBlockAppends.get(key);
+    if (prev) {
+      prev.delta += delta;
+      if (typeof opts?.streaming === "boolean") prev.streaming = opts.streaming;
+    } else {
+      this.pendingBlockAppends.set(key, {
+        sessionId,
+        blockId,
+        field,
+        delta,
+        streaming: opts?.streaming ?? null,
+      });
+    }
+    this.scheduleBlockAppendFlush();
   }
 
   public resolveWebviewView(view: vscode.WebviewView): void {
@@ -177,10 +316,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ],
     };
     view.webview.html = this.renderHtml(view.webview);
-    view.webview.onDidReceiveMessage(
-      (msg: unknown) => void this.onMessage(msg),
-    );
-    this.postState();
+    view.webview.onDidReceiveMessage((msg: unknown) => {
+      void this.onMessage(msg).catch((err) => {
+        this.onUiError(`Failed to handle webview message: ${String(err)}`);
+      });
+    });
+    view.onDidDispose(() => {
+      this.view = null;
+      this.statePostInFlight = false;
+      this.statePostDirty = false;
+      if (this.stateAckTimeout) clearTimeout(this.stateAckTimeout);
+      this.stateAckTimeout = null;
+      this.blocksSessionIdSynced = null;
+      if (this.blockAppendFlushTimer) clearTimeout(this.blockAppendFlushTimer);
+      this.blockAppendFlushTimer = null;
+      this.pendingBlockAppends.clear();
+    });
+    this.statePostDirty = true;
+    this.postControlState();
+  }
+
+  private scheduleBlockAppendFlush(): void {
+    if (this.blockAppendFlushTimer) return;
+    this.blockAppendFlushTimer = setTimeout(() => {
+      this.blockAppendFlushTimer = null;
+      this.flushBlockAppends();
+    }, 16);
+  }
+
+  private flushBlockAppends(): void {
+    if (!this.view) return;
+    if (this.pendingBlockAppends.size === 0) return;
+    const st = this.getState();
+    const activeId = st.activeSession?.id ?? null;
+    if (!activeId) {
+      this.pendingBlockAppends.clear();
+      return;
+    }
+
+    const pending = [...this.pendingBlockAppends.values()];
+    this.pendingBlockAppends.clear();
+
+    for (const p of pending) {
+      if (p.sessionId !== activeId) continue;
+      void this.view.webview
+        .postMessage({
+          type: "blockAppend",
+          sessionId: p.sessionId,
+          blockId: p.blockId,
+          field: p.field,
+          delta: p.delta,
+          streaming: p.streaming,
+        })
+        .then(undefined, (err) => {
+          this.onUiError(
+            `Failed to post block delta to webview: ${String(err)}`,
+          );
+        });
+    }
   }
 
   private async onMessage(msg: unknown): Promise<void> {
@@ -189,20 +382,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const type = anyMsg["type"];
 
     if (type === "ready") {
-      this.postState();
+      this.statePostDirty = true;
+      this.postControlState();
+      this.syncBlocksForActiveSession();
+      return;
+    }
+
+    if (type === "stateAck") {
+      const seq = anyMsg["seq"];
+      if (typeof seq !== "number") return;
+      if (seq > this.lastStateAckSeq) this.lastStateAckSeq = seq;
+      // Only unblock when the latest in-flight state is acknowledged.
+      if (seq === this.lastStatePostSeq) {
+        this.statePostInFlight = false;
+        if (this.stateAckTimeout) clearTimeout(this.stateAckTimeout);
+        this.stateAckTimeout = null;
+        if (this.statePostDirty) this.postControlState();
+      }
       return;
     }
 
     if (type === "send") {
       const text = anyMsg["text"];
+      const rewind = anyMsg["rewind"];
       if (typeof text !== "string") return;
-      await this.onSend(text, []);
+      await this.onSend(text, [], (rewind as any) ?? null);
       return;
     }
 
     if (type === "sendWithImages") {
       const text = anyMsg["text"];
       const images = anyMsg["images"];
+      const rewind = anyMsg["rewind"];
       if (typeof text !== "string") return;
       if (!Array.isArray(images)) return;
       const normalized = images
@@ -216,7 +427,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           name: typeof (img as any).name === "string" ? (img as any).name : "",
           url: (img as any).url as string,
         }));
-      await this.onSend(text, normalized);
+      await this.onSend(text, normalized, (rewind as any) ?? null);
       return;
     }
 
@@ -227,8 +438,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (type === "loadImage") {
+      const imageKey = anyMsg["imageKey"];
+      const requestId = anyMsg["requestId"];
+      if (typeof imageKey !== "string") return;
+      if (typeof requestId !== "string") return;
+      if (!this.view) return;
+
+      try {
+        const { mimeType, base64 } = await this.onLoadImage(imageKey);
+        await this.view.webview.postMessage({
+          type: "imageData",
+          requestId,
+          ok: true,
+          mimeType,
+          base64,
+        });
+      } catch (err) {
+        await this.view.webview.postMessage({
+          type: "imageData",
+          requestId,
+          ok: false,
+          error: String(err),
+        });
+      }
+      return;
+    }
+
     if (type === "stop") {
       await vscode.commands.executeCommand("codexMine.interruptTurn");
+      return;
+    }
+
+    if (type === "reloadSession") {
+      await vscode.commands.executeCommand("codexMine.reloadSession");
       return;
     }
 
@@ -415,7 +658,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const st = this.getState();
       const active = st.activeSession;
       if (!active || active.id !== sessionId) {
-        this.postState();
+        this.refresh();
+        this.syncBlocksForActiveSession();
         return;
       }
 
@@ -445,7 +689,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const cancellationToken =
         this.fileSearchCancellationTokenBySessionId.get(sessionId) ??
         crypto.randomUUID();
-      this.fileSearchCancellationTokenBySessionId.set(sessionId, cancellationToken);
+      this.fileSearchCancellationTokenBySessionId.set(
+        sessionId,
+        cancellationToken,
+      );
 
       let paths: string[] = [];
       try {
@@ -455,7 +702,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         paths = [];
       }
 
-      this.view?.webview.postMessage({ type: "fileSearchResult", sessionId, query, paths });
+      this.view?.webview.postMessage({
+        type: "fileSearchResult",
+        sessionId,
+        query,
+        paths,
+      });
       return;
     }
 
@@ -465,27 +717,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const st = this.getState();
       const active = st.activeSession;
       if (!active || active.id !== sessionId) {
-        this.postState();
+        this.refresh();
+        this.syncBlocksForActiveSession();
         return;
       }
 
-      const caps = st.capabilities ?? { agents: false, cliVariant: "unknown" as const };
+      const caps = st.capabilities ?? {
+        agents: false,
+        cliVariant: "unknown" as const,
+      };
       if (!caps.agents) {
         this.view?.webview.postMessage({ type: "agentIndex", agents: [] });
         return;
       }
 
-      const folderUri = vscode.Uri.parse(active.workspaceFolderUri);
-      const folder = vscode.workspace.getWorkspaceFolder(folderUri);
-      if (!folder) {
-        this.view?.webview.postMessage({ type: "agentIndex", agents: [] });
+      let agents: string[] = [];
+      try {
+        agents = await this.onListAgents(sessionId);
+      } catch (err) {
+        console.error("[codex-mine] agents list failed:", err);
+        agents = [];
+      }
+
+      this.view?.webview.postMessage({ type: "agentIndex", agents });
+      return;
+    }
+
+    if (type === "requestSkillIndex") {
+      const sessionId = anyMsg["sessionId"];
+      if (typeof sessionId !== "string") return;
+      const st = this.getState();
+      const active = st.activeSession;
+      if (!active || active.id !== sessionId) {
+        this.refresh();
+        this.syncBlocksForActiveSession();
         return;
       }
 
-      const { agents } = await listAgentsFromDisk(folder.uri.fsPath);
+      let skills: Array<{
+        name: string;
+        description: string | null;
+        scope: string;
+        path: string;
+      }> = [];
+      try {
+        skills = await this.onListSkills(sessionId);
+      } catch (err) {
+        console.error("[codex-mine] skills list failed:", err);
+        skills = [];
+      }
+
       this.view?.webview.postMessage({
-        type: "agentIndex",
-        agents: agents.map((a) => a.name),
+        type: "skillIndex",
+        sessionId,
+        skills,
       });
       return;
     }
@@ -495,20 +780,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const stack = anyMsg["stack"];
       const details =
         typeof message === "string"
-          ? message +
-            (typeof stack === "string" && stack ? "\n" + stack : "")
+          ? message + (typeof stack === "string" && stack ? "\n" + stack : "")
           : JSON.stringify(anyMsg, null, 2);
       console.error("[codex-mine] webview error:", details);
       return;
     }
   }
-  private postState(): void {
+  private postControlState(): void {
     if (!this.view) return;
+    if (this.statePostInFlight) return;
+    if (!this.statePostDirty) return;
+    this.statePostDirty = false;
+    this.statePostInFlight = true;
+    const seq = (this.lastStatePostSeq += 1);
+    if (this.stateAckTimeout) clearTimeout(this.stateAckTimeout);
+    // If the webview stops acknowledging state updates (e.g. render stuck),
+    // do not deadlock future refreshes; surface the issue and keep going.
+    this.stateAckTimeout = setTimeout(() => {
+      this.stateAckTimeout = null;
+      if (!this.view) return;
+      if (!this.statePostInFlight) return;
+      this.statePostInFlight = false;
+      this.onUiError(
+        `Webview did not acknowledge state update (seq=${String(seq)}) within 2000ms; continuing.`,
+      );
+      if (this.statePostDirty) this.postControlState();
+    }, 2000);
+    const full = this.getState();
+	    const controlState = {
+	      globalBlocks: full.globalBlocks,
+	      capabilities: full.capabilities,
+	      sessions: full.sessions,
+	      activeSession: full.activeSession,
+	      unreadSessionIds: full.unreadSessionIds,
+	      runningSessionIds: full.runningSessionIds,
+	      latestDiff: full.latestDiff,
+	      sending: full.sending,
+	      reloading: full.reloading,
+	      statusText: full.statusText,
+	      statusTooltip: full.statusTooltip,
+	      modelState: full.modelState,
+	      models: full.models,
+	      approvals: full.approvals,
+	      customPrompts: full.customPrompts,
+	    };
     void this.view.webview
-      .postMessage({ type: "state", state: this.getState() })
+      .postMessage({ type: "controlState", seq, state: controlState })
       .then(undefined, (err) => {
+        // Unblock if postMessage itself failed (e.g., disposed webview).
+        this.statePostInFlight = false;
+        if (this.stateAckTimeout) clearTimeout(this.stateAckTimeout);
+        this.stateAckTimeout = null;
         this.onUiError(`Failed to post state to webview: ${String(err)}`);
       });
+
+    const activeId = full.activeSession?.id ?? null;
+    if (activeId && activeId !== this.blocksSessionIdSynced) {
+      this.blocksSessionIdSynced = activeId;
+      void this.view.webview
+        .postMessage({
+          type: "blocksReset",
+          sessionId: activeId,
+          blocks: full.blocks,
+        })
+        .then(undefined, (err) => {
+          this.onUiError(`Failed to post blocks to webview: ${String(err)}`);
+        });
+    }
   }
 
   private renderHtml(webview: vscode.Webview): string {
@@ -517,7 +855,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const nonce = crypto.randomBytes(16).toString("base64");
     const csp = [
       "default-src 'none'",
-      "img-src " + webview.cspSource + " data:",
+      "img-src " + webview.cspSource + " data: blob:",
       "style-src 'unsafe-inline'",
       `script-src ${webview.cspSource} 'nonce-${nonce}'`,
     ].join("; ");
@@ -538,6 +876,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         "markdown-it.min.js",
       ),
     );
+    const cacheBusted = (uri: vscode.Uri): vscode.Uri =>
+      uri.with({ query: `v=${nonce}` });
+    const clientScriptUriV = cacheBusted(clientScriptUri);
+    const markdownItUriV = cacheBusted(markdownItUri);
 
     return `<!doctype html>
 <html lang="ja">
@@ -569,12 +911,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       button.iconBtn::before { content: "➤"; font-size: 14px; opacity: 0.95; }
       button.iconBtn[data-mode="stop"]::before { content: "■"; font-size: 12px; }
       button.iconBtn.settingsBtn::before { content: "⚙"; font-size: 14px; }
-      .footerBar { border-top: 1px solid rgba(127,127,127,0.25); padding: 8px 12px 10px; display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; }
+      .footerBar { border-top: 1px solid rgba(127,127,127,0.25); padding: 8px 12px 10px; display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; position: relative; }
       .modelBar { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; margin: 0; min-width: 0; flex: 1 1 auto; overflow: hidden; }
       .modelSelect { background: var(--vscode-input-background); color: inherit; border: 1px solid rgba(127,127,127,0.35); border-radius: 6px; padding: 4px 6px; }
       .modelSelect.model { width: 160px; max-width: 160px; }
       .modelSelect.effort { width: 110px; max-width: 110px; }
       .footerStatus { margin-left: auto; font-size: 12px; opacity: 0.75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .footerStatus.clickable { cursor: pointer; }
+      .statusPopover { position: absolute; right: 12px; bottom: calc(100% + 6px); max-width: min(520px, calc(100vw - 24px)); background: var(--vscode-editorHoverWidget-background, var(--vscode-input-background)); border: 1px solid rgba(127,127,127,0.35); border-radius: 10px; box-shadow: 0 6px 18px rgba(0,0,0,0.25); padding: 8px 10px; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
       .tabs { display: flex; gap: 6px; overflow: auto; padding-bottom: 2px; }
       .tab { padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,0.35); cursor: pointer; white-space: nowrap; user-select: none; }
       .tab.active { border-color: rgba(0, 120, 212, 0.9); }
@@ -585,6 +929,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .approval { border: 1px solid rgba(127,127,127,0.25); border-radius: 10px; padding: 10px 12px; background: rgba(255, 120, 0, 0.10); }
       .approvalTitle { font-weight: 600; margin-bottom: 6px; }
       .approvalActions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .editBanner { border: 1px solid rgba(127,127,127,0.25); border-radius: 10px; padding: 8px 10px; margin: 0 0 8px; background: rgba(0, 120, 212, 0.10); display: flex; align-items: center; gap: 10px; }
+      .editBannerText { flex: 1 1 auto; min-width: 0; font-size: 12px; opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .editBanner button { padding: 4px 8px; font-size: 12px; border-radius: 8px; }
       .msg { margin: 10px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,0.25); }
       .note { margin: 8px 2px; font-size: 12px; opacity: 0.7; color: var(--vscode-descriptionForeground, inherit); }
       /* Keep user distinct from webSearch (both were blue-ish in dark themes). */
@@ -596,7 +943,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .tool.mcp { background: rgba(0, 200, 170, 0.08); }
       .tool.webSearch { background: rgba(0, 180, 255, 0.10); border-color: rgba(0, 180, 255, 0.22); }
       .reasoning { background: rgba(0, 169, 110, 0.12); }
-      .divider { background: rgba(255, 185, 0, 0.06); border-style: dashed; }
+      .divider { background: rgba(255, 185, 0, 0.06); border-style: dashed; position: relative; padding-right: 28px; }
       .imageBlock { display: flex; flex-direction: column; gap: 8px; }
       .imageBlock-user { background: rgba(255,255,255,0.035); border-color: rgba(0, 120, 212, 0.35); }
       .imageBlock-assistant { background: rgba(0,0,0,0.06); }
@@ -605,6 +952,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .imageTitle { font-weight: 600; font-size: 12px; opacity: 0.8; }
       .imageCaption { font-size: 12px; opacity: 0.7; word-break: break-word; }
       .imageContent { width: 100%; max-width: 100%; height: auto; max-height: var(--cm-chat-image-max-height); object-fit: contain; border-radius: 8px; border: 1px solid rgba(127,127,127,0.25); background: rgba(0,0,0,0.02); }
+      .imageGallery { display: flex; flex-direction: column; gap: 8px; }
+      .imageGallery-user { background: rgba(255,255,255,0.035); border-color: rgba(0, 120, 212, 0.35); }
+      .imageGallery-assistant { background: rgba(0,0,0,0.06); }
+      .imageGallery-tool { background: rgba(0, 200, 170, 0.08); }
+      .imageGallery-system { background: rgba(255, 185, 0, 0.12); }
+      .imageGalleryTitle { font-weight: 600; font-size: 12px; opacity: 0.8; }
+      .imageGalleryGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .imageGalleryTile { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+      .imageGalleryCaption { font-size: 12px; opacity: 0.7; word-break: break-word; }
+      .imageGalleryImage { width: 100%; max-width: 100%; height: auto; max-height: min(240px, var(--cm-chat-image-max-height)); object-fit: contain; border-radius: 8px; border: 1px solid rgba(127,127,127,0.25); background: rgba(0,0,0,0.02); }
       details { border-radius: 10px; border: 1px solid rgba(127,127,127,0.25); padding: 4px 12px; margin: 5px 0; }
       details.notice { background: rgba(127,127,127,0.04); }
       details.notice.info { background: rgba(255,255,255,0.06); }
@@ -614,9 +971,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       details > summary > span.statusIcon { position: static; top: auto; right: auto; transform: none; margin-left: auto; }
       .webSearchCard { position: relative; padding-right: 28px; }
       .webSearchCard .statusIcon { top: 12px; transform: none; }
+      .divider .statusIcon { top: 12px; transform: none; }
       .webSearchRow { position: relative; }
       .statusIcon { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; opacity: 0.9; }
       .statusIcon::before, .statusIcon::after { content: ""; display: block; box-sizing: border-box; }
+      .msgHeader { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+      .msgHeaderTitle { font-size: 12px; opacity: 0.7; }
+      .msgActions { display: flex; gap: 8px; }
+      .msgActionBtn { padding: 2px 8px; font-size: 12px; border-radius: 999px; }
 
       /* inProgress: spinner */
       .statusIcon.status-inProgress::before { width: 14px; height: 14px; border: 2px solid rgba(180, 180, 180, 0.95); border-top-color: rgba(180, 180, 180, 0.15); border-radius: 50%; animation: cmSpin 0.9s linear infinite; margin: 1px; }
@@ -659,6 +1021,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .returnToBottomBtn:hover { opacity: 0.9; background: rgba(127,127,127,0.14); }
       .inputRow { display: flex; gap: 8px; align-items: flex-end; }
       textarea { flex: 1; resize: none; box-sizing: border-box; border-radius: 8px; border: 1px solid rgba(127,127,127,0.35); padding: 6px 10px; background: transparent; color: inherit; font-family: var(--cm-editor-font-family); font-size: var(--cm-editor-font-size); font-weight: var(--cm-editor-font-weight); line-height: 1.2; overflow-y: hidden; min-height: 30px; max-height: 200px; }
+      textarea::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .suggest { position: absolute; left: 12px; right: 12px; bottom: calc(100% + 8px); border: 1px solid var(--vscode-editorSuggestWidget-border, rgba(127,127,127,0.35)); border-radius: 10px; background: var(--vscode-editorSuggestWidget-background, rgba(30,30,30,0.95)); color: var(--vscode-editorSuggestWidget-foreground, inherit); max-height: 160px; overflow: auto; display: none; z-index: 20; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
       button.iconBtn.attachBtn::before { content: "📎"; font-size: 14px; }
       .attachments { display: none; flex-wrap: wrap; gap: 8px; }
@@ -680,32 +1043,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .autoUrlLink { color: inherit; text-decoration: none; cursor: text; }
       .autoUrlLink.modHover { color: var(--vscode-textLink-foreground, rgba(0,120,212,0.9)); text-decoration: underline; cursor: pointer; }
       .autoUrlLink.modHover:hover { color: var(--vscode-textLink-activeForeground, rgba(0,120,212,1)); }
-      .fileDiff { margin-top: 8px; }
-    </style>
-  </head>
-  <body>
+	      .fileDiff { margin-top: 8px; }
+	      .toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000; max-width: min(820px, calc(100vw - 32px)); border-radius: 10px; padding: 10px 12px; border: 1px solid rgba(127,127,127,0.35); box-shadow: 0 10px 30px rgba(0,0,0,0.35); background: var(--vscode-notifications-background, rgba(30,30,30,0.95)); color: var(--vscode-notifications-foreground, inherit); display: none; }
+	      .toast.info { border-color: rgba(127,127,127,0.35); }
+	      .toast.success { border-color: rgba(0,200,120,0.55); }
+	      .toast.error { border-color: rgba(220,60,60,0.60); }
+	    </style>
+	  </head>
+	  <body>
     <div class="top">
       <div class="topRow">
         <div id="title" class="title">Codex UI</div>
-	        <div class="actions">
-	          <button id="new">New</button>
-            <button id="resume">Resume</button>
-	          <button id="status">Status</button>
-	          <button id="diff" disabled>Open Latest Diff</button>
-            <button id="settings" class="iconBtn settingsBtn" aria-label="Settings" title="Settings"></button>
-	        </div>
-	      </div>
+        <div class="actions">
+          <button id="new">New</button>
+          <button id="resume">Resume</button>
+          <button id="reload" title="Reload session (codex-mine only)" disabled>Reload</button>
+          <button id="status">Status</button>
+          <button id="diff" disabled>Open Latest Diff</button>
+          <button id="settings" class="iconBtn settingsBtn" aria-label="Settings" title="Settings"></button>
+        </div>
+      </div>
       <div id="tabs" class="tabs"></div>
     </div>
     <div id="approvals" class="approvals" style="display:none"></div>
     <div id="log" class="log"></div>
     <div id="composer" class="composer">
+      <div id="editBanner" class="editBanner" style="display:none"></div>
       <div id="attachments" class="attachments"></div>
       <button id="returnToBottom" class="returnToBottomBtn" title="Scroll to bottom">Return to Bottom</button>
       <div id="inputRow" class="inputRow">
         <input id="imageInput" type="file" accept="image/*" multiple style="display:none" />
         <button id="attach" class="iconBtn attachBtn" aria-label="Attach image" title="Attach image"></button>
-        <textarea id="input" rows="1" placeholder="Type a message (Enter to send / Shift+Enter for newline)"></textarea>
+        <textarea id="input" rows="1" placeholder="Type a message"></textarea>
         <button id="send" class="iconBtn" data-mode="send" aria-label="Send" title="Send (Esc: stop)"></button>
       </div>
       <div id="suggest" class="suggest"></div>
@@ -713,11 +1082,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	    <div class="footerBar">
 	      <div id="modelBar" class="modelBar"></div>
 	      <div id="statusText" class="footerStatus" style="display:none"></div>
+	          <div id="statusPopover" class="statusPopover" style="display:none"></div>
 	    </div>
-		    <script nonce="${nonce}" src="${markdownItUri}"></script>
-		    <script nonce="${nonce}" src="${clientScriptUri}"></script>
-		  </body>
-		</html>`;
+	    <div id="toast" class="toast"></div>
+	    <script nonce="${nonce}" src="${markdownItUriV}"></script>
+	    <script nonce="${nonce}" src="${clientScriptUriV}"></script>
+	  </body>
+	</html>`;
   }
 }
 

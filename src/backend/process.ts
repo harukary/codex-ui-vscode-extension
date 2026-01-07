@@ -10,6 +10,8 @@ import type { ThreadStartParams } from "../generated/v2/ThreadStartParams";
 import type { ThreadStartResponse } from "../generated/v2/ThreadStartResponse";
 import type { ThreadResumeParams } from "../generated/v2/ThreadResumeParams";
 import type { ThreadResumeResponse } from "../generated/v2/ThreadResumeResponse";
+import type { ThreadCompactParams } from "../generated/v2/ThreadCompactParams";
+import type { ThreadCompactResponse } from "../generated/v2/ThreadCompactResponse";
 import type { TurnStartParams } from "../generated/v2/TurnStartParams";
 import type { TurnStartResponse } from "../generated/v2/TurnStartResponse";
 import type { TurnInterruptParams } from "../generated/v2/TurnInterruptParams";
@@ -20,6 +22,8 @@ import type { ModelListParams } from "../generated/v2/ModelListParams";
 import type { ModelListResponse } from "../generated/v2/ModelListResponse";
 import type { ThreadArchiveParams } from "../generated/v2/ThreadArchiveParams";
 import type { ThreadArchiveResponse } from "../generated/v2/ThreadArchiveResponse";
+import type { ThreadRewindParams } from "../generated/v2/ThreadRewindParams";
+import type { ThreadRewindResponse } from "../generated/v2/ThreadRewindResponse";
 import type { ThreadListParams } from "../generated/v2/ThreadListParams";
 import type { ThreadListResponse } from "../generated/v2/ThreadListResponse";
 import type { GetAccountParams } from "../generated/v2/GetAccountParams";
@@ -44,8 +48,13 @@ type SpawnOptions = {
   output: vscode.OutputChannel;
 };
 
+export type BackendExitInfo = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
 export class BackendProcess implements vscode.Disposable {
-  private readonly exitHandlers = new Set<() => void>();
+  private readonly exitHandlers = new Set<(info: BackendExitInfo) => void>();
   private readonly rpc: RpcClient;
 
   public onNotification: ((n: AnyServerNotification) => void) | null = null;
@@ -69,7 +78,9 @@ export class BackendProcess implements vscode.Disposable {
       "serverRequest",
       (r: ServerRequest) => void this.handleServerRequest(r),
     );
-    this.rpc.on("exit", () => this.exitHandlers.forEach((h) => h()));
+    this.rpc.on("exit", (info: BackendExitInfo) =>
+      this.exitHandlers.forEach((h) => h(info)),
+    );
   }
 
   public static async spawn(opts: SpawnOptions): Promise<BackendProcess> {
@@ -105,6 +116,10 @@ export class BackendProcess implements vscode.Disposable {
   }
 
   public onDidExit(handler: () => void): void {
+    this.exitHandlers.add(() => handler());
+  }
+
+  public onDidExitWithInfo(handler: (info: BackendExitInfo) => void): void {
     this.exitHandlers.add(handler);
   }
 
@@ -114,6 +129,14 @@ export class BackendProcess implements vscode.Disposable {
     this.child.removeAllListeners();
     try {
       this.child.kill();
+    } catch {
+      // kill() can throw if already dead; surface via exit handlers instead.
+    }
+  }
+
+  public kill(signal: NodeJS.Signals): void {
+    try {
+      this.child.kill(signal);
     } catch {
       // kill() can throw if already dead; surface via exit handlers instead.
     }
@@ -137,11 +160,38 @@ export class BackendProcess implements vscode.Disposable {
     });
   }
 
+  public async threadReload(
+    params: ThreadResumeParams,
+  ): Promise<ThreadResumeResponse> {
+    return this.rpc.request<ThreadResumeResponse>({
+      method: "thread/reload",
+      params,
+    });
+  }
+
   public async threadArchive(
     params: ThreadArchiveParams,
   ): Promise<ThreadArchiveResponse> {
     return this.rpc.request<ThreadArchiveResponse>({
       method: "thread/archive",
+      params,
+    });
+  }
+
+  public async threadCompact(
+    params: ThreadCompactParams,
+  ): Promise<ThreadCompactResponse> {
+    return this.rpc.request<ThreadCompactResponse>({
+      method: "thread/compact",
+      params,
+    });
+  }
+
+  public async threadRewind(
+    params: ThreadRewindParams,
+  ): Promise<ThreadRewindResponse> {
+    return this.rpc.request<ThreadRewindResponse>({
+      method: "thread/rewind",
       params,
     });
   }
@@ -198,7 +248,9 @@ export class BackendProcess implements vscode.Disposable {
     });
   }
 
-  public async accountRead(params: GetAccountParams): Promise<GetAccountResponse> {
+  public async accountRead(
+    params: GetAccountParams,
+  ): Promise<GetAccountResponse> {
     return this.rpc.request<GetAccountResponse>({
       method: "account/read",
       params,
@@ -272,7 +324,10 @@ export class BackendProcess implements vscode.Disposable {
 
     const choice = await vscode.window.showWarningMessage(
       `Codex is requesting approval: `,
-      { modal: true, detail: "Review the request and choose Accept or Decline." },
+      {
+        modal: true,
+        detail: "Review the request and choose Accept or Decline.",
+      },
       "Accept",
       "Accept (For Session)",
       "Decline",

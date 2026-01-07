@@ -26,15 +26,42 @@ type ModelState = {
 type ChatBlock =
   | { id: string; type: "user"; text: string }
   | { id: string; type: "assistant"; text: string; streaming?: boolean }
-  | { id: string; type: "divider"; text: string }
+  | {
+      id: string;
+      type: "divider";
+      text: string;
+      status?: "inProgress" | "completed" | "failed";
+    }
   | { id: string; type: "note"; text: string }
   | {
       id: string;
       type: "image";
       title: string;
       src: string;
+      // Offloaded images omit `src` and use `imageKey` to request data on-demand.
+      imageKey?: string;
+      mimeType?: string;
+      byteLength?: number;
+      autoLoad?: boolean;
       alt: string;
       caption: string | null;
+      role: "user" | "assistant" | "tool" | "system";
+    }
+  | {
+      id: string;
+      type: "imageGallery";
+      title: string;
+      images: Array<{
+        title: string;
+        src: string;
+        // Offloaded images omit `src` and use `imageKey` to request data on-demand.
+        imageKey?: string;
+        mimeType?: string;
+        byteLength?: number;
+        autoLoad?: boolean;
+        alt: string;
+        caption: string | null;
+      }>;
       role: "user" | "assistant" | "tool" | "system";
     }
   | { id: string; type: "info"; title: string; text: string }
@@ -96,14 +123,19 @@ type ChatViewState = {
   blocks: ChatBlock[];
   latestDiff: string | null;
   sending: boolean;
+  reloading: boolean;
   statusText?: string | null;
+  statusTooltip?: string | null;
   modelState?: ModelState | null;
   models?: Array<{
     id: string;
     model: string;
     displayName: string;
     description: string;
-    supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>;
+    supportedReasoningEfforts: Array<{
+      reasoningEffort: string;
+      description: string;
+    }>;
     defaultReasoningEffort: string;
     isDefault: boolean;
   }> | null;
@@ -125,7 +157,7 @@ type SuggestItem = {
   insert: string;
   label: string;
   detail?: string;
-  kind: "slash" | "at" | "file" | "dir" | "agent";
+  kind: "slash" | "at" | "file" | "dir" | "agent" | "skill";
 };
 
 function main(): void {
@@ -152,6 +184,8 @@ function main(): void {
   const logEl = mustGet("log");
   const approvalsEl = mustGet("approvals");
   const composerEl = mustGet("composer");
+  const editBannerEl = mustGet("editBanner");
+  const toastEl = mustGet<HTMLDivElement>("toast");
   const inputRowEl = mustGet("inputRow");
   const inputEl = mustGet<HTMLTextAreaElement>("input");
   const imageInput = mustGet<HTMLInputElement>("imageInput");
@@ -162,10 +196,20 @@ function main(): void {
   const diffBtn = mustGet<HTMLButtonElement>("diff");
   const newBtn = mustGet<HTMLButtonElement>("new");
   const resumeBtn = mustGet<HTMLButtonElement>("resume");
+  const reloadBtn = mustGet<HTMLButtonElement>("reload");
   const statusBtn = mustGet<HTMLButtonElement>("status");
   const settingsBtn = mustGet<HTMLButtonElement>("settings");
   const tabsEl = mustGet("tabs");
   const modelBarEl = mustGet("modelBar");
+  const footerBarEl = (() => {
+    const el = statusTextEl.parentElement;
+    if (!el)
+      throw new Error(
+        "Webview DOM element missing: statusText parent (footerBar)",
+      );
+    return el as HTMLElement;
+  })();
+  const statusPopoverEl = mustGet("statusPopover");
   const modelSelect = document.createElement("select");
   modelSelect.className = "modelSelect model";
   const reasoningSelect = document.createElement("select");
@@ -173,21 +217,222 @@ function main(): void {
   modelBarEl.appendChild(modelSelect);
   modelBarEl.appendChild(reasoningSelect);
 
-	  const populateSelect = (
-	    el: HTMLSelectElement,
-	    options: string[],
-	    value: string | null | undefined,
-	  ): void => {
-	    const v = (value && value.trim()) || "default";
-	    const opts = options.includes(v) ? options : [v, ...options];
-	    const sig = v + "\n" + opts.join("\n");
-	    if (el.dataset.sig === sig) return;
-	    el.dataset.sig = sig;
-	    el.innerHTML = "";
-	    for (const opt of opts) {
-	      const o = document.createElement("option");
-	      o.value = opt;
-	      o.textContent = opt === "default" ? "default (CLI config)" : opt;
+  const placeholder = {
+    // Keep the placeholder short (single-line). Put detailed hints in title.
+    wide: "Type a message",
+    narrow: "Message",
+    tiny: "",
+    hint: "Type a message (Enter to send / Shift+Enter for newline)",
+  } as const;
+
+  const updateInputPlaceholder = (): void => {
+    // Prevent placeholder wrapping by keeping it short; use title for the full hint.
+    const w = inputEl.clientWidth;
+    const next =
+      w >= 260
+        ? placeholder.wide
+        : w >= 170
+          ? placeholder.narrow
+          : placeholder.tiny;
+    if (inputEl.placeholder !== next) inputEl.placeholder = next;
+    inputEl.title = placeholder.hint;
+  };
+
+  // Respond to sidebar resizing / layout changes without introducing wraps.
+  const placeholderObserver = new ResizeObserver(() =>
+    updateInputPlaceholder(),
+  );
+  placeholderObserver.observe(inputRowEl);
+
+  let statusPopoverOpen = false;
+  let statusPopoverDetails = "";
+  let statusHoverDetails = "";
+  let statusPopoverEnabled = false;
+  let statusTextHovering = false;
+
+  const hideStatusPopover = (): void => {
+    statusPopoverOpen = false;
+    statusPopoverEl.style.display = "none";
+    statusPopoverEl.textContent = "";
+  };
+
+  const toggleStatusPopover = (): void => {
+    if (!statusPopoverDetails) return;
+    statusPopoverOpen = !statusPopoverOpen;
+    if (!statusPopoverOpen) {
+      hideStatusPopover();
+      return;
+    }
+    statusPopoverEl.textContent = statusPopoverDetails;
+    statusPopoverEl.style.display = "";
+  };
+
+  statusTextEl.addEventListener("click", (e) => {
+    if (!statusPopoverEnabled || !statusPopoverDetails) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toggleStatusPopover();
+  });
+  statusTextEl.addEventListener("mouseenter", () => {
+    statusTextHovering = true;
+    if (statusPopoverOpen) return;
+    if (!statusHoverDetails) return;
+    statusPopoverEl.textContent = statusHoverDetails;
+    statusPopoverEl.style.display = "";
+  });
+  statusTextEl.addEventListener("mouseleave", () => {
+    statusTextHovering = false;
+    if (statusPopoverOpen) return;
+    hideStatusPopover();
+  });
+  document.addEventListener("click", () => hideStatusPopover());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hideStatusPopover();
+  });
+
+  type ParsedFooterStatus = {
+    ctxPercent: string | null;
+    ctxDetail: string | null;
+    limitA: { label: string; percent: string } | null;
+    limitB: { label: string; percent: string } | null;
+  };
+
+  const parseFooterStatus = (fullStatus: string): ParsedFooterStatus => {
+    const status = fullStatus.trim();
+
+    const ctx = (() => {
+      const m = status.match(/\bremaining=([0-9]{1,3})%\s*\(([^)]+)\)/i);
+      if (m) return { pct: m[1] ?? null, detail: (m[2] ?? "").trim() || null };
+      const m2 = status.match(/\bctx\s+remaining=([0-9]{1,3})%/i);
+      if (m2) return { pct: m2[1] ?? null, detail: null };
+      return { pct: null, detail: null };
+    })();
+
+    const limits = (() => {
+      const found: Array<{ label: string; percent: string }> = [];
+      const re = /\b([a-zA-Z0-9]+)[:=]([0-9]+(?:\.[0-9]+)?)%\b/g;
+      for (const m of status.matchAll(re)) {
+        const rawLabel = (m[1] ?? "").trim();
+        const percent = (m[2] ?? "").trim();
+        if (!rawLabel || !percent) continue;
+        const lower = rawLabel.toLowerCase();
+        if (lower === "remaining" || lower === "ctx") continue;
+        const label =
+          lower === "primary" ? "5h" : lower === "secondary" ? "wk" : rawLabel;
+        found.push({ label, percent });
+      }
+      const rank = (label: string): number => {
+        const lower = label.toLowerCase();
+        if (lower === "5h") return 0;
+        if (lower === "wk") return 1;
+        return 10;
+      };
+      const byLabel = new Map<string, { label: string; percent: string }>();
+      for (const it of found) {
+        if (!byLabel.has(it.label)) byLabel.set(it.label, it);
+      }
+      return [...byLabel.values()].sort(
+        (a, b) => rank(a.label) - rank(b.label),
+      );
+    })();
+
+    const a = limits[0] ?? null;
+    const b = limits[1] ?? null;
+
+    return {
+      ctxPercent: ctx.pct,
+      ctxDetail: ctx.detail,
+      limitA: a,
+      limitB: b,
+    };
+  };
+
+  const fmtPctCompact = (raw: string): string => {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return raw;
+    const rounded = Math.round(n * 100) / 100;
+    return String(rounded)
+      .replace(/\.0+$/, "")
+      .replace(/(\.\d*[1-9])0+$/, "$1");
+  };
+
+  const buildFooterStatusCandidates = (
+    p: ParsedFooterStatus,
+  ): Array<{ tier: number; text: string }> => {
+    const hasCtx = !!p.ctxPercent;
+    const hasLimits = !!p.limitA || !!p.limitB;
+    if (!hasCtx && !hasLimits) return [];
+
+    const ctxTier0 = (() => {
+      if (!p.ctxPercent) return null;
+      if (p.ctxDetail) return `ctx ${p.ctxPercent}% (${p.ctxDetail})`;
+      return `ctx ${p.ctxPercent}%`;
+    })();
+    const ctxTier1 = p.ctxPercent ? `ctx ${p.ctxPercent}%` : null;
+    const ctxTier2 = p.ctxPercent ? `${p.ctxPercent}%` : null;
+
+    const limitsTier0 = (() => {
+      const parts: string[] = [];
+      if (p.limitA)
+        parts.push(`${p.limitA.label}:${fmtPctCompact(p.limitA.percent)}%`);
+      if (p.limitB)
+        parts.push(`${p.limitB.label}:${fmtPctCompact(p.limitB.percent)}%`);
+      return parts.length > 0 ? parts.join(" ") : null;
+    })();
+    const limitsTier1 = (() => {
+      const parts: string[] = [];
+      if (p.limitA)
+        parts.push(`${p.limitA.label}:${fmtPctCompact(p.limitA.percent)}`);
+      if (p.limitB)
+        parts.push(`${p.limitB.label}:${fmtPctCompact(p.limitB.percent)}`);
+      return parts.length > 0 ? parts.join(" ") : null;
+    })();
+    const limitsTier2 = (() => {
+      const a = p.limitA ? fmtPctCompact(p.limitA.percent) : null;
+      const b = p.limitB ? fmtPctCompact(p.limitB.percent) : null;
+      if (a && b) return `L:${a}/${b}`;
+      if (a && p.limitA) return `${p.limitA.label}:${a}`;
+      if (b && p.limitB) return `${p.limitB.label}:${b}`;
+      return null;
+    })();
+
+    const join = (a: string | null, b: string | null): string | null => {
+      const parts = [a, b].filter(
+        (v): v is string => typeof v === "string" && v.length > 0,
+      );
+      return parts.length > 0 ? parts.join(" • ") : null;
+    };
+
+    const t0 = join(ctxTier0, limitsTier0);
+    const t1 = join(ctxTier1, limitsTier1);
+    const t2 = join(ctxTier2, limitsTier2);
+
+    return [
+      { tier: 0, text: t0 ?? "" },
+      { tier: 1, text: t1 ?? "" },
+      { tier: 2, text: t2 ?? "" },
+      { tier: 3, text: "ⓘ" },
+    ].filter((c) => c.text.length > 0);
+  };
+
+  const fitsStatusText = (): boolean =>
+    statusTextEl.scrollWidth <= statusTextEl.clientWidth + 1;
+
+  const populateSelect = (
+    el: HTMLSelectElement,
+    options: string[],
+    value: string | null | undefined,
+  ): void => {
+    const v = (value && value.trim()) || "default";
+    const opts = options.includes(v) ? options : [v, ...options];
+    const sig = v + "\n" + opts.join("\n");
+    if (el.dataset.sig === sig) return;
+    el.dataset.sig = sig;
+    el.innerHTML = "";
+    for (const opt of opts) {
+      const o = document.createElement("option");
+      o.value = opt;
+      o.textContent = opt === "default" ? "default (CLI config)" : opt;
       if (opt === v) o.selected = true;
       el.appendChild(o);
     }
@@ -280,7 +525,10 @@ function main(): void {
     inputEl.value = st.text;
     autosizeInput();
     try {
-      const start = Math.max(0, Math.min(st.selectionStart, inputEl.value.length));
+      const start = Math.max(
+        0,
+        Math.min(st.selectionStart, inputEl.value.length),
+      );
       const end = Math.max(0, Math.min(st.selectionEnd, inputEl.value.length));
       inputEl.setSelectionRange(start, end);
     } catch {
@@ -290,15 +538,45 @@ function main(): void {
     if (opts?.updateSuggestions ?? true) updateSuggestions();
   };
 
+  // Input history is per session so Up/Down navigation doesn't leak across tabs.
+  type InputHistoryState = {
+    items: string[];
+    index: number | null;
+    draftBeforeHistory: string;
+  };
+
+  const inputHistoryBySessionKey = new Map<string, InputHistoryState>();
+
+  const ensureInputHistoryState = (key: string): InputHistoryState => {
+    const existing = inputHistoryBySessionKey.get(key);
+    if (existing) return existing;
+    const next: InputHistoryState = {
+      items: [],
+      index: null,
+      draftBeforeHistory: "",
+    };
+    inputHistoryBySessionKey.set(key, next);
+    return next;
+  };
+
+  const inputHistoryKeyForActiveComposer = (): string => activeComposerKey;
+
+  const exitInputHistoryNavigation = (sessionId: string | null): void => {
+    const key = composerKeyForSessionId(sessionId);
+    const st = ensureInputHistoryState(key);
+    if (st.index === null) return;
+    inputEl.value = st.draftBeforeHistory;
+    st.index = null;
+    st.draftBeforeHistory = "";
+  };
+
   // Chat auto-scroll:
   // - While the user is near the bottom, new content keeps the log pinned to the bottom.
   // - Once the user scrolls up, stop forcing scroll (free mode) until they scroll back near bottom.
   let stickLogToBottom = true;
   const isLogNearBottom = (): boolean => {
     const slackPx = 40;
-    return (
-      logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= slackPx
-    );
+    return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= slackPx;
   };
 
   const positionReturnToBottomBtn = (): void => {
@@ -361,7 +639,6 @@ function main(): void {
   });
   window.addEventListener("pagehide", () => saveComposerState());
 
-
   const getSessionDisplayTitle = (
     sess: Session,
     idx: number,
@@ -396,7 +673,14 @@ function main(): void {
 
   let receivedState = false;
   let pendingState: ChatViewState | null = null;
+  let pendingStateSeq: number | null = null;
   let renderScheduled = false;
+  let controlRenderScheduled = false;
+  let pendingControlState: ChatViewState | null = null;
+  let pendingControlSeq: number | null = null;
+  let blocksRenderScheduled = false;
+  let pendingBlocksState: ChatViewState | null = null;
+  let forceScrollToBottomNextRender = false;
   function showWebviewError(err: unknown): void {
     const anyErr = err as { message?: unknown; stack?: unknown } | null;
     const msg = String(anyErr && anyErr.message ? anyErr.message : err);
@@ -440,7 +724,9 @@ function main(): void {
     if (target instanceof HTMLElement) return target;
     if (target instanceof Element) return target as unknown as HTMLElement;
     const node = target as Node;
-    return node && "parentElement" in node ? (node.parentElement as HTMLElement | null) : null;
+    return node && "parentElement" in node
+      ? (node.parentElement as HTMLElement | null)
+      : null;
   };
 
   window.addEventListener("mousemove", (e) => {
@@ -454,37 +740,240 @@ function main(): void {
   });
   window.addEventListener("keydown", (e) => {
     if (!hoveredAutoLink) return;
-    hoveredAutoLink.classList.toggle("modHover", Boolean(e.ctrlKey || e.metaKey));
+    hoveredAutoLink.classList.toggle(
+      "modHover",
+      Boolean(e.ctrlKey || e.metaKey),
+    );
   });
   window.addEventListener("keyup", (e) => {
     if (!hoveredAutoLink) return;
-    hoveredAutoLink.classList.toggle("modHover", Boolean(e.ctrlKey || e.metaKey));
+    hoveredAutoLink.classList.toggle(
+      "modHover",
+      Boolean(e.ctrlKey || e.metaKey),
+    );
   });
   window.addEventListener("blur", () => setAutoLinkHoverState(null, false));
 
-	  let state: ChatViewState = {
-	    sessions: [],
-	    activeSession: null,
-	    unreadSessionIds: [],
-	    runningSessionIds: [],
-	    blocks: [],
-	    latestDiff: null,
-	    sending: false,
-	    statusText: null,
-	    modelState: null,
-	    approvals: [],
-	    customPrompts: [],
-	  };
+  let state: ChatViewState = {
+    sessions: [],
+    activeSession: null,
+    unreadSessionIds: [],
+    runningSessionIds: [],
+    blocks: [],
+    latestDiff: null,
+    sending: false,
+    reloading: false,
+    statusText: null,
+    modelState: null,
+    approvals: [],
+    customPrompts: [],
+  };
+
+  let toastTimer: number | null = null;
+  const showToast = (
+    kind: "info" | "success" | "error",
+    message: string,
+    timeoutMs = 2500,
+  ): void => {
+    if (toastTimer !== null) {
+      window.clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    toastEl.className = `toast ${kind}`;
+    toastEl.textContent = message;
+    toastEl.style.display = "";
+    toastTimer = window.setTimeout(() => {
+      toastEl.style.display = "none";
+      toastEl.textContent = "";
+      toastEl.className = "toast";
+      toastTimer = null;
+    }, timeoutMs);
+  };
 
   let domSessionId: string | null = null;
+  let rewindTurnIndex: number | null = null;
   const blockElByKey = new Map<string, HTMLElement>();
   let tabsSig: string | null = null;
   const tabElBySessionId = new Map<string, HTMLDivElement>();
-
-  const inputHistory: string[] = [];
-  let historyIndex: number | null = null;
-  let draftBeforeHistory = "";
   let isComposing = false;
+
+  type ImageLoadResult =
+    | { ok: true; imageKey: string; mimeType: string; base64: string }
+    | { ok: false; imageKey: string; error: string };
+  const pendingImageRequestsById = new Map<
+    string,
+    { imageKey: string; resolve: (r: ImageLoadResult) => void }
+  >();
+  const imageObjectUrlByKey = new Map<
+    string,
+    { url: string; byteLength: number; lastUsedAt: number }
+  >();
+  const IMAGE_OBJECT_URL_CACHE_MAX_ITEMS = 24;
+  const IMAGE_OBJECT_URL_CACHE_MAX_TOTAL_BYTES = 12_000_000;
+  const IMAGE_RENDER_MAX_EDGE_PX = 1024;
+  const IMAGE_RENDER_MAX_BYTES = 350_000;
+
+  function pruneImageObjectUrls(): void {
+    const entries = Array.from(imageObjectUrlByKey.entries());
+    let total = entries.reduce((sum, [, v]) => sum + (v.byteLength || 0), 0);
+    if (
+      entries.length <= IMAGE_OBJECT_URL_CACHE_MAX_ITEMS &&
+      total <= IMAGE_OBJECT_URL_CACHE_MAX_TOTAL_BYTES
+    )
+      return;
+    entries.sort((a, b) => (a[1].lastUsedAt || 0) - (b[1].lastUsedAt || 0));
+    for (const [key, v] of entries) {
+      if (
+        imageObjectUrlByKey.size <= IMAGE_OBJECT_URL_CACHE_MAX_ITEMS &&
+        total <= IMAGE_OBJECT_URL_CACHE_MAX_TOTAL_BYTES
+      )
+        break;
+      URL.revokeObjectURL(v.url);
+      imageObjectUrlByKey.delete(key);
+      total -= v.byteLength || 0;
+    }
+  }
+
+  async function decodeBase64ToBytes(base64: string): Promise<Uint8Array> {
+    try {
+      const binary = atob(base64);
+      const out = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+      return out;
+    } catch (err) {
+      throw new Error(`Failed to decode base64: ${String(err)}`);
+    }
+  }
+
+  async function resizeImageBlob(
+    blob: Blob,
+  ): Promise<{ blob: Blob; byteLength: number }> {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const w = bitmap.width;
+      const h = bitmap.height;
+      if (!w || !h) return { blob, byteLength: blob.size };
+      const scale = Math.min(1, IMAGE_RENDER_MAX_EDGE_PX / Math.max(w, h));
+      const tw = Math.max(1, Math.round(w * scale));
+      const th = Math.max(1, Math.round(h * scale));
+
+      const canvas = document.createElement("canvas");
+      canvas.width = tw;
+      canvas.height = th;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return { blob, byteLength: blob.size };
+      ctx.drawImage(bitmap, 0, 0, tw, th);
+
+      const toBlob = (quality: number): Promise<Blob | null> =>
+        new Promise((resolve) =>
+          canvas.toBlob((b) => resolve(b), "image/jpeg", quality),
+        );
+      const candidates = [0.85, 0.75, 0.65, 0.55];
+      let best: Blob | null = null;
+      for (const q of candidates) {
+        const b = await toBlob(q);
+        if (!b) continue;
+        best = b;
+        if (b.size <= IMAGE_RENDER_MAX_BYTES) break;
+      }
+      if (!best) return { blob, byteLength: blob.size };
+      return { blob: best, byteLength: best.size };
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  function requestImageData(imageKey: string): Promise<ImageLoadResult> {
+    const requestId = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
+    return new Promise((resolve) => {
+      pendingImageRequestsById.set(requestId, { imageKey, resolve });
+      vscode.postMessage({ type: "loadImage", imageKey, requestId });
+    });
+  }
+
+  type OffloadableImageRef = {
+    imageKey?: string;
+    src: string;
+    mimeType?: string;
+    autoLoad?: boolean;
+    caption: string | null;
+  };
+
+  async function ensureImageRendered(
+    imageRef: OffloadableImageRef,
+    imgEl: HTMLImageElement,
+    captionEl: HTMLDivElement,
+  ): Promise<void> {
+    const imageKey =
+      typeof imageRef.imageKey === "string" ? imageRef.imageKey : "";
+    if (!imageKey) {
+      if (imageRef.src && imgEl.src !== imageRef.src) imgEl.src = imageRef.src;
+      return;
+    }
+
+    const cached = imageObjectUrlByKey.get(imageKey);
+    if (cached) {
+      cached.lastUsedAt = Date.now();
+      if (imgEl.src !== cached.url) imgEl.src = cached.url;
+      return;
+    }
+
+    if (!imageRef.autoLoad) {
+      imgEl.removeAttribute("src");
+      imgEl.style.cursor = "pointer";
+      const caption = (imageRef.caption || "").trim();
+      captionEl.textContent =
+        caption || "画像はオフロードされています（クリックで読み込み）";
+      captionEl.style.display = "";
+      imgEl.addEventListener(
+        "click",
+        () => {
+          (imageRef as any).autoLoad = true;
+          void ensureImageRendered(imageRef, imgEl, captionEl);
+        },
+        { once: true },
+      );
+      return;
+    }
+
+    captionEl.textContent = "画像を読み込み中…";
+    captionEl.style.display = "";
+
+    const res = await requestImageData(imageKey);
+    if (!res.ok) {
+      captionEl.textContent = `画像の読み込みに失敗: ${res.error}`;
+      captionEl.style.display = "";
+      return;
+    }
+
+    const bytes = await decodeBase64ToBytes(res.base64);
+    const mimeType =
+      res.mimeType || (imageRef.mimeType ? String(imageRef.mimeType) : "");
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    const rawBlob = new Blob([copy.buffer as ArrayBuffer], {
+      type: mimeType || "application/octet-stream",
+    });
+    const resized = await resizeImageBlob(rawBlob);
+    const url = URL.createObjectURL(resized.blob);
+    imageObjectUrlByKey.set(imageKey, {
+      url,
+      byteLength: resized.byteLength,
+      lastUsedAt: Date.now(),
+    });
+    pruneImageObjectUrls();
+
+    imgEl.style.cursor = "";
+    if (imgEl.src !== url) imgEl.src = url;
+    const caption = (imageRef.caption || "").trim();
+    captionEl.textContent = caption;
+    captionEl.style.display = caption ? "" : "none";
+  }
+
+  window.addEventListener("unload", () => {
+    for (const v of imageObjectUrlByKey.values()) URL.revokeObjectURL(v.url);
+    imageObjectUrlByKey.clear();
+  });
 
   let detailsState = persistedWebviewState.detailsState ?? {};
 
@@ -493,7 +982,14 @@ function main(): void {
     updatePersistedWebviewState({ detailsState });
   }
 
-  const baseSlashSuggestions: SuggestItem[] = [];
+  const baseSlashSuggestions: SuggestItem[] = [
+    {
+      insert: "/compact ",
+      label: "/compact",
+      detail: "Compact context",
+      kind: "slash",
+    },
+  ];
   const uiSlashSuggestions: SuggestItem[] = [
     {
       insert: "/new ",
@@ -535,14 +1031,15 @@ function main(): void {
   ];
 
   function buildSlashSuggestions(): SuggestItem[] {
-    const caps = state.capabilities ?? { agents: false, cliVariant: "unknown" as const };
+    const caps = state.capabilities ?? {
+      agents: false,
+      cliVariant: "unknown" as const,
+    };
     const ui = caps.agents
       ? uiSlashSuggestions
       : uiSlashSuggestions.filter((s) => s.label !== "/agents");
     const reserved = new Set(
-      [...baseSlashSuggestions, ...ui].map((s) =>
-        s.label.replace(/^\//, ""),
-      ),
+      [...baseSlashSuggestions, ...ui].map((s) => s.label.replace(/^\//, "")),
     );
     const custom = (state.customPrompts ?? [])
       .map((p) => {
@@ -572,7 +1069,8 @@ function main(): void {
 
   let suggestItems: SuggestItem[] = [];
   let suggestIndex = 0;
-  let fileSearch: null | { sessionId: string; query: string; paths: string[] } = null;
+  let fileSearch: null | { sessionId: string; query: string; paths: string[] } =
+    null;
   let fileSearchInFlight: null | { sessionId: string; query: string } = null;
   let fileSearchTimer: number | null = null;
   const FILE_SEARCH_DEBOUNCE_MS = 250;
@@ -581,11 +1079,21 @@ function main(): void {
   let agentIndex: string[] | null = null;
   let agentIndexForSessionId: string | null = null;
   let agentIndexRequestedForSessionId: string | null = null;
+  let skillIndex: Array<{
+    name: string;
+    description: string | null;
+    scope: string;
+    path: string;
+  }> | null = null;
+  let skillIndexForSessionId: string | null = null;
+  let skillIndexRequestedForSessionId: string | null = null;
   let activeReplace: null | {
     from: number;
     to: number;
     inserted: string;
   } = null;
+  const pendingBlocksBySessionId = new Map<string, ChatBlock[]>();
+  const blocksBySessionId = new Map<string, ChatBlock[]>();
 
   function isOpen(key: string, defaultOpen: boolean): boolean {
     const v = detailsState[key];
@@ -880,10 +1388,17 @@ function main(): void {
     if (root.dataset.fileLinks === "1") return;
     root.dataset.fileLinks = "1";
 
+    // NOTE: For plain text nodes, we intentionally keep file detection conservative
+    // (require at least one "/") to avoid accidental linkification (e.g. emails).
+    // For <code> tokens, we allow basename-style paths like "README.md:10" and
+    // ".env.local:23" because they are explicitly formatted by the author.
     const fileTokenRe =
       /(?:\.?\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?/g;
     const fileTokenWithAtRe =
       /@?(?:\.?\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?/g;
+
+    const codeFileTokenRe =
+      /^(?:\.?\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)*\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?$/;
 
     const urlRe = /https?:\/\/[^\s<>()]+/gi;
 
@@ -910,8 +1425,7 @@ function main(): void {
         continue;
       }
       const rawForMatch = raw.startsWith("@") ? raw.slice(1) : raw;
-      const m = rawForMatch.match(fileTokenRe);
-      if (!m || m.length !== 1 || m[0] !== rawForMatch) continue;
+      if (!codeFileTokenRe.test(rawForMatch)) continue;
       const normalized = normalizeToken(rawForMatch);
       if (!normalized) continue;
       el.dataset.openFile = normalized;
@@ -1056,7 +1570,9 @@ function main(): void {
       suggestEl.appendChild(row);
     }
 
-    const active = suggestEl.querySelector(".suggestItem.active") as HTMLElement | null;
+    const active = suggestEl.querySelector(
+      ".suggestItem.active",
+    ) as HTMLElement | null;
     if (active) {
       // Keep the active item visible when navigating with keyboard.
       active.scrollIntoView({ block: "nearest" });
@@ -1102,10 +1618,12 @@ function main(): void {
       .map((it) => {
         const label = it.label.toLowerCase();
         const altLabel = label.startsWith("/prompts:")
-          ? ("/" + label.slice("/prompts:".length))
+          ? "/" + label.slice("/prompts:".length)
           : label.startsWith("@")
             ? label.slice(1)
-          : label;
+            : label.startsWith("$")
+              ? label.slice(1)
+              : label;
         const useAlt = !q.includes("prompts:");
         const hay = useAlt ? altLabel : label;
         const idx = hay.indexOf(q);
@@ -1160,7 +1678,10 @@ function main(): void {
     if (atTok) {
       const query = atTok.token.slice(1);
       let items: SuggestItem[] = [...atSuggestions];
-      const caps = state.capabilities ?? { agents: false, cliVariant: "unknown" as const };
+      const caps = state.capabilities ?? {
+        agents: false,
+        cliVariant: "unknown" as const,
+      };
 
       if (query.length > 0 || atTok.token === "@") {
         if (caps.agents) {
@@ -1253,6 +1774,65 @@ function main(): void {
       return;
     }
 
+    const dollarTok = currentPrefixedToken("$");
+    if (dollarTok) {
+      const query = dollarTok.token.slice(1);
+      const sessionId = state.activeSession.id;
+
+      if (
+        (!skillIndex || skillIndexForSessionId !== sessionId) &&
+        skillIndexRequestedForSessionId !== sessionId
+      ) {
+        skillIndexRequestedForSessionId = sessionId;
+        vscode.postMessage({ type: "requestSkillIndex", sessionId });
+      }
+
+      if (!skillIndex || skillIndexForSessionId !== sessionId) {
+        suggestItems = [];
+        activeReplace = null;
+        renderSuggest();
+        return;
+      }
+
+      const q = query.toLowerCase();
+      const filtered = query
+        ? skillIndex.filter((s) => {
+            const name = (s.name || "").toLowerCase();
+            if (name.includes(q)) return true;
+            const desc = (s.description || "").toLowerCase();
+            return desc.includes(q);
+          })
+        : skillIndex;
+
+      const items = filtered.slice(0, 50).map((s) => ({
+        insert: `$${s.name} `,
+        label: `$${s.name}`,
+        detail: s.description ? truncateOneLine(s.description, 60) : "",
+        kind: "skill" as const,
+      }));
+
+      const ranked = query ? rankByPrefix(items, query) : items;
+      const nextReplace = {
+        from: dollarTok.start,
+        to: dollarTok.end,
+        inserted: "",
+      };
+      suggestItems = ranked;
+      activeReplace = nextReplace;
+      if (
+        prevReplace &&
+        prevReplace.from === nextReplace.from &&
+        prevReplace.to === nextReplace.to &&
+        isSameSuggestList(prevItems, ranked)
+      ) {
+        suggestIndex = Math.min(ranked.length - 1, Math.max(0, prevIndex));
+      } else {
+        suggestIndex = 0;
+      }
+      renderSuggest();
+      return;
+    }
+
     // Slash commands: only show at start of first line.
     const lineStart = before.lastIndexOf("\n") + 1;
     const onFirstLine = before.indexOf("\n") === -1;
@@ -1265,9 +1845,7 @@ function main(): void {
           query.length === 0 ||
           allSlash.some((s) => slashMatches(s.label, query))
         ) {
-          const ranked = query
-            ? rankByPrefix(allSlash, "/" + query)
-            : allSlash;
+          const ranked = query ? rankByPrefix(allSlash, "/" + query) : allSlash;
           const nextReplace = {
             from: slashTok.start,
             to: slashTok.end,
@@ -1334,16 +1912,75 @@ function main(): void {
     requestAnimationFrame(() => {
       renderScheduled = false;
       if (!pendingState) return;
-      render(pendingState);
+      const renderedSeq = pendingStateSeq;
+      try {
+        renderFull(pendingState);
+      } catch (err) {
+        vscode.postMessage({
+          type: "uiError",
+          message: `Webview render failed: ${String((err as Error)?.message ?? err)}`,
+        });
+      }
       pendingState = null;
+      pendingStateSeq = null;
       autosizeInput();
+      if (typeof renderedSeq === "number") {
+        vscode.postMessage({ type: "stateAck", seq: renderedSeq });
+      }
     });
   }
 
-  function render(s: ChatViewState): void {
+  function scheduleControlRender(): void {
+    if (controlRenderScheduled) return;
+    controlRenderScheduled = true;
+    requestAnimationFrame(() => {
+      controlRenderScheduled = false;
+      if (!pendingControlState) return;
+      const renderedSeq = pendingControlSeq;
+      try {
+        renderControl(pendingControlState);
+      } catch (err) {
+        vscode.postMessage({
+          type: "uiError",
+          message: `Webview render(control) failed: ${String((err as Error)?.message ?? err)}`,
+        });
+      }
+      pendingControlState = null;
+      pendingControlSeq = null;
+      autosizeInput();
+      if (typeof renderedSeq === "number") {
+        vscode.postMessage({ type: "stateAck", seq: renderedSeq });
+      }
+    });
+  }
+
+  function scheduleBlocksRender(): void {
+    if (blocksRenderScheduled) return;
+    blocksRenderScheduled = true;
+    requestAnimationFrame(() => {
+      blocksRenderScheduled = false;
+      if (!pendingBlocksState) return;
+      try {
+        renderBlocks(pendingBlocksState);
+      } catch (err) {
+        vscode.postMessage({
+          type: "uiError",
+          message: `Webview render(blocks) failed: ${String((err as Error)?.message ?? err)}`,
+        });
+      }
+      pendingBlocksState = null;
+      updateReturnToBottomVisibility();
+    });
+  }
+
+  function renderFull(s: ChatViewState): void {
     state = s;
-    const shouldAutoScroll = stickLogToBottom && isLogNearBottom();
-    let forceScrollToBottom = false;
+    renderControl(s);
+    renderBlocks(s);
+  }
+
+  function renderControl(s: ChatViewState): void {
+    state = s;
     titleEl.textContent = s.activeSession
       ? getSessionDisplayTitle(
           s.activeSession,
@@ -1363,28 +2000,78 @@ function main(): void {
     const effortOptions = (() => {
       if (!ms.model || models.length === 0)
         return ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
-      const model = models.find((m) => m.model === ms.model || m.id === ms.model);
-      if (!model) return ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
+      const model = models.find(
+        (m) => m.model === ms.model || m.id === ms.model,
+      );
+      if (!model)
+        return ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
       const supported =
         model.supportedReasoningEfforts
           ?.map((o) => o.reasoningEffort)
-          .filter((v): v is string => typeof v === "string" && v.length > 0) ?? [];
+          .filter((v): v is string => typeof v === "string" && v.length > 0) ??
+        [];
       if (supported.length === 0)
         return ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
       return ["default", ...supported];
     })();
     populateSelect(reasoningSelect, effortOptions, ms.reasoning);
 
-
     const fullStatus = String(s.statusText || "").trim();
-    const shortStatus = (() => {
-      const m = fullStatus.match(/ctx\\s+remaining=([0-9]{1,3})%/i);
-      if (m) return `ctx ${m[1]}%`;
-      return fullStatus;
-    })();
-    statusTextEl.textContent = shortStatus;
-    statusTextEl.title = fullStatus;
-    statusTextEl.style.display = shortStatus ? "" : "none";
+    const statusTooltip = String(s.statusTooltip || fullStatus).trim();
+    const parsed = parseFooterStatus(fullStatus);
+    const candidates = buildFooterStatusCandidates(parsed);
+
+    // Constrain the footer status area so it never steals space from the selectors.
+    const gapPx = 10;
+    const availablePx = Math.max(
+      0,
+      footerBarEl.clientWidth -
+        Math.round(modelBarEl.getBoundingClientRect().width) -
+        gapPx,
+    );
+    statusTextEl.style.maxWidth = `${availablePx}px`;
+
+    statusPopoverDetails = fullStatus;
+    statusHoverDetails = statusTooltip !== fullStatus ? statusTooltip : "";
+    statusPopoverEnabled = false;
+
+    // Do not dismiss the hover popover during refresh. Rate limit updates (and other
+    // streaming refreshes) can arrive frequently; keep the popover visible while
+    // the user is hovering so the tooltip remains readable.
+    if (statusPopoverOpen) {
+      statusPopoverEl.textContent = statusPopoverDetails;
+      statusPopoverEl.style.display = "";
+    } else if (statusTextHovering) {
+      if (statusHoverDetails) {
+        statusPopoverEl.textContent = statusHoverDetails;
+        statusPopoverEl.style.display = "";
+      } else {
+        hideStatusPopover();
+      }
+    } else {
+      hideStatusPopover();
+    }
+
+    if (fullStatus && candidates.length > 0) {
+      let chosen = candidates[candidates.length - 1]!;
+      for (const c of candidates) {
+        statusTextEl.textContent = c.text;
+        statusTextEl.title = statusTooltip;
+        statusTextEl.style.display = "";
+        if (fitsStatusText()) {
+          chosen = c;
+          break;
+        }
+      }
+      statusPopoverEnabled = chosen.tier >= 2;
+      statusTextEl.classList.toggle("clickable", statusPopoverEnabled);
+    } else {
+      statusTextEl.textContent = fullStatus;
+      statusTextEl.title = statusTooltip;
+      statusTextEl.style.display = fullStatus ? "" : "none";
+      statusTextEl.classList.remove("clickable");
+      statusPopoverEnabled = false;
+    }
     diffBtn.disabled = !s.latestDiff;
     sendBtn.disabled = !s.activeSession;
     sendBtn.dataset.mode = s.sending ? "stop" : "send";
@@ -1394,6 +2081,12 @@ function main(): void {
     resumeBtn.disabled = s.sending;
     attachBtn.disabled = !s.activeSession;
     const variant = s.capabilities?.cliVariant ?? "unknown";
+    reloadBtn.disabled =
+      !s.activeSession || s.sending || s.reloading || variant !== "codex-mine";
+    reloadBtn.title =
+      variant === "codex-mine"
+        ? "Reload session (re-read config.toml, agents, etc.)"
+        : "Reload session (codex-mine only)";
     settingsBtn.disabled = false;
     settingsBtn.title =
       variant === "codex-mine"
@@ -1404,6 +2097,7 @@ function main(): void {
     // Keep input enabled so the user can draft messages even before selecting a session.
     // Sending is still guarded by sendBtn.disabled and sendCurrentInput().
     inputEl.disabled = false;
+    updateInputPlaceholder();
 
     const sessionsList = s.sessions || [];
     const unread = new Set<string>(s.unreadSessionIds || []);
@@ -1439,7 +2133,8 @@ function main(): void {
         const dt = getSessionDisplayTitle(sess, idx);
 
         const existing = tabElBySessionId.get(sess.id);
-        const div = existing ?? (document.createElement("div") as HTMLDivElement);
+        const div =
+          existing ?? (document.createElement("div") as HTMLDivElement);
         if (!existing) {
           tabElBySessionId.set(sess.id, div);
           div.addEventListener("click", () =>
@@ -1469,14 +2164,34 @@ function main(): void {
     const nextSessionId = s.activeSession ? s.activeSession.id : null;
     if (domSessionId !== nextSessionId) {
       // Persist the previous session's draft before switching.
+      // If the user is browsing input history, exit that mode so the draft is saved.
+      exitInputHistoryNavigation(domSessionId);
       saveComposerState();
       domSessionId = nextSessionId;
       restoreComposerState(domSessionId);
+      setEditMode(null);
       blockElByKey.clear();
       logEl.replaceChildren();
       // New session / fresh log should start pinned.
       stickLogToBottom = true;
-      forceScrollToBottom = true;
+      forceScrollToBottomNextRender = true;
+
+      // If blocks for the next session are already known, immediately re-render them.
+      // This avoids a race where a blocks render runs before this control render,
+      // and then gets wiped by the DOM reset above.
+      if (domSessionId) {
+        const cached =
+          pendingBlocksBySessionId.get(domSessionId) ??
+          blocksBySessionId.get(domSessionId) ??
+          null;
+        if (cached) {
+          pendingBlocksBySessionId.delete(domSessionId);
+          blocksBySessionId.set(domSessionId, cached);
+          state = { ...(state as any), blocks: cached } as ChatViewState;
+          pendingBlocksState = state;
+          scheduleBlocksRender();
+        }
+      }
     }
 
     approvalsEl.innerHTML = "";
@@ -1606,10 +2321,47 @@ function main(): void {
       return;
     }
 
+    updateSuggestions();
+  }
+
+  function renderBlocks(s: ChatViewState): void {
+    if (!s.activeSession) return;
+
+    const shouldAutoScroll = stickLogToBottom && isLogNearBottom();
+    const forceScrollToBottom = forceScrollToBottomNextRender;
+    forceScrollToBottomNextRender = false;
+
+    let userTurnIndex = 0;
     for (const block of s.blocks || []) {
       if (block.type === "divider") {
         const key = "b:" + block.id;
         const div = ensureDiv(key, "msg system divider");
+        const status = block.status;
+        const existingIcon = div.querySelector(
+          'span[data-k="statusIcon"]',
+        ) as HTMLSpanElement | null;
+        if (status) {
+          const icon =
+            existingIcon ??
+            (() => {
+              const el = document.createElement("span");
+              el.dataset.k = "statusIcon";
+              div.appendChild(el);
+              return el;
+            })();
+          const className = `statusIcon status-${status}`;
+          if (icon.className !== className) icon.className = className;
+          const label =
+            status === "inProgress"
+              ? "Compacting"
+              : status === "completed"
+                ? "Completed"
+                : "Failed";
+          if (icon.getAttribute("aria-label") !== label)
+            icon.setAttribute("aria-label", label);
+        } else if (existingIcon) {
+          existingIcon.remove();
+        }
         const pre = ensurePre(div, "body");
         if (pre.textContent !== block.text) pre.textContent = block.text;
         continue;
@@ -1630,9 +2382,7 @@ function main(): void {
           "msg imageBlock imageBlock-" + String(block.role || "system"),
         );
         const titleEl =
-          (div.querySelector(
-            'div[data-k="title"]',
-          ) as HTMLDivElement | null) ??
+          (div.querySelector('div[data-k="title"]') as HTMLDivElement | null) ??
           (() => {
             const t = document.createElement("div");
             t.dataset.k = "title";
@@ -1640,7 +2390,8 @@ function main(): void {
             div.appendChild(t);
             return t;
           })();
-        if (titleEl.textContent !== block.title) titleEl.textContent = block.title;
+        if (titleEl.textContent !== block.title)
+          titleEl.textContent = block.title;
 
         const img =
           (div.querySelector(
@@ -1654,10 +2405,8 @@ function main(): void {
             div.appendChild(i);
             return i;
           })();
-        if (img.src !== block.src) img.src = block.src;
         img.alt = block.alt || "image";
 
-        const captionText = (block.caption || "").trim();
         const captionEl =
           (div.querySelector(
             'div[data-k="caption"]',
@@ -1669,8 +2418,80 @@ function main(): void {
             div.appendChild(c);
             return c;
           })();
-        captionEl.textContent = captionText;
-        captionEl.style.display = captionText ? "" : "none";
+        void ensureImageRendered(block, img, captionEl).catch((err) => {
+          captionEl.textContent = `画像の描画に失敗: ${String(err)}`;
+          captionEl.style.display = "";
+        });
+        continue;
+      }
+
+      if (block.type === "imageGallery") {
+        const key = "b:" + block.id;
+        const div = ensureDiv(
+          key,
+          "msg imageGallery imageGallery-" + String(block.role || "system"),
+        );
+        const titleEl =
+          (div.querySelector('div[data-k="title"]') as HTMLDivElement | null) ??
+          (() => {
+            const t = document.createElement("div");
+            t.dataset.k = "title";
+            t.className = "imageGalleryTitle";
+            div.appendChild(t);
+            return t;
+          })();
+        if (titleEl.textContent !== block.title)
+          titleEl.textContent = block.title;
+
+        const gridEl =
+          (div.querySelector('div[data-k="grid"]') as HTMLDivElement | null) ??
+          (() => {
+            const g = document.createElement("div");
+            g.dataset.k = "grid";
+            g.className = "imageGalleryGrid";
+            div.appendChild(g);
+            return g;
+          })();
+
+        gridEl.replaceChildren();
+        for (let i = 0; i < block.images.length; i++) {
+          const imageRef = block.images[i]!;
+          const tile = document.createElement("div");
+          tile.className = "imageGalleryTile";
+
+          const img =
+            (tile.querySelector(
+              'img[data-k="image"]',
+            ) as HTMLImageElement | null) ??
+            (() => {
+              const im = document.createElement("img");
+              im.dataset.k = "image";
+              im.className = "imageGalleryImage";
+              im.loading = "lazy";
+              tile.appendChild(im);
+              return im;
+            })();
+          img.alt = imageRef.alt || "image";
+
+          const captionEl =
+            (tile.querySelector(
+              'div[data-k="caption"]',
+            ) as HTMLDivElement | null) ??
+            (() => {
+              const c = document.createElement("div");
+              c.dataset.k = "caption";
+              c.className = "imageGalleryCaption";
+              tile.appendChild(c);
+              return c;
+            })();
+
+          void ensureImageRendered(imageRef, img, captionEl).catch((err) => {
+            captionEl.textContent = `画像の描画に失敗: ${String(err)}`;
+            captionEl.style.display = "";
+          });
+
+          gridEl.appendChild(tile);
+        }
         continue;
       }
 
@@ -1704,6 +2525,65 @@ function main(): void {
           key,
           "msg " + (block.type === "user" ? "user" : "assistant"),
         );
+
+        if (block.type === "user") {
+          userTurnIndex += 1;
+          div.dataset.turnIndex = String(userTurnIndex);
+
+          const header =
+            (div.querySelector(
+              ':scope > div[data-k="header"]',
+            ) as HTMLDivElement | null) ??
+            (() => {
+              const h = document.createElement("div");
+              h.dataset.k = "header";
+              h.className = "msgHeader";
+              div.prepend(h);
+              return h;
+            })();
+
+          const title =
+            (header.querySelector(
+              ':scope > div[data-k="title"]',
+            ) as HTMLDivElement | null) ??
+            (() => {
+              const t = document.createElement("div");
+              t.dataset.k = "title";
+              t.className = "msgHeaderTitle";
+              header.appendChild(t);
+              return t;
+            })();
+          title.textContent = `Turn #${userTurnIndex}`;
+
+          const actions =
+            (header.querySelector(
+              ':scope > div[data-k="actions"]',
+            ) as HTMLDivElement | null) ??
+            (() => {
+              const a = document.createElement("div");
+              a.dataset.k = "actions";
+              a.className = "msgActions";
+              header.appendChild(a);
+              return a;
+            })();
+
+          actions.replaceChildren();
+
+          const editBtn = document.createElement("button");
+          editBtn.className = "msgActionBtn";
+          editBtn.textContent = "Edit";
+          editBtn.disabled = Boolean(state.sending);
+          editBtn.addEventListener("click", () => {
+            if (state.sending) return;
+            setEditMode(userTurnIndex, block.text);
+            inputEl.focus();
+          });
+          actions.appendChild(editBtn);
+        } else {
+          const header = div.querySelector(':scope > div[data-k="header"]');
+          if (header) header.remove();
+        }
+
         if (block.type === "assistant" && block.streaming) {
           const mdEl = div.querySelector(`div.md[data-k="body"]`);
           if (mdEl) mdEl.remove();
@@ -1771,7 +2651,8 @@ function main(): void {
           block.durationMs === null
         ) {
           const existing = blockElByKey.get(id);
-          if (existing?.parentElement) existing.parentElement.removeChild(existing);
+          if (existing?.parentElement)
+            existing.parentElement.removeChild(existing);
           blockElByKey.delete(id);
           delete detailsState[id];
           continue;
@@ -1972,6 +2853,22 @@ function main(): void {
           continue;
         }
 
+        if (block.title === "MCP startup issues") {
+          const id = "mcpStartupIssues:" + block.id;
+          const det = ensureDetails(
+            id,
+            "notice",
+            false,
+            "Notice: " + block.title,
+            id,
+          );
+          const pre = det.querySelector(`pre[data-k="body"]`);
+          if (pre) pre.remove();
+          const mdEl = ensureMd(det, "body");
+          renderMarkdownInto(mdEl, block.text);
+          continue;
+        }
+
         const div = ensureDiv(key, "msg system");
         const pre = div.querySelector(`pre[data-k="body"]`);
         if (pre) pre.remove();
@@ -2011,7 +2908,6 @@ function main(): void {
     }
 
     pruneStaleSessionBlockEls(new Set((s.blocks || []).map((b) => b.id)));
-    updateSuggestions();
     updateReturnToBottomVisibility();
 
     if (forceScrollToBottom || shouldAutoScroll) {
@@ -2021,7 +2917,35 @@ function main(): void {
     }
   }
 
-function sendCurrentInput(): void {
+  function setEditMode(next: number | null, presetText?: string): void {
+    rewindTurnIndex = next;
+
+    if (typeof presetText === "string") {
+      inputEl.value = presetText;
+      autosizeInput();
+      updateSuggestions();
+      saveComposerState();
+    }
+
+    if (rewindTurnIndex === null) {
+      editBannerEl.style.display = "none";
+      editBannerEl.replaceChildren();
+      return;
+    }
+
+    editBannerEl.replaceChildren();
+    const text = document.createElement("div");
+    text.className = "editBannerText";
+    text.textContent = `Editing turn #${rewindTurnIndex}. Sending will rewind and replace subsequent messages.`;
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => setEditMode(null));
+    editBannerEl.appendChild(text);
+    editBannerEl.appendChild(cancel);
+    editBannerEl.style.display = "";
+  }
+
+  function sendCurrentInput(): void {
     if (!state.activeSession) return;
     if (state.sending) return;
     const text = inputEl.value;
@@ -2032,24 +2956,31 @@ function sendCurrentInput(): void {
         type: "sendWithImages",
         text,
         images: pendingImages.map((img) => ({ name: img.name, url: img.url })),
+        rewind: rewindTurnIndex === null ? null : { turnIndex: rewindTurnIndex },
       });
       pendingImages.splice(0, pendingImages.length);
       renderAttachments();
     } else {
-      vscode.postMessage({ type: "send", text });
+      vscode.postMessage({
+        type: "send",
+        text,
+        rewind: rewindTurnIndex === null ? null : { turnIndex: rewindTurnIndex },
+      });
     }
 
     // Keep a simple history for navigating with Up/Down.
-    const last = inputHistory.at(-1);
-    if (last !== trimmed) inputHistory.push(trimmed);
-    historyIndex = null;
-    draftBeforeHistory = "";
+    const hist = ensureInputHistoryState(activeComposerKey);
+    const last = hist.items.at(-1);
+    if (last !== trimmed) hist.items.push(trimmed);
+    hist.index = null;
+    hist.draftBeforeHistory = "";
 
     inputEl.value = "";
     inputEl.setSelectionRange(0, 0);
     autosizeInput();
     updateSuggestions();
     saveComposerState();
+    setEditMode(null);
   }
 
   function renderAttachments(): void {
@@ -2091,7 +3022,8 @@ function sendCurrentInput(): void {
   function readFileAsDataUrl(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onerror = () => reject(reader.error ?? new Error("File read failed"));
+      reader.onerror = () =>
+        reject(reader.error ?? new Error("File read failed"));
       reader.onload = () => {
         if (typeof reader.result === "string") resolve(reader.result);
         else reject(new Error("Unexpected file read result"));
@@ -2112,7 +3044,10 @@ function sendCurrentInput(): void {
     return "png";
   }
 
-  async function attachImageFile(file: File, fallbackBaseName: string): Promise<void> {
+  async function attachImageFile(
+    file: File,
+    fallbackBaseName: string,
+  ): Promise<void> {
     const url = await readFileAsDataUrl(file);
     const ext = fileExtFromMime(file.type);
     const rawName = String((file as any).name || "").trim();
@@ -2178,6 +3113,9 @@ function sendCurrentInput(): void {
   resumeBtn.addEventListener("click", () =>
     vscode.postMessage({ type: "resumeFromHistory" }),
   );
+  reloadBtn.addEventListener("click", () =>
+    state.reloading ? undefined : vscode.postMessage({ type: "reloadSession" }),
+  );
   statusBtn.addEventListener("click", () =>
     vscode.postMessage({ type: "showStatus" }),
   );
@@ -2197,7 +3135,8 @@ function sendCurrentInput(): void {
       if (!dt) return;
       const items = Array.from(dt.items || []);
       const imageItems = items.filter(
-        (it) => it.kind === "file" && String(it.type || "").startsWith("image/"),
+        (it) =>
+          it.kind === "file" && String(it.type || "").startsWith("image/"),
       );
       if (imageItems.length === 0) return;
       if (!state.activeSession) return;
@@ -2223,13 +3162,20 @@ function sendCurrentInput(): void {
   });
   inputEl.addEventListener("keyup", (e) => {
     const key = (e as KeyboardEvent).key;
-    if ((key === "ArrowDown" || key === "ArrowUp") && suggestItems.length > 0) return;
+    if ((key === "ArrowDown" || key === "ArrowUp") && suggestItems.length > 0)
+      return;
     updateSuggestions();
   });
   inputEl.addEventListener("compositionstart", () => {
     isComposing = true;
   });
   inputEl.addEventListener("compositionend", () => {
+    isComposing = false;
+  });
+  // NOTE: On some platforms/IME flows, `compositionend` may not fire if the
+  // textarea loses focus mid-composition. If we keep `isComposing=true`, Enter
+  // will never send. Reset on blur to avoid a stuck composer.
+  inputEl.addEventListener("blur", () => {
     isComposing = false;
   });
 
@@ -2277,17 +3223,18 @@ function sendCurrentInput(): void {
       const end = inputEl.selectionEnd ?? 0;
       if (cur !== end) return;
       if (cur !== 0) return;
-      if (inputHistory.length === 0) return;
+      const hist = ensureInputHistoryState(inputHistoryKeyForActiveComposer());
+      if (hist.items.length === 0) return;
       e.preventDefault();
 
-      if (historyIndex === null) {
-        draftBeforeHistory = inputEl.value;
-        historyIndex = inputHistory.length - 1;
+      if (hist.index === null) {
+        hist.draftBeforeHistory = inputEl.value;
+        hist.index = hist.items.length - 1;
       } else {
-        historyIndex = Math.max(0, historyIndex - 1);
+        hist.index = Math.max(0, hist.index - 1);
       }
 
-      inputEl.value = inputHistory[historyIndex] || "";
+      inputEl.value = hist.items[hist.index] || "";
       const pos = inputEl.value.length;
       inputEl.setSelectionRange(pos, pos);
       autosizeInput();
@@ -2302,16 +3249,17 @@ function sendCurrentInput(): void {
       if ((e as KeyboardEvent).isComposing) return;
       if (suggestItems.length > 0) return;
 
-      if (historyIndex === null) return;
+      const hist = ensureInputHistoryState(inputHistoryKeyForActiveComposer());
+      if (hist.index === null) return;
       e.preventDefault();
 
-      historyIndex += 1;
-      if (historyIndex >= inputHistory.length) {
-        historyIndex = null;
-        inputEl.value = draftBeforeHistory;
-        draftBeforeHistory = "";
+      hist.index += 1;
+      if (hist.index >= hist.items.length) {
+        hist.index = null;
+        inputEl.value = hist.draftBeforeHistory;
+        hist.draftBeforeHistory = "";
       } else {
-        inputEl.value = inputHistory[historyIndex] || "";
+        inputEl.value = hist.items[hist.index] || "";
       }
       const pos = inputEl.value.length;
       inputEl.setSelectionRange(pos, pos);
@@ -2328,23 +3276,236 @@ function sendCurrentInput(): void {
     }
   });
 
+  function appendDeltaToPre(pre: HTMLPreElement, delta: string): void {
+    // Avoid creating one Text node per delta (can eventually freeze the webview).
+    const last = pre.lastChild;
+    if (last && last.nodeType === Node.TEXT_NODE) {
+      (last as Text).appendData(delta);
+      return;
+    }
+    pre.append(document.createTextNode(delta));
+  }
+
   window.addEventListener("message", (event: MessageEvent) => {
     const msg = event.data;
     if (!msg || typeof msg !== "object") return;
     const anyMsg = msg as {
       type?: unknown;
+      seq?: unknown;
       state?: unknown;
+      blocks?: unknown;
+      block?: unknown;
+      blockId?: unknown;
+      field?: unknown;
+      delta?: unknown;
+      streaming?: unknown;
       paths?: unknown;
       sessionId?: unknown;
       query?: unknown;
       agents?: unknown;
+      skills?: unknown;
       text?: unknown;
+      kind?: unknown;
+      message?: unknown;
+      timeoutMs?: unknown;
+      requestId?: unknown;
+      ok?: unknown;
+      mimeType?: unknown;
+      base64?: unknown;
+      error?: unknown;
     };
+    if (anyMsg.type === "toast") {
+      const kind =
+        anyMsg.kind === "success" || anyMsg.kind === "error" ? anyMsg.kind : "info";
+      const message = typeof anyMsg.message === "string" ? anyMsg.message : "";
+      if (!message) return;
+      const timeoutMs =
+        typeof anyMsg.timeoutMs === "number" && Number.isFinite(anyMsg.timeoutMs)
+          ? Math.max(0, Math.trunc(anyMsg.timeoutMs))
+          : 2500;
+      showToast(kind, message, timeoutMs);
+      return;
+    }
+    if (anyMsg.type === "imageData") {
+      const requestId =
+        typeof anyMsg.requestId === "string" ? anyMsg.requestId : null;
+      if (!requestId) return;
+      const pending = pendingImageRequestsById.get(requestId);
+      if (!pending) return;
+      pendingImageRequestsById.delete(requestId);
+      if (anyMsg.ok) {
+        pending.resolve({
+          ok: true,
+          imageKey: pending.imageKey,
+          mimeType: typeof anyMsg.mimeType === "string" ? anyMsg.mimeType : "",
+          base64: typeof anyMsg.base64 === "string" ? anyMsg.base64 : "",
+        });
+      } else {
+        pending.resolve({
+          ok: false,
+          imageKey: pending.imageKey,
+          error:
+            typeof anyMsg.error === "string" ? anyMsg.error : "Unknown error",
+        });
+      }
+      return;
+    }
     if (anyMsg.type === "state") {
       receivedState = true;
+      const seq = typeof anyMsg.seq === "number" ? anyMsg.seq : null;
       state = anyMsg.state as ChatViewState;
       pendingState = state;
+      pendingStateSeq = seq;
       scheduleRender();
+      return;
+    }
+    if (anyMsg.type === "controlState") {
+      receivedState = true;
+      const seq = typeof anyMsg.seq === "number" ? anyMsg.seq : null;
+      const next = (anyMsg.state as Partial<ChatViewState>) ?? {};
+      const prevBlocks = state.blocks;
+      state = {
+        ...(state as any),
+        ...(next as any),
+        blocks: prevBlocks,
+      } as ChatViewState;
+
+      const activeId = state.activeSession?.id ?? null;
+      if (activeId) {
+        const pendingBlocks = pendingBlocksBySessionId.get(activeId);
+        if (pendingBlocks) {
+          pendingBlocksBySessionId.delete(activeId);
+          blocksBySessionId.set(activeId, pendingBlocks);
+          state = { ...(state as any), blocks: pendingBlocks } as ChatViewState;
+          pendingBlocksState = state;
+          scheduleBlocksRender();
+        } else {
+          const cachedBlocks = blocksBySessionId.get(activeId);
+          if (cachedBlocks) {
+            state = { ...(state as any), blocks: cachedBlocks } as ChatViewState;
+            pendingBlocksState = state;
+            scheduleBlocksRender();
+          }
+        }
+      }
+      pendingControlState = state;
+      pendingControlSeq = seq;
+      scheduleControlRender();
+      return;
+    }
+    if (anyMsg.type === "blocksReset") {
+      const sessionId =
+        typeof anyMsg.sessionId === "string" ? anyMsg.sessionId : null;
+      if (!sessionId) return;
+      const blocks = Array.isArray(anyMsg.blocks)
+        ? (anyMsg.blocks as ChatBlock[])
+        : [];
+      blocksBySessionId.set(sessionId, blocks);
+      if (!state.activeSession || state.activeSession.id !== sessionId) {
+        pendingBlocksBySessionId.set(sessionId, blocks);
+        return;
+      }
+      state = { ...(state as any), blocks } as ChatViewState;
+      pendingBlocksState = state;
+      scheduleBlocksRender();
+      return;
+    }
+    if (anyMsg.type === "blockUpsert") {
+      const sessionId =
+        typeof anyMsg.sessionId === "string" ? anyMsg.sessionId : null;
+      if (!sessionId) return;
+      if (!state.activeSession || state.activeSession.id !== sessionId) return;
+      const block = anyMsg.block as ChatBlock;
+      if (!block || typeof (block as any).id !== "string") return;
+      const blocks = state.blocks || [];
+      const idx = blocks.findIndex((b) => b && b.id === (block as any).id);
+      if (idx >= 0) blocks[idx] = block;
+      else blocks.push(block);
+      blocksBySessionId.set(sessionId, blocks);
+      state = { ...(state as any), blocks } as ChatViewState;
+      pendingBlocksState = state;
+      scheduleBlocksRender();
+      return;
+    }
+    if (anyMsg.type === "blockAppend") {
+      const sessionId =
+        typeof anyMsg.sessionId === "string" ? anyMsg.sessionId : null;
+      const blockId =
+        typeof anyMsg.blockId === "string" ? anyMsg.blockId : null;
+      const field = typeof anyMsg.field === "string" ? anyMsg.field : null;
+      const delta = typeof anyMsg.delta === "string" ? anyMsg.delta : null;
+      const streaming =
+        typeof anyMsg.streaming === "boolean" ? anyMsg.streaming : null;
+      if (!sessionId || !blockId || !field || delta === null) return;
+      if (!state.activeSession || state.activeSession.id !== sessionId) return;
+
+      const b = (state.blocks || []).find((x) => x && x.id === blockId) as
+        | ChatBlock
+        | undefined;
+      if (!b) return;
+
+      if (field === "assistantText" && b.type === "assistant") {
+        b.text += delta;
+        if (streaming !== null) (b as any).streaming = streaming;
+        blocksBySessionId.set(sessionId, state.blocks || []);
+
+        // Fast path: update the visible <pre> without a full render.
+        const key = "b:" + blockId;
+        const div = blockElByKey.get(key);
+        if (div) {
+          const pre = div.querySelector(
+            `pre[data-k="body"]`,
+          ) as HTMLPreElement | null;
+          if (pre) {
+            appendDeltaToPre(pre, delta);
+            return;
+          }
+        }
+
+        pendingBlocksState = state;
+        scheduleBlocksRender();
+        return;
+      }
+      if (field === "commandOutput" && b.type === "command") {
+        b.output += delta;
+        blocksBySessionId.set(sessionId, state.blocks || []);
+
+        const id = "command:" + blockId;
+        const det = blockElByKey.get(id);
+        if (det && det.tagName.toLowerCase() === "details") {
+          const pre = (det as HTMLElement).querySelector(
+            `pre[data-k="body"]`,
+          ) as HTMLPreElement | null;
+          if (pre) {
+            appendDeltaToPre(pre, delta);
+            return;
+          }
+        }
+
+        pendingBlocksState = state;
+        scheduleBlocksRender();
+        return;
+      }
+      if (field === "fileChangeDetail" && b.type === "fileChange") {
+        b.detail += delta;
+        blocksBySessionId.set(sessionId, state.blocks || []);
+
+        const id = "fileChange:" + blockId;
+        const det = blockElByKey.get(id);
+        if (det && det.tagName.toLowerCase() === "details") {
+          const pre = (det as HTMLElement).querySelector(
+            `pre[data-k="detail"]`,
+          ) as HTMLPreElement | null;
+          if (pre) {
+            appendDeltaToPre(pre, delta);
+            return;
+          }
+        }
+
+        pendingBlocksState = state;
+        scheduleBlocksRender();
+        return;
+      }
       return;
     }
     if (anyMsg.type === "fileSearchResult") {
@@ -2361,12 +3522,16 @@ function sendCurrentInput(): void {
 
       // Ignore stale results.
       const inFlight = fileSearchInFlight;
-      if (!inFlight || inFlight.sessionId !== sessionId || inFlight.query !== query)
+      if (
+        !inFlight ||
+        inFlight.sessionId !== sessionId ||
+        inFlight.query !== query
+      )
         return;
 
       fileSearch = { sessionId, query, paths };
       fileSearchInFlight = null;
-      renderSuggest();
+      updateSuggestions();
       return;
     }
     if (anyMsg.type === "agentIndex") {
@@ -2381,6 +3546,42 @@ function sendCurrentInput(): void {
         agentIndexForSessionId = null;
       }
       renderSuggest();
+      return;
+    }
+    if (anyMsg.type === "skillIndex") {
+      const sessionId =
+        typeof anyMsg.sessionId === "string" ? anyMsg.sessionId : null;
+      const rawSkills = Array.isArray(anyMsg.skills) ? anyMsg.skills : [];
+      if (!sessionId) return;
+      if (!state.activeSession) return;
+      if (state.activeSession.id !== sessionId) return;
+
+      const skills = rawSkills
+        .map(
+          (
+            s,
+          ): null | {
+            name: string;
+            description: string | null;
+            scope: string;
+            path: string;
+          } => {
+            if (!s || typeof s !== "object") return null;
+            const o = s as Record<string, unknown>;
+            const name = typeof o.name === "string" ? o.name : "";
+            const scope = typeof o.scope === "string" ? o.scope : "";
+            const path = typeof o.path === "string" ? o.path : "";
+            const description =
+              typeof o.description === "string" ? o.description : null;
+            if (!name || !scope || !path) return null;
+            return { name, description, scope, path };
+          },
+        )
+        .filter((v): v is NonNullable<typeof v> => v !== null);
+
+      skillIndex = skills;
+      skillIndexForSessionId = sessionId;
+      updateSuggestions();
       return;
     }
     if (anyMsg.type === "insertText") {
@@ -2520,7 +3721,13 @@ function sendCurrentInput(): void {
       .map((p) => {
         const pl = p.toLowerCase();
         const depth = (p.match(/\//g) || []).length;
-        const score = q ? (pl.startsWith(q) ? 0 : pl.includes("/" + q) ? 1 : 2) : 0;
+        const score = q
+          ? pl.startsWith(q)
+            ? 0
+            : pl.includes("/" + q)
+              ? 1
+              : 2
+          : 0;
         return { p, score, depth, len: p.length };
       })
       .sort(
@@ -2579,6 +3786,18 @@ function sendCurrentInput(): void {
         return href;
       }
     })();
+
+    // If the link is explicitly a file reference, treat it as such even if it
+    // looks like it has a URI scheme (e.g. "README.md:10" would otherwise be
+    // misclassified as scheme="readme.md").
+    const explicitFileRefRe =
+      /^(?:\.{0,2}\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)*\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?$/;
+    if (explicitFileRefRe.test(decoded)) {
+      const normalized = decoded.replace(/^\/+/, "");
+      e.preventDefault();
+      vscode.postMessage({ type: "openFile", path: normalized });
+      return;
+    }
 
     const schemeMatch = decoded.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
     const scheme = schemeMatch ? schemeMatch[1]?.toLowerCase() : null;

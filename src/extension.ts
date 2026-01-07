@@ -4,9 +4,11 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as util from "node:util";
 import { parse as shellParse } from "shell-quote";
 import * as vscode from "vscode";
 import { BackendManager } from "./backend/manager";
+import type { BackendTermination } from "./backend/manager";
 import { listAgentsFromDisk } from "./agents_disk";
 import type { AnyServerNotification } from "./backend/types";
 import type { ContentBlock } from "./generated/ContentBlock";
@@ -32,6 +34,9 @@ import { DiffDocumentProvider, makeDiffUri } from "./ui/diff_provider";
 import { SessionPanelManager } from "./ui/session_panel_manager";
 import { SessionTreeDataProvider } from "./ui/session_tree";
 
+const REWIND_STEP_TIMEOUT_MS = 120_000;
+const LAST_ACTIVE_SESSION_KEY = "codexMine.lastActiveSessionId.v1";
+
 let backendManager: BackendManager | null = null;
 let sessions: SessionStore | null = null;
 let sessionTree: SessionTreeDataProvider | null = null;
@@ -39,11 +44,287 @@ let diffProvider: DiffDocumentProvider | null = null;
 let chatView: ChatViewProvider | null = null;
 let sessionPanels: SessionPanelManager | null = null;
 let activeSessionId: string | null = null;
-let selectSessionRequestSeq = 0;
 let extensionContext: vscode.ExtensionContext | null = null;
 let outputChannel: vscode.OutputChannel | null = null;
 
+type StressUiJob = {
+  sessionId: string;
+  cancel: () => void;
+};
+let stressUiJob: StressUiJob | null = null;
+
+type CachedImageMeta = {
+  mimeType: string;
+  byteLength: number;
+  createdAtMs: number;
+};
+
+const IMAGE_CACHE_DIRNAME = "images.v2";
+const IMAGE_CACHE_MAX_ITEMS = 500;
+const IMAGE_CACHE_MAX_TOTAL_BYTES = 250_000_000;
+const SESSION_IMAGE_AUTOLOAD_RECENT = 24;
+const USER_INPUT_IMAGE_DIRNAME = "user-input-images.v1";
+
+async function withTimeout<T>(
+  label: string,
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+function formatUnknownError(err: unknown): string {
+  if (err instanceof Error) return err.stack ?? err.message;
+  if (typeof err === "string") return err;
+  if (typeof err === "number" || typeof err === "boolean" || err === null)
+    return String(err);
+
+  if (typeof err === "object" && err !== null) {
+    const record = err as Record<string, unknown>;
+    const msg = record["message"];
+    const code = record["code"];
+    if (typeof msg === "string" && (typeof code === "string" || typeof code === "number")) {
+      return `code=${String(code)} message=${msg}`;
+    }
+    if (typeof msg === "string") return msg;
+  }
+
+  const inspected = util.inspect(err, {
+    depth: 6,
+    breakLength: 120,
+    maxArrayLength: 50,
+    maxStringLength: 10_000,
+  });
+  const maxLen = 12_000;
+  if (inspected.length <= maxLen) return inspected;
+  return `${inspected.slice(0, maxLen)}…(truncated ${inspected.length - maxLen} chars)`;
+}
+
+function requireExtensionContext(): vscode.ExtensionContext {
+  if (!extensionContext) throw new Error("extensionContext is not initialized");
+  return extensionContext;
+}
+
+function imageCacheDirFsPath(context: vscode.ExtensionContext): string {
+  const base = context.globalStorageUri?.fsPath;
+  if (!base) throw new Error("globalStorageUri is not available");
+  return path.join(base, IMAGE_CACHE_DIRNAME);
+}
+
+function userInputImageDirFsPath(context: vscode.ExtensionContext): string {
+  const base = context.globalStorageUri?.fsPath;
+  if (!base) throw new Error("globalStorageUri is not available");
+  return path.join(base, USER_INPUT_IMAGE_DIRNAME);
+}
+
+async function ensureUserInputImageDir(
+  context: vscode.ExtensionContext,
+): Promise<string> {
+  const dir = userInputImageDirFsPath(context);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+function imageCachePaths(
+  context: vscode.ExtensionContext,
+  imageKey: string,
+): { metaPath: string; dataPath: string } {
+  const dir = imageCacheDirFsPath(context);
+  return {
+    metaPath: path.join(dir, `${imageKey}.json`),
+    dataPath: path.join(dir, `${imageKey}.bin`),
+  };
+}
+
+async function ensureImageCacheDir(
+  context: vscode.ExtensionContext,
+): Promise<string> {
+  const dir = imageCacheDirFsPath(context);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+function sanitizeImageKey(key: string): string {
+  return key.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 160) || "img";
+}
+
+async function pruneImageCache(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  const dir = imageCacheDirFsPath(context);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch (err) {
+    // Directory may not exist yet; do not create it during prune.
+    return;
+  }
+
+  const metas = entries.filter((n) => n.endsWith(".json"));
+  const items: Array<{
+    imageKey: string;
+    metaPath: string;
+    dataPath: string;
+    createdAtMs: number;
+    byteLength: number;
+  }> = [];
+
+  for (const metaName of metas) {
+    const imageKey = metaName.slice(0, -".json".length);
+    const { metaPath, dataPath } = imageCachePaths(context, imageKey);
+    try {
+      const metaRaw = await fs.readFile(metaPath, "utf8");
+      const meta = JSON.parse(metaRaw) as CachedImageMeta;
+      if (
+        !meta ||
+        typeof meta.mimeType !== "string" ||
+        typeof meta.byteLength !== "number" ||
+        typeof meta.createdAtMs !== "number"
+      ) {
+        throw new Error(`Invalid meta: ${metaPath}`);
+      }
+      items.push({
+        imageKey,
+        metaPath,
+        dataPath,
+        createdAtMs: meta.createdAtMs,
+        byteLength: meta.byteLength,
+      });
+    } catch (err) {
+      // Corrupted meta: remove both files so it doesn't linger indefinitely.
+      outputChannel?.appendLine(
+        `[images] Corrupted meta '${metaName}', removing: ${String(err)}`,
+      );
+      await fs.rm(metaPath, { force: true }).catch(() => null);
+      await fs.rm(dataPath, { force: true }).catch(() => null);
+    }
+  }
+
+  items.sort((a, b) => b.createdAtMs - a.createdAtMs);
+  let totalBytes = items.reduce((sum, it) => sum + it.byteLength, 0);
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]!;
+    const keepByCount = i < IMAGE_CACHE_MAX_ITEMS;
+    const keepByBytes = totalBytes <= IMAGE_CACHE_MAX_TOTAL_BYTES;
+    if (keepByCount && keepByBytes) continue;
+    totalBytes -= it.byteLength;
+    await fs.rm(it.metaPath, { force: true }).catch(() => null);
+    await fs.rm(it.dataPath, { force: true }).catch(() => null);
+  }
+}
+
+async function cacheImageBytes(args: {
+  imageKey?: string;
+  prefix: string;
+  mimeType: string;
+  bytes: Buffer;
+}): Promise<{ imageKey: string; mimeType: string; byteLength: number }> {
+  const context = requireExtensionContext();
+  await ensureImageCacheDir(context);
+  const imageKey =
+    typeof args.imageKey === "string" && args.imageKey
+      ? sanitizeImageKey(args.imageKey)
+      : sanitizeImageKey(`${args.prefix}-${crypto.randomUUID()}`);
+  const { metaPath, dataPath } = imageCachePaths(context, imageKey);
+  const meta: CachedImageMeta = {
+    mimeType: args.mimeType,
+    byteLength: args.bytes.byteLength,
+    createdAtMs: Date.now(),
+  };
+  await fs.writeFile(dataPath, args.bytes);
+  await fs.writeFile(metaPath, JSON.stringify(meta));
+  void pruneImageCache(context);
+  return {
+    imageKey,
+    mimeType: args.mimeType,
+    byteLength: args.bytes.byteLength,
+  };
+}
+
+function parseDataUrl(dataUrl: string): { mimeType: string; base64: string } {
+  const m = /^data:([^;]+);base64,(.*)$/s.exec(dataUrl);
+  if (!m)
+    throw new Error("Unsupported image URL (expected data:...;base64,...)");
+  const mimeType = m[1] || "";
+  const base64 = m[2] || "";
+  if (!mimeType || !base64) throw new Error("Invalid data URL");
+  return { mimeType, base64 };
+}
+
+function imageExtFromMimeType(mimeType: string): string | null {
+  switch (mimeType) {
+    case "image/png":
+      return "png";
+    case "image/jpeg":
+      return "jpg";
+    case "image/gif":
+      return "gif";
+    case "image/webp":
+      return "webp";
+    case "image/bmp":
+      return "bmp";
+    case "image/svg+xml":
+      return "svg";
+    case "image/tiff":
+      return "tiff";
+    default:
+      return null;
+  }
+}
+
+async function persistUserInputImageFile(args: {
+  sessionId: string;
+  mimeType: string;
+  bytes: Buffer;
+}): Promise<{ path: string }> {
+  const context = requireExtensionContext();
+  const dir = await ensureUserInputImageDir(context);
+  const ext = imageExtFromMimeType(args.mimeType);
+  if (!ext) throw new Error(`Unsupported image MIME type: ${args.mimeType}`);
+  const fileName = `${sanitizeImageKey(`user-${args.sessionId}-${crypto.randomUUID()}`)}.${ext}`;
+  const filePath = path.join(dir, fileName);
+  await fs.writeFile(filePath, args.bytes);
+  return { path: filePath };
+}
+
+async function cacheImageDataUrl(args: {
+  prefix: string;
+  dataUrl: string;
+}): Promise<{ imageKey: string; mimeType: string; byteLength: number }> {
+  const { mimeType, base64 } = parseDataUrl(args.dataUrl);
+  const bytes = Buffer.from(base64, "base64");
+  return await cacheImageBytes({ prefix: args.prefix, mimeType, bytes });
+}
+
+async function loadCachedImageBase64(imageKey: string): Promise<{
+  mimeType: string;
+  base64: string;
+}> {
+  const context = requireExtensionContext();
+  const { metaPath, dataPath } = imageCachePaths(context, imageKey);
+  const metaRaw = await fs.readFile(metaPath, "utf8");
+  const meta = JSON.parse(metaRaw) as CachedImageMeta;
+  if (!meta || typeof meta.mimeType !== "string") {
+    throw new Error(`Invalid cached image meta: ${imageKey}`);
+  }
+  const data = await fs.readFile(dataPath);
+  return { mimeType: meta.mimeType, base64: data.toString("base64") };
+}
+
 const HIDDEN_TAB_SESSIONS_KEY = "codexMine.hiddenTabSessions.v1";
+const LEGACY_RUNTIMES_KEY = "codexMine.sessionRuntime.v1";
 const hiddenTabSessionIds = new Set<string>();
 const unreadSessionIds = new Set<string>();
 const mcpStatusByServer = new Map<string, string>();
@@ -53,6 +334,9 @@ const cliVariantByBackendKey = new Map<
 >();
 const defaultTitleRe = /^(.*)\s+\([0-9a-f]{8}\)$/i;
 type UiImageInput = { name: string; url: string };
+type BackendImageInput =
+  | { kind: "imageUrl"; url: string }
+  | { kind: "localImage"; path: string };
 
 type CustomPromptSummary = {
   name: string;
@@ -66,10 +350,15 @@ type SessionRuntime = {
   blocks: ChatBlock[];
   latestDiff: string | null;
   statusText: string | null;
+  uiHydrationBlockedText: string | null;
   tokenUsage: ThreadTokenUsage | null;
   sending: boolean;
+  reloading: boolean;
+  compactInFlight: boolean;
+  pendingCompactBlockId: string | null;
   streamingAssistantItemIds: Set<string>;
   activeTurnId: string | null;
+  pendingInterrupt: boolean;
   lastTurnStartedAtMs: number | null;
   lastTurnCompletedAtMs: number | null;
   v2NotificationsSeen: boolean;
@@ -92,6 +381,8 @@ const globalRuntime: Pick<SessionRuntime, "blocks" | "blockIndexById"> = {
   blockIndexById: new Map<string, number>(),
 };
 let globalStatusText: string | null = null;
+let globalRateLimitStatusText: string | null = null;
+let globalRateLimitStatusTooltip: string | null = null;
 let customPrompts: CustomPromptSummary[] = [];
 let sessionModelState: {
   model: string | null;
@@ -107,6 +398,9 @@ export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
   const output = vscode.window.createOutputChannel("Codex UI");
   outputChannel = output;
+  output.appendLine(
+    `[debug] Codex UI extension version=${String(context.extension.packageJSON.version || "")}`,
+  );
   output.appendLine(`[debug] extensionPath=${context.extensionPath}`);
   void loadInitialModelState(output);
 
@@ -116,11 +410,13 @@ export function activate(context: vscode.ExtensionContext): void {
   sessions = new SessionStore();
   loadSessions(context, sessions);
   for (const s of sessions.listAll()) ensureRuntime(s.id);
-  loadRuntimes(context, sessions);
   loadHiddenTabSessions(context);
   refreshCustomPromptsFromDisk();
+  void cleanupLegacyRuntimeCache(context);
 
   backendManager = new BackendManager(output, sessions);
+  backendManager.onBackendTerminated = (backendKey, info) =>
+    handleBackendTerminated(backendKey, info);
   backendManager.onServerEvent = (session, n) => {
     if (session) applyServerNotification(session.id, n);
     else applyGlobalNotification(n);
@@ -179,9 +475,10 @@ export function activate(context: vscode.ExtensionContext): void {
   chatView = new ChatViewProvider(
     context,
     () => buildChatState(),
-    async (text, images = []) => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
-      if (!sessions) throw new Error("sessions is not initialized");
+	    async (text, images = [], rewind = null) => {
+	      if (!backendManager) throw new Error("backendManager is not initialized");
+	      if (!sessions) throw new Error("sessions is not initialized");
+	      const bm = backendManager;
 
       const session = activeSessionId
         ? sessions.getById(activeSessionId)
@@ -192,6 +489,12 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       const trimmed = text.trim();
+      if (rewind && trimmed.startsWith("/")) {
+        void vscode.window.showErrorMessage(
+          "Rewind is not supported for slash commands.",
+        );
+        return;
+      }
       if (trimmed.startsWith("/") && images.length > 0) {
         void vscode.window.showErrorMessage(
           "Slash commands do not support images yet.",
@@ -208,7 +511,94 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(expanded.error);
         return;
       }
-      await sendUserInput(session, expanded.text, images);
+
+      if (rewind) {
+        const turnIndexRaw = (rewind as any).turnIndex;
+        const turnIndex =
+          typeof turnIndexRaw === "number" && Number.isFinite(turnIndexRaw)
+            ? Math.trunc(turnIndexRaw)
+            : 0;
+
+        if (!turnIndex || turnIndex < 1) {
+          void vscode.window.showErrorMessage("Invalid rewind request.");
+          return;
+        }
+
+        const rt = ensureRuntime(session.id);
+        if (rt.sending) {
+          void vscode.window.showErrorMessage(
+            "Cannot rewind while a turn is in progress.",
+          );
+          return;
+        }
+
+        const rewindBlockId = newLocalId("info");
+
+        const runRewind = async (): Promise<void> => {
+          upsertBlock(session.id, {
+            id: rewindBlockId,
+            type: "info",
+            title: "Rewind requested",
+            text: `Rewinding to turn #${turnIndex}…`,
+          });
+          chatView?.refresh();
+
+          await withTimeout(
+            "thread/rewind",
+            bm.threadRewind(session, { turnIndex }),
+            REWIND_STEP_TIMEOUT_MS,
+          );
+
+          upsertBlock(session.id, {
+            id: rewindBlockId,
+            type: "info",
+            title: "Reloading session",
+            text: "Rewind completed. Reloading thread state…",
+          });
+          chatView?.refresh();
+
+          const reloaded = await withTimeout(
+            "thread/reload",
+            bm.reloadSession(session, getSessionModelState()),
+            REWIND_STEP_TIMEOUT_MS,
+          );
+          hydrateRuntimeFromThread(session.id, reloaded.thread, {
+            force: true,
+          });
+
+          upsertBlock(session.id, {
+            id: rewindBlockId,
+            type: "info",
+            title: "Rewind completed",
+            text: `Rewound to turn #${turnIndex}.`,
+          });
+          chatView?.refresh();
+        };
+
+        try {
+          await runRewind();
+        } catch (err) {
+          const errText = formatUnknownError(err);
+          outputChannel?.appendLine(
+            `[rewind] Failed: threadId=${session.threadId} turnIndex=${turnIndex} err=${errText}`,
+          );
+          upsertBlock(session.id, {
+            id: rewindBlockId,
+            type: "error",
+            title: "Rewind failed",
+            text: `${errText}\n\nCheck 'Codex UI' output channel for backend logs.`,
+          });
+          chatView?.refresh();
+          return;
+        }
+      }
+
+      await sendUserInput(
+        session,
+        expanded.text,
+        images,
+        getSessionModelState(),
+      );
     },
     async (sessionId, query, cancellationToken) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
@@ -221,6 +611,41 @@ export function activate(context: vscode.ExtensionContext): void {
         cancellationToken,
       );
       return res.files.map((f) => String(f.path || "").replace(/\\\\/g, "/"));
+    },
+    async (sessionId) => {
+      if (!sessions) throw new Error("sessions is not initialized");
+      const session = sessions.getById(sessionId);
+      if (!session) throw new Error(`Session not found: ${sessionId}`);
+      const folder = resolveWorkspaceFolderForSession(session);
+      if (!folder)
+        throw new Error(`WorkspaceFolder not found for session: ${sessionId}`);
+
+      const v = cliVariantByBackendKey.get(session.backendKey) ?? "unknown";
+      if (v !== "codex-mine") return [];
+
+      const { agents } = await listAgentsFromDisk(folder.uri.fsPath);
+      return agents
+        .map((a) => String(a.name || "").trim())
+        .filter((name) => name.length > 0);
+    },
+    async (sessionId) => {
+      if (!backendManager) throw new Error("backendManager is not initialized");
+      if (!sessions) throw new Error("sessions is not initialized");
+      const session = sessions.getById(sessionId);
+      if (!session) throw new Error(`Session not found: ${sessionId}`);
+
+      const entries = await backendManager.listSkillsForSession(session);
+      const entry = entries[0] ?? null;
+      const skills = entry?.skills ?? [];
+      return skills.map((s) => ({
+        name: s.name,
+        description: s.description,
+        scope: s.scope,
+        path: s.path,
+      }));
+    },
+    async (imageKey) => {
+      return await loadCachedImageBase64(imageKey);
     },
     async () => {
       if (!sessions) throw new Error("sessions is not initialized");
@@ -235,7 +660,7 @@ export function activate(context: vscode.ExtensionContext): void {
         sessionId: session.id,
       });
     },
-    (message) => {
+    (message: string) => {
       void vscode.window.showErrorMessage(message);
       const session = activeSessionId
         ? sessions?.getById(activeSessionId)
@@ -260,6 +685,35 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(output);
 
+  // Best-effort: restore the last active session after extension reloads so users
+  // don't need to re-select it from Sessions every time. This performs at most one
+  // `thread/resume` and avoids any background rehydration while switching tabs.
+  void (async () => {
+    if (!backendManager) return;
+    if (!sessions) return;
+    if (activeSessionId) return;
+    const lastSessionId = context.workspaceState.get<string>(
+      LAST_ACTIVE_SESSION_KEY,
+    );
+    if (typeof lastSessionId !== "string" || !lastSessionId) return;
+    const session = sessions.getById(lastSessionId);
+    if (!session) return;
+    try {
+      // Ensure the view is visible so the user sees the restored conversation.
+      await showCodexMineViewContainer();
+      setActiveSession(session.id, { markRead: false });
+      const res = await backendManager.resumeSession(session);
+      void ensureModelsFetched(session);
+      hydrateRuntimeFromThread(session.id, res.thread);
+      setActiveSession(session.id);
+      refreshCustomPromptsFromDisk();
+    } catch (err) {
+      output.appendLine(
+        `[startup] Failed to restore last sessionId=${lastSessionId}: ${String(err)}`,
+      );
+    }
+  })();
+
   context.subscriptions.push(
     vscode.commands.registerCommand("codexMine.startBackend", async () => {
       if (!backendManager) throw new Error("backendManager is not initialized");
@@ -276,11 +730,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!extensionContext) throw new Error("extensionContext is not set");
       if (!sessions) throw new Error("sessions is not initialized");
 
-      // Clear persisted cache.
-      persistedRuntimeCache = {};
-      dirtyRuntimeSessionIds.clear();
-      persistRuntimeTimer = null;
-      await extensionContext.workspaceState.update(RUNTIMES_KEY, persistedRuntimeCache);
+      // This only clears in-memory state. Conversation history is re-hydrated
+      // from `thread/resume` (backed by ~/.codex/sessions) when sessions are opened.
+      await cleanupLegacyRuntimeCache(extensionContext);
 
       // Clear in-memory runtimes for existing sessions.
       for (const s of sessions.listAll()) {
@@ -302,56 +754,62 @@ export function activate(context: vscode.ExtensionContext): void {
       chatView?.refresh();
 
       void vscode.window.showInformationMessage(
-        "Cleared Codex UI runtime cache for this workspace. Reload the window if the Chat view is still blank.",
+        "Cleared Codex UI in-memory runtime cache. Reopen a session to re-hydrate history.",
       );
     }),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codexMine.newSession", async (args?: unknown) => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
+    vscode.commands.registerCommand(
+      "codexMine.newSession",
+      async (args?: unknown) => {
+        if (!backendManager)
+          throw new Error("backendManager is not initialized");
 
-      const folderFromArgs = ((): vscode.WorkspaceFolder | null => {
-        if (typeof args !== "object" || args === null) return null;
-        const anyArgs = args as Record<string, unknown>;
-        const forcePickFolder = anyArgs["forcePickFolder"];
-        if (typeof forcePickFolder === "boolean" && forcePickFolder) {
-          return null;
-        }
-        const uriRaw = anyArgs["workspaceFolderUri"];
-        if (typeof uriRaw !== "string" || !uriRaw) return null;
-        try {
-          const uri = vscode.Uri.parse(uriRaw);
-          return vscode.workspace.getWorkspaceFolder(uri) ?? null;
-        } catch {
-          return null;
-        }
-      })();
+        const folderFromArgs = ((): vscode.WorkspaceFolder | null => {
+          if (typeof args !== "object" || args === null) return null;
+          const anyArgs = args as Record<string, unknown>;
+          const forcePickFolder = anyArgs["forcePickFolder"];
+          if (typeof forcePickFolder === "boolean" && forcePickFolder) {
+            return null;
+          }
+          const uriRaw = anyArgs["workspaceFolderUri"];
+          if (typeof uriRaw !== "string" || !uriRaw) return null;
+          try {
+            const uri = vscode.Uri.parse(uriRaw);
+            return vscode.workspace.getWorkspaceFolder(uri) ?? null;
+          } catch {
+            return null;
+          }
+        })();
 
-      const folder =
-        folderFromArgs ??
-        (typeof args === "object" &&
-        args !== null &&
-        (args as Record<string, unknown>)["forcePickFolder"] === true
-          ? null
-          : (() => {
-              if (!sessions) return null;
-              const active = activeSessionId ? sessions.getById(activeSessionId) : null;
-              if (!active) return null;
-              return resolveWorkspaceFolderForSession(active);
-            })()) ??
-        (await pickWorkspaceFolder());
-      if (!folder) return;
+        const folder =
+          folderFromArgs ??
+          (typeof args === "object" &&
+          args !== null &&
+          (args as Record<string, unknown>)["forcePickFolder"] === true
+            ? null
+            : (() => {
+                if (!sessions) return null;
+                const active = activeSessionId
+                  ? sessions.getById(activeSessionId)
+                  : null;
+                if (!active) return null;
+                return resolveWorkspaceFolderForSession(active);
+              })()) ??
+          (await pickWorkspaceFolder());
+        if (!folder) return;
 
-      await ensureBackendMatchesConfiguredCli(folder, "newSession");
-      const session = await backendManager.newSession(
-        folder,
-        getSessionModelState(),
-      );
-      setActiveSession(session.id);
-      void ensureModelsFetched(session);
-      await showCodexMineViewContainer();
-    }),
+        await ensureBackendMatchesConfiguredCli(folder, "newSession");
+        const session = await backendManager.newSession(
+          folder,
+          getSessionModelState(),
+        );
+        setActiveSession(session.id);
+        void ensureModelsFetched(session);
+        await showCodexMineViewContainer();
+      },
+    ),
   );
 
   context.subscriptions.push(
@@ -456,16 +914,39 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
 
-      const session = activeSessionId ? sessions.getById(activeSessionId) : null;
+      const session = activeSessionId
+        ? sessions.getById(activeSessionId)
+        : null;
       if (!session) return;
 
       const rt = ensureRuntime(session.id);
-      const turnId = rt.activeTurnId;
-      if (!turnId) return;
+      let turnId =
+        rt.activeTurnId ?? backendManager.getActiveTurnId(session.threadId);
 
-      try {
-        await backendManager.interruptTurn(session, turnId);
-      } catch (err) {
+      if (!turnId && rt.sending) {
+        rt.pendingInterrupt = true;
+        output.appendLine(
+          "[turn] Interrupt requested before turnId is known; will interrupt on turn/started.",
+        );
+        chatView?.refresh();
+        schedulePersistRuntime(session.id);
+        return;
+      }
+
+      if (!turnId) {
+        upsertBlock(session.id, {
+          id: newLocalId("info"),
+          type: "info",
+          title: "Nothing to interrupt",
+          text: "Interrupt was requested, but no in-progress turn was found for this session.",
+        });
+        chatView?.refresh();
+        schedulePersistRuntime(session.id);
+        return;
+      }
+
+      output.appendLine(`[turn] Interrupt requested: turnId=${turnId}`);
+      void backendManager.interruptTurn(session, turnId).catch((err) => {
         output.appendLine(`[turn] Failed to interrupt: ${String(err)}`);
         upsertBlock(session.id, {
           id: newLocalId("error"),
@@ -474,8 +955,219 @@ export function activate(context: vscode.ExtensionContext): void {
           text: String(err),
         });
         chatView?.refresh();
+      });
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codexMine.reloadSession", async () => {
+      if (!backendManager) throw new Error("backendManager is not initialized");
+      if (!sessions) throw new Error("sessions is not initialized");
+
+      const session = activeSessionId
+        ? sessions.getById(activeSessionId)
+        : null;
+      if (!session) return;
+
+      const rt = ensureRuntime(session.id);
+      if (rt.sending) {
+        void vscode.window.showErrorMessage(
+          "Cannot reload while a turn is in progress.",
+        );
+        return;
+      }
+      if (rt.reloading) return;
+      rt.reloading = true;
+      rt.uiHydrationBlockedText = null;
+      chatView?.refresh();
+      chatView?.toast("info", "Reloading session…");
+
+      output.appendLine(
+        `[session] Reload requested: threadId=${session.threadId}`,
+      );
+      try {
+        const res = await backendManager.reloadSession(
+          session,
+          getSessionModelState(),
+        );
+        hydrateRuntimeFromThread(session.id, res.thread, { force: true });
+        schedulePersistRuntime(session.id);
+        chatView?.refresh();
+        chatView?.toast("success", "Reload completed.");
+      } catch (err) {
+        output.appendLine(`[session] Reload failed: ${String(err)}`);
+        upsertBlock(session.id, {
+          id: newLocalId("error"),
+          type: "error",
+          title: "Reload failed",
+          text: String(err),
+        });
+        chatView?.refresh();
+        chatView?.toast("error", "Reload failed.");
+      } finally {
+        rt.reloading = false;
+        chatView?.refresh();
       }
     }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codexMine.debug.stressUi", async () => {
+      if (!sessions) throw new Error("sessions is not initialized");
+      if (!outputChannel) throw new Error("outputChannel is not initialized");
+      if (!chatView) throw new Error("chatView is not initialized");
+      const output = outputChannel;
+      const view = chatView;
+
+      const session = activeSessionId
+        ? sessions.getById(activeSessionId)
+        : null;
+      if (!session) {
+        void vscode.window.showErrorMessage("No session selected.");
+        return;
+      }
+
+      const totalRaw = await vscode.window.showInputBox({
+        title: "Stress UI streaming",
+        prompt: "Total characters to append",
+        value: "2000000",
+        validateInput: (v) => {
+          const n = Number(v);
+          if (!Number.isFinite(n) || n <= 0) return "Enter a positive number";
+          return undefined;
+        },
+      });
+      if (!totalRaw) return;
+      const totalChars = Math.floor(Number(totalRaw));
+
+      const chunkRaw = await vscode.window.showInputBox({
+        title: "Stress UI streaming",
+        prompt: "Chunk size (characters per tick)",
+        value: "2000",
+        validateInput: (v) => {
+          const n = Number(v);
+          if (!Number.isFinite(n) || n <= 0) return "Enter a positive number";
+          if (n > 200_000) return "Too large; keep it <= 200000";
+          return undefined;
+        },
+      });
+      if (!chunkRaw) return;
+      const chunkChars = Math.floor(Number(chunkRaw));
+
+      const intervalRaw = await vscode.window.showInputBox({
+        title: "Stress UI streaming",
+        prompt: "Interval between ticks (ms)",
+        value: "0",
+        validateInput: (v) => {
+          const n = Number(v);
+          if (!Number.isFinite(n) || n < 0)
+            return "Enter 0 or a positive number";
+          if (n > 10_000) return "Too large; keep it <= 10000";
+          return undefined;
+        },
+      });
+      if (intervalRaw === undefined) return;
+      const intervalMs = Math.floor(Number(intervalRaw));
+
+      // Cancel any existing job.
+      if (stressUiJob) {
+        stressUiJob.cancel();
+        stressUiJob = null;
+      }
+
+      const rt = ensureRuntime(session.id);
+      const blockId = `debug:stressUi:${session.id}`;
+      const block = getOrCreateBlock(rt, blockId, () => ({
+        id: blockId,
+        type: "assistant",
+        text: "",
+        streaming: true,
+      }));
+      if (block.type === "assistant") {
+        block.text = "";
+        (block as any).streaming = true;
+      }
+      view.postBlockUpsert(session.id, block);
+
+      const baseChunk =
+        chunkChars <= 1 ? "A" : `${"A".repeat(chunkChars - 1)}\n`;
+      let remaining = totalChars;
+      let cancelled = false;
+
+      output.appendLine(
+        `[debug] stressUi started: sessionId=${session.id} totalChars=${totalChars} chunkChars=${chunkChars} intervalMs=${intervalMs}`,
+      );
+
+      const tick = (): void => {
+        if (cancelled) return;
+        const nextLen = Math.min(remaining, baseChunk.length);
+        const delta =
+          nextLen === baseChunk.length
+            ? baseChunk
+            : baseChunk.slice(0, nextLen);
+        remaining -= delta.length;
+
+        const b = getOrCreateBlock(rt, blockId, () => ({
+          id: blockId,
+          type: "assistant",
+          text: "",
+          streaming: true,
+        }));
+        if (b.type === "assistant") {
+          b.text += delta;
+          (b as any).streaming = remaining > 0;
+        }
+        view.postBlockAppend(session.id, blockId, "assistantText", delta, {
+          streaming: remaining > 0,
+        });
+
+        if (remaining <= 0) {
+          output.appendLine(
+            `[debug] stressUi completed: sessionId=${session.id}`,
+          );
+          stressUiJob = null;
+          return;
+        }
+        setTimeout(tick, intervalMs);
+      };
+
+      tick();
+
+      stressUiJob = {
+        sessionId: session.id,
+        cancel: () => {
+          cancelled = true;
+          const b = getOrCreateBlock(rt, blockId, () => ({
+            id: blockId,
+            type: "assistant",
+            text: "",
+            streaming: false,
+          }));
+          if (b.type === "assistant") (b as any).streaming = false;
+          view.postBlockUpsert(session.id, b);
+          output.appendLine(
+            `[debug] stressUi cancelled: sessionId=${session.id}`,
+          );
+        },
+      };
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codexMine.debug.stopStressUi",
+      async () => {
+        if (!outputChannel) throw new Error("outputChannel is not initialized");
+        if (!stressUiJob) {
+          void vscode.window.showInformationMessage(
+            "No UI stress job is running.",
+          );
+          return;
+        }
+        stressUiJob.cancel();
+        stressUiJob = null;
+      },
+    ),
   );
 
   context.subscriptions.push(
@@ -483,7 +1175,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
 
-      const session = activeSessionId ? sessions.getById(activeSessionId) : null;
+      const session = activeSessionId
+        ? sessions.getById(activeSessionId)
+        : null;
       if (!session) {
         void vscode.window.showErrorMessage("No session selected.");
         return;
@@ -497,7 +1191,9 @@ export function activate(context: vscode.ExtensionContext): void {
         const res = await backendManager.readRateLimits(session);
         rateLimits = res.rateLimits;
       } catch (err) {
-        output.appendLine(`[status] Failed to read rate limits: ${String(err)}`);
+        output.appendLine(
+          `[status] Failed to read rate limits: ${String(err)}`,
+        );
       }
 
       let accountLine: string | null = null;
@@ -534,7 +1230,11 @@ export function activate(context: vscode.ExtensionContext): void {
         const planFromLimits = rateLimits?.planType ?? null;
         planLine = planFromLimits ? `Plan: ${planFromLimits}` : null;
         // Avoid duplicating plan if account already includes it.
-        if (accountLine && accountLine.includes("(") && accountLine.includes(")")) {
+        if (
+          accountLine &&
+          accountLine.includes("(") &&
+          accountLine.includes(")")
+        ) {
           planLine = null;
         }
       }
@@ -552,9 +1252,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return `Context window: ${remainingPct}% left (${formatHumanCount(used)} used / ${formatHumanCount(ctx)})`;
       })();
 
-      const limitLines = rateLimits
-        ? formatRateLimitLines(rateLimits)
-        : [];
+      const limitLines = rateLimits ? formatRateLimitLines(rateLimits) : [];
 
       const text = [
         sessionLine,
@@ -566,10 +1264,12 @@ export function activate(context: vscode.ExtensionContext): void {
         contextLine,
         ...limitLines,
       ]
-        .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+        .filter(
+          (v): v is string => typeof v === "string" && v.trim().length > 0,
+        )
         .join("\n");
 
-      upsertBlock(rt, {
+      upsertBlock(session.id, {
         id: newLocalId("status"),
         type: "info",
         title: "Status",
@@ -581,120 +1281,136 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codexMine.showSkills", async (args?: unknown) => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
-      if (!sessions) throw new Error("sessions is not initialized");
+    vscode.commands.registerCommand(
+      "codexMine.showSkills",
+      async (args?: unknown) => {
+        if (!backendManager)
+          throw new Error("backendManager is not initialized");
+        if (!sessions) throw new Error("sessions is not initialized");
 
-      const session =
-        parseSessionArg(args, sessions) ??
-        (activeSessionId ? sessions.getById(activeSessionId) : null);
-      if (!session) {
-        void vscode.window.showErrorMessage("No session selected.");
-        return;
-      }
+        const session =
+          parseSessionArg(args, sessions) ??
+          (activeSessionId ? sessions.getById(activeSessionId) : null);
+        if (!session) {
+          void vscode.window.showErrorMessage("No session selected.");
+          return;
+        }
 
-      let entries;
-      try {
-        entries = await backendManager.listSkillsForSession(session);
-      } catch (err) {
-        output.appendLine(`[skills] Failed to list skills: ${String(err)}`);
-        void vscode.window.showErrorMessage("Failed to list skills.");
-        return;
-      }
+        let entries;
+        try {
+          entries = await backendManager.listSkillsForSession(session);
+        } catch (err) {
+          output.appendLine(`[skills] Failed to list skills: ${String(err)}`);
+          void vscode.window.showErrorMessage("Failed to list skills.");
+          return;
+        }
 
-      const entry = entries[0] ?? null;
-      const skills = entry?.skills ?? [];
-      const errors = entry?.errors ?? [];
+        const entry = entries[0] ?? null;
+        const skills = entry?.skills ?? [];
+        const errors = entry?.errors ?? [];
 
-      if (skills.length === 0) {
-        const msg =
-          errors.length > 0
-            ? "No skills found (some skills failed to load)."
-            : "No skills found. Enable [features].skills=true in $CODEX_HOME/config.toml.";
-        void vscode.window.showInformationMessage(msg);
-        return;
-      }
+        if (skills.length === 0) {
+          const msg =
+            errors.length > 0
+              ? "No skills found (some skills failed to load)."
+              : "No skills found. Enable [features].skills=true in $CODEX_HOME/config.toml.";
+          void vscode.window.showInformationMessage(msg);
+          return;
+        }
 
-      const picked = await vscode.window.showQuickPick(
-        skills.map((s) => ({
-          label: s.name,
-          description: s.description,
-          detail: `${s.scope} • ${s.path}`,
-          skill: s,
-        })),
-        {
-          title: "Codex UI: Skills",
-          matchOnDescription: true,
-          matchOnDetail: true,
-        },
-      );
-      if (!picked) return;
+        const picked = await vscode.window.showQuickPick(
+          skills.map((s) => ({
+            label: s.name,
+            description: s.description,
+            detail: `${s.scope} • ${s.path}`,
+            skill: s,
+          })),
+          {
+            title: "Codex UI: Skills",
+            matchOnDescription: true,
+            matchOnDetail: true,
+          },
+        );
+        if (!picked) return;
 
-      chatView?.insertIntoInput(`$${picked.skill.name} `);
-    }),
+        chatView?.insertIntoInput(`$${picked.skill.name} `);
+      },
+    ),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codexMine.showAgents", async (args?: unknown) => {
-      if (!sessions) throw new Error("sessions is not initialized");
+    vscode.commands.registerCommand(
+      "codexMine.showAgents",
+      async (args?: unknown) => {
+        if (!sessions) throw new Error("sessions is not initialized");
 
-      const session =
-        parseSessionArg(args, sessions) ??
-        (activeSessionId ? sessions.getById(activeSessionId) : null);
-      if (!session) {
-        void vscode.window.showErrorMessage("No session selected.");
-        return;
-      }
+        const session =
+          parseSessionArg(args, sessions) ??
+          (activeSessionId ? sessions.getById(activeSessionId) : null);
+        if (!session) {
+          void vscode.window.showErrorMessage("No session selected.");
+          return;
+        }
 
-      const folder = resolveWorkspaceFolderForSession(session);
-      if (!folder) {
-        void vscode.window.showErrorMessage("WorkspaceFolder not found for session.");
-        return;
-      }
+        const folder = resolveWorkspaceFolderForSession(session);
+        if (!folder) {
+          void vscode.window.showErrorMessage(
+            "WorkspaceFolder not found for session.",
+          );
+          return;
+        }
 
-      await ensureBackendMatchesConfiguredCli(folder, "agents");
+        const v = cliVariantByBackendKey.get(session.backendKey) ?? "unknown";
+        if (v !== "codex-mine") {
+          void vscode.window.showInformationMessage(
+            "Agents are available only when running codex-mine. Click Settings (⚙) and select codex-mine, then restart the backend.",
+          );
+          return;
+        }
 
-      const v = cliVariantByBackendKey.get(session.backendKey) ?? "unknown";
-      if (v !== "codex-mine") {
-        void vscode.window.showInformationMessage(
-          "Agents are available only when running codex-mine. Click Settings (⚙) and select codex-mine, then restart the backend.",
+        const { agents, errors } = await listAgentsFromDisk(folder.uri.fsPath);
+        if (errors.length > 0) {
+          output.appendLine(`[agents] cwd=${folder.uri.fsPath}`);
+          for (const e of errors) output.appendLine(`[agents] ${e}`);
+        }
+
+        try {
+          // Ensure the backend is configured as codex-mine (purely for UX; listing is from disk).
+          await ensureBackendMatchesConfiguredCli(folder, "agents");
+        } catch (err) {
+          output.appendLine(
+            `[agents] Backend configuration check failed: ${String(err)}`,
+          );
+          void vscode.window.showErrorMessage("Failed to list agents.");
+          return;
+        }
+
+        if (agents.length === 0) {
+          const msg =
+            errors.length > 0
+              ? "No agents found (some agent files failed to load)."
+              : "No agents found. Add <git root>/.codex/agents/<name>.md or $CODEX_HOME/agents/<name>.md, and ensure [agents].sources includes the desired locations.";
+          void vscode.window.showInformationMessage(msg);
+          return;
+        }
+
+        const picked = await vscode.window.showQuickPick(
+          agents.map((a) => ({
+            label: a.name,
+            description: a.description,
+            detail: `${a.source} • ${a.path}`,
+            agent: a,
+          })),
+          {
+            title: "Codex UI: Agents",
+            matchOnDescription: true,
+            matchOnDetail: true,
+          },
         );
-        return;
-      }
-
-      const { agents, errors, gitRoot } = await listAgentsFromDisk(folder.uri.fsPath);
-      if (errors.length > 0) {
-        output.appendLine(
-          `[agents] scanned cwd=${folder.uri.fsPath} gitRoot=${gitRoot ?? "(none)"}`,
-        );
-        for (const e of errors) output.appendLine(`[agents] ${e}`);
-      }
-
-      if (agents.length === 0) {
-        const msg =
-          errors.length > 0
-            ? "No agents found (some agent files failed to load)."
-            : "No agents found. Add <git root>/.codex/agents/<name>.md or $CODEX_HOME/agents/<name>.md.";
-        void vscode.window.showInformationMessage(msg);
-        return;
-      }
-
-      const picked = await vscode.window.showQuickPick(
-        agents.map((a) => ({
-          label: a.name,
-          description: a.description,
-          detail: `${a.source} • ${a.path}`,
-          agent: a,
-        })),
-        {
-          title: "Codex UI: Agents",
-          matchOnDescription: true,
-          matchOnDetail: true,
-        },
-      );
-      if (!picked) return;
-      chatView?.insertIntoInput(`@${picked.agent.name} `);
-    }),
+        if (!picked) return;
+        chatView?.insertIntoInput(`@${picked.agent.name} `);
+      },
+    ),
   );
 
   context.subscriptions.push(
@@ -712,7 +1428,9 @@ export function activate(context: vscode.ExtensionContext): void {
         cfg.get<string>("cli.commands.codex") ??
         cfg.get<string>("cli.commands.upstream") ??
         "codex";
-      const current = normalizeCliVariant(cfg.get<string>("cli.variant") ?? "auto");
+      const current = normalizeCliVariant(
+        cfg.get<string>("cli.variant") ?? "auto",
+      );
 
       const mineProbe = await probeCliVersion(mineCmd);
       const mineDetected = mineProbe.ok && mineProbe.version.includes("-mine.");
@@ -760,17 +1478,33 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
-      await cfg.update("cli.variant", picked.it.variant, vscode.ConfigurationTarget.Global);
+      await cfg.update(
+        "cli.variant",
+        picked.it.variant,
+        vscode.ConfigurationTarget.Global,
+      );
 
       const restart = await vscode.window.showInformationMessage(
         "CLI setting updated. Restart running backends now to apply?",
         "Restart all",
+        "Force restart all",
         "Later",
       );
       if (restart === "Restart all") {
         const folders = vscode.workspace.workspaceFolders ?? [];
         for (const f of folders) {
           await ensureBackendMatchesConfiguredCli(f, "newSession");
+        }
+      } else if (restart === "Force restart all") {
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        for (const f of folders) {
+          await backendManager.restartForWorkspaceFolder(f);
+          if (picked.it.variant !== "auto") {
+            cliVariantByBackendKey.set(
+              f.uri.toString(),
+              picked.it.variant === "codex-mine" ? "codex-mine" : "codex",
+            );
+          }
         }
       } else {
         void vscode.window.showInformationMessage(
@@ -794,12 +1528,20 @@ export function activate(context: vscode.ExtensionContext): void {
         const picked = await vscode.window.showQuickPick(
           [
             { label: "Rename", action: "rename" as const },
+            { label: "Copy Session ID", action: "copySessionId" as const },
             { label: "Open in Editor Tab", action: "openPanel" as const },
             { label: "Close Tab (Hide)", action: "hide" as const },
           ],
           { title: session.title },
         );
         if (!picked) return;
+
+        if (picked.action === "copySessionId") {
+          await vscode.commands.executeCommand("codexMine.copySessionId", {
+            sessionId: session.id,
+          });
+          return;
+        }
 
         if (picked.action === "rename") {
           await vscode.commands.executeCommand("codexMine.renameSession", {
@@ -892,6 +1634,23 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
+      "codexMine.copySessionId",
+      async (args?: unknown) => {
+        if (!sessions) throw new Error("sessions is not initialized");
+        const session = parseSessionArg(args, sessions);
+        if (!session) {
+          void vscode.window.showErrorMessage("Session not found.");
+          return;
+        }
+
+        await vscode.env.clipboard.writeText(session.id);
+        void vscode.window.showInformationMessage("Copied session ID.");
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
       "codexMine.sendMessage",
       async (args?: unknown) => {
         if (!backendManager)
@@ -928,16 +1687,14 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!session) {
           void vscode.window.showErrorMessage("Session not found.");
           return;
-      }
+        }
 
-      const res = await backendManager.resumeSession(
-        session,
-      );
-      void ensureModelsFetched(session);
-      hydrateRuntimeFromThread(session.id, res.thread);
-      setActiveSession(session.id);
-      refreshCustomPromptsFromDisk();
-      await showCodexMineViewContainer();
+        const res = await backendManager.resumeSession(session);
+        void ensureModelsFetched(session);
+        hydrateRuntimeFromThread(session.id, res.thread);
+        setActiveSession(session.id);
+        refreshCustomPromptsFromDisk();
+        await showCodexMineViewContainer();
       },
     ),
   );
@@ -949,8 +1706,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
         if (!sessions) throw new Error("sessions is not initialized");
-        if (!sessionPanels)
-          throw new Error("sessionPanels is not initialized");
+        if (!sessionPanels) throw new Error("sessionPanels is not initialized");
 
         const session = parseSessionArg(args, sessions);
         if (!session) {
@@ -964,7 +1720,10 @@ export function activate(context: vscode.ExtensionContext): void {
         setActiveSession(session.id);
 
         const rt = ensureRuntime(session.id);
-        sessionPanels.open(session, { blocks: rt.blocks, latestDiff: rt.latestDiff });
+        sessionPanels.open(session, {
+          blocks: rt.blocks,
+          latestDiff: rt.latestDiff,
+        });
       },
     ),
   );
@@ -1012,42 +1771,53 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        const requestSeq = ++selectSessionRequestSeq;
-        const prevActiveSessionId = activeSessionId;
-
-        // Make tab switching feel immediate: update the active session in the UI
-        // before waiting on any backend I/O. Avoid marking as read until we confirm
-        // the session is actually opened.
+        // Session switching should be a pure UI operation. However, after a reload the UI may not
+        // have hydrated blocks for a session yet. In that case, treat the click as an explicit
+        // "open" and resume once (only if nothing is currently running).
         setActiveSession(session.id, { markRead: false });
-        void showCodexMineViewContainer();
+        await showCodexMineViewContainer();
+
+        const rt = ensureRuntime(session.id);
+        if (hasConversationBlocks(rt)) {
+          rt.uiHydrationBlockedText = null;
+          setActiveSession(session.id);
+          return;
+        }
+
+        const anyRunning = [...runtimeBySessionId.values()].some(
+          (r) =>
+            r.sending ||
+            r.activeTurnId !== null ||
+            r.streamingAssistantItemIds.size > 0 ||
+            r.pendingApprovals.size > 0,
+        );
+        if (anyRunning) {
+          rt.uiHydrationBlockedText =
+            "This session has not been loaded in the UI yet. Wait for the running session to finish, then use Reload/Resume to load history.";
+          setActiveSession(session.id);
+          return;
+        }
 
         try {
           const res = await backendManager.resumeSession(session);
-          if (requestSeq !== selectSessionRequestSeq) return;
-
           void ensureModelsFetched(session);
           hydrateRuntimeFromThread(session.id, res.thread);
+          rt.uiHydrationBlockedText = null;
           setActiveSession(session.id);
-          await showCodexMineViewContainer();
         } catch (err) {
-          if (requestSeq !== selectSessionRequestSeq) return;
-
           outputChannel?.appendLine(
-            `[selectSession] Failed sessionId=${session.id}: ${
-              err instanceof Error ? err.stack ?? err.message : String(err)
+            `[selectSession] Failed to hydrate sessionId=${session.id}: ${
+              err instanceof Error ? (err.stack ?? err.message) : String(err)
             }`,
           );
-
-          if (prevActiveSessionId) {
-            setActiveSession(prevActiveSessionId);
-          } else {
-            activeSessionId = null;
-            chatView?.refresh();
-          }
-
-          void vscode.window.showErrorMessage(
-            "Failed to open session. See 'Codex UI' output for details.",
-          );
+          upsertBlock(session.id, {
+            id: newLocalId("error"),
+            type: "error",
+            title: "Failed to load session",
+            text: String(err),
+          });
+          chatView?.refresh();
+          setActiveSession(session.id);
         }
       },
     ),
@@ -1067,9 +1837,7 @@ export function activate(context: vscode.ExtensionContext): void {
           session ??
           (activeSessionId ? sessions.getById(activeSessionId) : null);
         if (!active) {
-          void vscode.window.showErrorMessage(
-            "No session selected.",
-          );
+          void vscode.window.showErrorMessage("No session selected.");
           return;
         }
 
@@ -1077,8 +1845,7 @@ export function activate(context: vscode.ExtensionContext): void {
           title: "Codex UI: Rename session",
           value: active.title,
           prompt: "Change the title shown in the chat tabs and Sessions list.",
-          validateInput: (v) =>
-            v.trim() ? null : "Title cannot be empty.",
+          validateInput: (v) => (v.trim() ? null : "Title cannot be empty."),
         });
         if (next === undefined) return;
 
@@ -1121,6 +1888,87 @@ export function activate(context: vscode.ExtensionContext): void {
       },
     ),
   );
+}
+
+function handleBackendTerminated(
+  backendKey: string,
+  info: BackendTermination,
+): void {
+  if (!sessions) return;
+
+  const affectedSessions = sessions.list(backendKey);
+  if (affectedSessions.length === 0) return;
+
+  const folderLabel = (() => {
+    try {
+      return vscode.Uri.parse(backendKey).fsPath;
+    } catch {
+      return backendKey;
+    }
+  })();
+
+  outputChannel?.appendLine(
+    `[backend] terminated: cwd=${folderLabel} reason=${info.reason} code=${info.code ?? "null"} signal=${info.signal ?? "null"}`,
+  );
+
+  const backendHash = crypto
+    .createHash("sha1")
+    .update(backendKey)
+    .digest("hex")
+    .slice(0, 10);
+  const title = info.reason === "exit" ? "Backend exited" : "Backend stopped";
+  const detailParts: string[] = [`cwd=${folderLabel}`, `reason=${info.reason}`];
+  if (info.code !== null) detailParts.push(`code=${info.code}`);
+  if (info.signal !== null) detailParts.push(`signal=${info.signal}`);
+  detailParts.push(`at=${new Date().toISOString()}`);
+  upsertGlobal({
+    id: `global:backendTerminated:${backendHash}`,
+    type: info.reason === "exit" ? "error" : "info",
+    title,
+    text: detailParts.join(" • "),
+  });
+
+  for (const s of affectedSessions) {
+    const rt = ensureRuntime(s.id);
+    const wasRunning =
+      rt.sending ||
+      rt.activeTurnId !== null ||
+      rt.streamingAssistantItemIds.size > 0 ||
+      rt.pendingApprovals.size > 0;
+
+    rt.sending = false;
+    rt.lastTurnCompletedAtMs = Date.now();
+    rt.activeTurnId = null;
+    rt.pendingInterrupt = false;
+
+    for (const id of rt.streamingAssistantItemIds) {
+      const idx = rt.blockIndexById.get(id);
+      if (idx === undefined) continue;
+      const b = rt.blocks[idx];
+      if (b && b.type === "assistant") (b as any).streaming = false;
+    }
+    rt.streamingAssistantItemIds.clear();
+
+    // Any approval requests are now stale because the backend process is gone.
+    for (const resolve of rt.approvalResolvers.values()) resolve("cancel");
+    rt.approvalResolvers.clear();
+    rt.pendingApprovals.clear();
+
+    if (wasRunning && info.reason === "exit") {
+      upsertBlock(s.id, {
+        id: newLocalId("error"),
+        type: "error",
+        title: "Backend exited",
+        text:
+          `The backend process for this workspace folder exited. ` +
+          `You may need to restart the backend and resume this session.`,
+      });
+    }
+
+    schedulePersistRuntime(s.id);
+  }
+
+  chatView?.refresh();
 }
 
 export function deactivate(): void {
@@ -1348,31 +2196,99 @@ function expandCustomPromptIfAny(
 }
 
 async function sendUserText(session: Session, text: string): Promise<void> {
-  await sendUserInput(session, text, []);
+  await sendUserInput(session, text, [], getSessionModelState());
 }
 
 async function sendUserInput(
   session: Session,
   text: string,
   images: UiImageInput[],
+  modelState: ModelState | null,
 ): Promise<void> {
   if (!backendManager) throw new Error("backendManager is not initialized");
   const rt = ensureRuntime(session.id);
   rt.sending = true;
+  rt.pendingInterrupt = false;
+  const backendImages: BackendImageInput[] = [];
   const trimmed = text.trim();
   if (trimmed) {
     upsertBlock(session.id, { id: newLocalId("user"), type: "user", text });
     sessionPanels?.addUserMessage(session.id, text);
   }
   if (images.length > 0) {
-    const names = images
-      .map((img) => String(img.name || "").trim())
-      .filter((name) => name.length > 0);
-    const label =
-      names.length > 0
-        ? `Attached ${images.length} image(s): ${names.join(", ")}`
-        : `Attached ${images.length} image(s)`;
-    upsertBlock(session.id, { id: newLocalId("user-images"), type: "note", text: label });
+    const galleryImages: Array<{
+      title: string;
+      src: string;
+      imageKey: string;
+      mimeType: string;
+      byteLength: number;
+      autoLoad?: boolean;
+      alt: string;
+      caption: string | null;
+    }> = [];
+    const errors: string[] = [];
+
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i]!;
+      const rawName = String(img.name || "").trim();
+      const name = rawName || `image-${i + 1}`;
+      try {
+        const { mimeType, base64 } = parseDataUrl(img.url);
+        const bytes = Buffer.from(base64, "base64");
+        const saved = await cacheImageBytes({
+          prefix: `user-${session.id}`,
+          mimeType,
+          bytes,
+        });
+        const persisted = await persistUserInputImageFile({
+          sessionId: session.id,
+          mimeType,
+          bytes,
+        });
+        galleryImages.push({
+          title: name,
+          src: "",
+          imageKey: saved.imageKey,
+          mimeType: saved.mimeType,
+          byteLength: saved.byteLength,
+          autoLoad: true,
+          alt: name,
+          caption: name,
+        });
+        backendImages.push({ kind: "localImage", path: persisted.path });
+      } catch (err) {
+        errors.push(`${name}: ${String(err)}`);
+        backendImages.push({ kind: "imageUrl", url: img.url });
+      }
+    }
+
+    if (galleryImages.length > 0) {
+      const title =
+        galleryImages.length === 1
+          ? "Attached 1 image"
+          : `Attached ${galleryImages.length} images`;
+      upsertBlock(session.id, {
+        id: newLocalId("user-image-gallery"),
+        type: "imageGallery",
+        title,
+        images: galleryImages,
+        role: "user",
+      });
+      enforceSessionImageAutoloadLimit(rt);
+    }
+
+    if (errors.length > 0) {
+      upsertBlock(session.id, {
+        id: newLocalId("user-image-cache-error"),
+        type: "error",
+        title: "Failed to cache input image(s)",
+        text: errors.join("\n"),
+      });
+    }
+
+    outputChannel?.appendLine(
+      `[images] input images: total=${images.length} cached=${galleryImages.length} errors=${errors.length}`,
+    );
   }
   chatView?.refresh();
   schedulePersistRuntime(session.id);
@@ -1381,11 +2297,15 @@ async function sendUserInput(
     await backendManager.sendMessageWithModelAndImages(
       session,
       text,
-      images.map((img) => img.url),
-      getSessionModelState(),
+      backendImages,
+      modelState,
     );
   } catch (err) {
+    outputChannel?.appendLine(
+      `[send] Failed: sessionId=${session.id} threadId=${session.threadId} err=${String(err)}`,
+    );
     rt.sending = false;
+    rt.pendingInterrupt = false;
     upsertBlock(session.id, {
       id: newLocalId("error"),
       type: "error",
@@ -1412,12 +2332,17 @@ async function handleSlashCommand(
 
   const expandedPrompt = expandCustomPromptIfAny(trimmed, customPrompts);
   if (expandedPrompt.kind === "expanded") {
-    await sendUserText(session, expandedPrompt.text);
+    await sendUserInput(
+      session,
+      expandedPrompt.text,
+      [],
+      getSessionModelState(),
+    );
     return true;
   }
   if (expandedPrompt.kind === "error") {
     const rt = ensureRuntime(session.id);
-    upsertBlock(rt, {
+    upsertBlock(session.id, {
       id: newLocalId("promptError"),
       type: "error",
       title: "Custom prompt error",
@@ -1432,6 +2357,81 @@ async function handleSlashCommand(
     await vscode.commands.executeCommand("codexMine.newSession", {
       workspaceFolderUri: session.workspaceFolderUri,
     });
+    return true;
+  }
+  if (cmd === "compact") {
+    if (arg) {
+      upsertBlock(session.id, {
+        id: newLocalId("compactError"),
+        type: "error",
+        title: "Slash command error",
+        text: "/compact does not take arguments.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    const rt = ensureRuntime(session.id);
+    if (rt.compactInFlight) {
+      upsertBlock(session.id, {
+        id: newLocalId("compactAlreadyRunning"),
+        type: "error",
+        title: "Compact already running",
+        text: "A previous /compact is still in progress.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+    rt.sending = true;
+    rt.compactInFlight = true;
+    rt.pendingInterrupt = false;
+    const pendingId = newLocalId("compacting");
+    rt.pendingCompactBlockId = pendingId;
+    upsertBlock(session.id, {
+      id: pendingId,
+      type: "divider",
+      status: "inProgress",
+      text: `${makeDividerLine("Context")}\n• Compacting…`,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+
+    try {
+      await backendManager.threadCompact(session);
+    } catch (err) {
+      const errText =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err);
+      outputChannel?.appendLine(
+        `[compact] Failed: sessionId=${session.id} threadId=${session.threadId} err=${errText}`,
+      );
+      rt.sending = false;
+      rt.compactInFlight = false;
+      if (rt.pendingCompactBlockId) {
+        upsertBlock(session.id, {
+          id: rt.pendingCompactBlockId,
+          type: "divider",
+          status: "failed",
+          text: `${makeDividerLine("Context")}\n• Compact failed`,
+        });
+      }
+      rt.pendingCompactBlockId = null;
+      rt.pendingInterrupt = false;
+      upsertBlock(session.id, {
+        id: newLocalId("error"),
+        type: "error",
+        title: "Compact failed",
+        text: errText,
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+    }
     return true;
   }
   if (cmd === "resume") {
@@ -1478,12 +2478,13 @@ async function handleSlashCommand(
         return "- /prompts:" + p.name + hint;
       })
       .join("\n");
-    upsertBlock(rt, {
+    upsertBlock(session.id, {
       id: newLocalId("help"),
       type: "system",
       title: "Help",
       text: [
         "Slash commands:",
+        "- /compact: Compact context (if supported by backend)",
         "- /new: New session",
         "- /resume: Resume from history",
         "- /diff: Open Latest Diff",
@@ -1566,8 +2567,7 @@ async function expandMentions(
     if (!docUri) {
       return {
         ok: false,
-        error:
-          "Cannot expand @selection because there is no active editor.",
+        error: "Cannot expand @selection because there is no active editor.",
       };
     }
 
@@ -1576,10 +2576,7 @@ async function expandMentions(
     let relPath = path.relative(folderFsPath, docFsPath);
     relPath = relPath.split(path.sep).join("/");
     if (!relPath || relPath.startsWith("../") || path.isAbsolute(relPath)) {
-      return {
-        ok: false,
-        error: " file is outside the workspace.",
-      };
+      return { ok: false, error: " file is outside the workspace." };
     }
 
     const startLine = (sel?.start?.line ?? 0) + 1;
@@ -1595,86 +2592,7 @@ async function expandMentions(
     out = out.replaceAll("@selection", replacement);
   }
 
-  // Support both "@relative/path" and legacy "@file:relative/path".
-  // Match CLI-like rule: token must start at whitespace boundary.
-  const fileRe = /(^|[\s])@([^\s]+)/g;
-  const matches = [...out.matchAll(fileRe)];
-  if (matches.length === 0) return { ok: true, text: out };
-
-  const folder = resolveWorkspaceFolderForSession(session);
-  if (!folder) {
-    return {
-      ok: false,
-      error: "Cannot validate @ mentions because no workspace folder is available.",
-    };
-  }
-
-  const cliVariant = cliVariantByBackendKey.get(session.backendKey) ?? "unknown";
-  const allowAgents = cliVariant === "codex-mine";
-  const agentNamesLower = new Set<string>();
-  if (allowAgents) {
-    const { agents, errors, gitRoot } = await listAgentsFromDisk(folder.uri.fsPath);
-    if (errors.length > 0) {
-      const header = `[agents] scanned cwd=${folder.uri.fsPath} gitRoot=${gitRoot ?? "(none)"}`;
-      if (!loggedAgentScanErrors.has(header)) {
-        loggedAgentScanErrors.add(header);
-        outputChannel?.appendLine(header);
-      }
-      for (const e of errors) {
-        const line = `[agents] ${e}`;
-        if (loggedAgentScanErrors.has(line)) continue;
-        loggedAgentScanErrors.add(line);
-        outputChannel?.appendLine(line);
-      }
-    }
-    for (const a of agents) agentNamesLower.add(a.name.toLowerCase());
-  }
-
-  const unique = new Set<string>();
-  for (const m of matches) {
-    const raw = m[2];
-    if (!raw) continue;
-    if (raw === "selection") continue;
-
-    const withoutFrag = raw.includes("#") ? (raw.split("#")[0] ?? "") : raw;
-    if (allowAgents && agentNamesLower.has(withoutFrag.toLowerCase())) {
-      continue;
-    }
-    const rel = withoutFrag.toLowerCase().startsWith("file:")
-      ? withoutFrag.slice("file:".length)
-      : withoutFrag;
-    if (rel) unique.add(rel);
-  }
-  if (unique.size === 0) return { ok: true, text: out };
-
-  for (const rel of unique) {
-    if (rel.startsWith("/") || rel.includes(":")) {
-      return {
-        ok: false,
-        error: `@ mentions only support relative paths: ${rel}`,
-      };
-    }
-
-    const uri = vscode.Uri.joinPath(folder.uri, rel);
-    try {
-      const stat = await vscode.workspace.fs.stat(uri);
-      const isFile = (stat.type & vscode.FileType.File) !== 0;
-      const isDir = (stat.type & vscode.FileType.Directory) !== 0;
-      if (!isFile && !isDir) {
-        return {
-          ok: false,
-          error: `@ mentions only support files or directories: ${rel}`,
-        };
-      }
-    } catch (err) {
-      return {
-        ok: false,
-        error: `Failed to resolve @ mention: ${rel} (${String(err)})`,
-      };
-    }
-  }
-
-  // NOTE: @ mentions send file paths only. Do not expand file contents here.
+  // NOTE: Treat unresolved "@" tokens in copied text as plain text.
   return { ok: true, text: out };
 }
 
@@ -1761,6 +2679,25 @@ async function showCodexMineViewContainer(): Promise<void> {
   await vscode.commands.executeCommand("workbench.view.extension.codexMine");
 }
 
+function hasConversationBlocks(rt: SessionRuntime): boolean {
+  return rt.blocks.some((b) => {
+    switch (b.type) {
+      case "user":
+      case "assistant":
+      case "command":
+      case "fileChange":
+      case "mcp":
+      case "webSearch":
+      case "reasoning":
+      case "plan":
+      case "divider":
+        return true;
+      default:
+        return false;
+    }
+  });
+}
+
 function setActiveSession(
   sessionId: string,
   opts?: { markRead?: boolean },
@@ -1769,6 +2706,9 @@ function setActiveSession(
   activeSessionId = sessionId;
   ensureRuntime(sessionId);
   if (markRead) unreadSessionIds.delete(sessionId);
+  if (extensionContext) {
+    void extensionContext.workspaceState.update(LAST_ACTIVE_SESSION_KEY, sessionId);
+  }
   // If a hidden tab session is selected (e.g. via Sessions tree), show it again.
   if (hiddenTabSessionIds.delete(sessionId)) {
     if (extensionContext) saveHiddenTabSessions(extensionContext);
@@ -1776,6 +2716,7 @@ function setActiveSession(
   const s = sessions ? sessions.getById(sessionId) : null;
   if (s) void ensureModelsFetched(s);
   chatView?.refresh();
+  chatView?.syncBlocksForActiveSession();
 }
 
 function markUnreadSession(sessionId: string): void {
@@ -1870,7 +2811,10 @@ function formatRateLimitLines(rateLimits: RateLimitSnapshot): string[] {
   return lines.filter(Boolean);
 }
 
-function formatRateLimitLine(labelFallback: string, w: RateLimitWindow): string {
+function formatRateLimitLine(
+  labelFallback: string,
+  w: RateLimitWindow,
+): string {
   const mins = w.windowDurationMins ?? null;
   const label = mins ? rateLimitLabelFromMinutes(mins) : labelFallback;
   const used = Math.max(0, Math.min(100, w.usedPercent));
@@ -1887,6 +2831,18 @@ function rateLimitLabelFromMinutes(mins: number): string {
   if (mins === 1440) return "Daily limit";
   if (mins % 60 === 0) return `${mins / 60}h limit`;
   return `${mins}m limit`;
+}
+
+function rateLimitShortLabelFromMinutes(mins: number): string {
+  if (mins === 300) return "5h";
+  if (mins === 10080) return "wk";
+  if (mins === 1440) return "day";
+  if (mins % 60 === 0) return `${mins / 60}h`;
+  return `${mins}m`;
+}
+
+function formatPercent2(n: number): string {
+  return String(Math.round(n * 100) / 100);
 }
 
 function formatBar(remainingPercent: number, width: number): string {
@@ -1906,6 +2862,35 @@ function formatResetsAt(unixSeconds: number): string {
   const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   if (isSameDay) return hhmm;
   return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${hhmm}`;
+}
+
+function formatDurationJa(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const totalHours = Math.floor(totalMinutes / 60);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}日`);
+  if (hours > 0 || days > 0) parts.push(`${hours}時間`);
+  parts.push(`${minutes}分`);
+  return parts.join("");
+}
+
+function formatResetsAtTooltip(unixSeconds: number): string {
+  const d = new Date(unixSeconds * 1000);
+  const abs = d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const deltaMs = d.getTime() - Date.now();
+  if (!Number.isFinite(deltaMs)) return abs;
+  if (deltaMs >= 0) return `${abs}（あと${formatDurationJa(deltaMs)}）`;
+  return `${abs}（${formatDurationJa(-deltaMs)}前）`;
 }
 
 function resolveCodexHome(): string {
@@ -1933,7 +2918,9 @@ function backendKeyForCwd(cwd: string | null): string | null {
   return null;
 }
 
-function normalizeCliVariant(raw: string | null): "auto" | "codex" | "codex-mine" {
+function normalizeCliVariant(
+  raw: string | null,
+): "auto" | "codex" | "codex-mine" {
   const v = (raw ?? "auto").trim();
   if (v === "mine") return "codex-mine";
   if (v === "upstream") return "codex";
@@ -1995,10 +2982,9 @@ async function ensureBackendMatchesConfiguredCli(
   );
 }
 
-async function probeCliVersion(command: string): Promise<
-  | { ok: true; version: string }
-  | { ok: false; error: string }
-> {
+async function probeCliVersion(
+  command: string,
+): Promise<{ ok: true; version: string } | { ok: false; error: string }> {
   return await new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -2063,7 +3049,7 @@ function parsePromptFrontmatter(content: string): {
     if (val.length >= 2) {
       const first = val[0];
       const last = val[val.length - 1];
-      if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
         val = val.slice(1, -1);
       }
     }
@@ -2125,10 +3111,15 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     blocks: [],
     latestDiff: null,
     statusText: null,
+    uiHydrationBlockedText: null,
     tokenUsage: null,
     sending: false,
+    reloading: false,
+    compactInFlight: false,
+    pendingCompactBlockId: null,
     streamingAssistantItemIds: new Set(),
     activeTurnId: null,
+    pendingInterrupt: false,
     lastTurnStartedAtMs: null,
     lastTurnCompletedAtMs: null,
     v2NotificationsSeen: false,
@@ -2176,12 +3167,15 @@ function buildChatState(): ChatViewState {
     argumentHint: p.argumentHint,
     source: p.source,
   }));
-  const capsForBackendKey = (backendKey: string | null): {
+  const capsForBackendKey = (
+    backendKey: string | null,
+  ): {
     agents: boolean;
     cliVariant: "unknown" | "codex" | "codex-mine";
   } => {
-    const detected =
-      backendKey ? cliVariantByBackendKey.get(backendKey) ?? "unknown" : "unknown";
+    const detected = backendKey
+      ? (cliVariantByBackendKey.get(backendKey) ?? "unknown")
+      : "unknown";
     if (detected !== "unknown") {
       return { agents: detected === "codex-mine", cliVariant: detected };
     }
@@ -2192,11 +3186,7 @@ function buildChatState(): ChatViewState {
     const cfg = vscode.workspace.getConfiguration("codexMine", folderUri);
     const raw = cfg.get<string>("cli.variant") ?? "auto";
     const normalized =
-      raw === "mine"
-        ? "codex-mine"
-        : raw === "upstream"
-          ? "codex"
-          : raw;
+      raw === "mine" ? "codex-mine" : raw === "upstream" ? "codex" : raw;
     if (normalized === "codex-mine")
       return { agents: true, cliVariant: "codex-mine" };
     if (normalized === "codex") return { agents: false, cliVariant: "codex" };
@@ -2213,7 +3203,11 @@ function buildChatState(): ChatViewState {
       blocks: [],
       latestDiff: null,
       sending: false,
-      statusText: globalStatusText,
+      reloading: false,
+      statusText: [globalStatusText, globalRateLimitStatusText]
+        .filter(Boolean)
+        .join(" • "),
+      statusTooltip: globalRateLimitStatusTooltip,
       modelState: getSessionModelState(),
       models: null,
       approvals: [],
@@ -2238,7 +3232,11 @@ function buildChatState(): ChatViewState {
       blocks: [],
       latestDiff: null,
       sending: false,
-      statusText: globalStatusText,
+      reloading: false,
+      statusText: [globalStatusText, globalRateLimitStatusText]
+        .filter(Boolean)
+        .join(" • "),
+      statusTooltip: globalRateLimitStatusTooltip,
       modelState: getSessionModelState(),
       approvals: [],
       customPrompts: promptSummaries,
@@ -2246,16 +3244,26 @@ function buildChatState(): ChatViewState {
 
   const rt = ensureRuntime(activeRaw.id);
   const baseStatusText = rt.statusText ?? null;
+  const core: string[] = [];
+  const hydrationBlockedText = rt.uiHydrationBlockedText ?? null;
+  if (hydrationBlockedText) core.push("history not loaded");
+  if (baseStatusText) core.push(baseStatusText);
+  if (globalRateLimitStatusText) core.push(globalRateLimitStatusText);
   const suffix: string[] = [];
   if (rt.sending) suffix.push("sending…");
+  if (rt.reloading) suffix.push("reloading…");
   const worked = computeWorkedSeconds(rt);
   if (worked !== null) suffix.push(`worked=${worked}s`);
   if (rt.pendingApprovals.size > 0)
     suffix.push(`approvals=${rt.pendingApprovals.size}`);
+  const coreText = core.length > 0 ? core.join(" • ") : null;
   const statusText =
-    baseStatusText && suffix.length > 0
-      ? `${baseStatusText} • ${suffix.join(" • ")}`
-      : baseStatusText || (suffix.length > 0 ? suffix.join(" • ") : null);
+    coreText && suffix.length > 0
+      ? `${coreText} • ${suffix.join(" • ")}`
+      : coreText || (suffix.length > 0 ? suffix.join(" • ") : null);
+  const statusTooltipParts = [hydrationBlockedText, globalRateLimitStatusTooltip]
+    .filter(Boolean)
+    .join("\n\n");
   return {
     globalBlocks: globalRuntime.blocks,
     capabilities: capsForBackendKey(activeRaw.backendKey),
@@ -2266,7 +3274,11 @@ function buildChatState(): ChatViewState {
     blocks: rt.blocks,
     latestDiff: rt.latestDiff,
     sending: rt.sending,
-    statusText: statusText ?? globalStatusText,
+    reloading: rt.reloading,
+    statusText:
+      statusText ??
+      [globalStatusText, globalRateLimitStatusText].filter(Boolean).join(" • "),
+    statusTooltip: statusTooltipParts || null,
     modelState: getSessionModelState(),
     models: getModelOptionsForSession(activeRaw),
     approvals: [...rt.pendingApprovals.entries()].map(([requestKey, v]) => ({
@@ -2326,11 +3338,18 @@ function applyServerNotification(
       const headline =
         workedSeconds !== null ? `Worked for ${workedSeconds}s` : "Context";
       const line = makeDividerLine(headline);
-      upsertBlock(rt, {
-        id: `compacted:${turnId || Date.now()}`,
+      const blockId = rt.pendingCompactBlockId
+        ? rt.pendingCompactBlockId
+        : `compacted:${turnId || Date.now()}`;
+      upsertBlock(sessionId, {
+        id: blockId,
         type: "divider",
+        status: "completed",
         text: `${line}\n• Context compacted`,
       });
+      rt.sending = false;
+      rt.compactInFlight = false;
+      rt.pendingCompactBlockId = null;
       chatView?.refresh();
       return;
     }
@@ -2339,47 +3358,84 @@ function applyServerNotification(
       rt.lastTurnStartedAtMs = Date.now();
       rt.lastTurnCompletedAtMs = null;
       rt.activeTurnId = String((n as any).params?.turn?.id ?? "") || null;
+      if (
+        rt.pendingInterrupt &&
+        rt.activeTurnId &&
+        backendManager &&
+        sessions
+      ) {
+        rt.pendingInterrupt = false;
+        const session = sessions.getById(sessionId);
+        if (session) {
+          const turnId = rt.activeTurnId;
+          outputChannel?.appendLine(
+            `[turn] Sending queued interrupt: turnId=${turnId}`,
+          );
+          void backendManager.interruptTurn(session, turnId).catch((err) => {
+            outputChannel?.appendLine(
+              `[turn] Failed to interrupt (queued): ${String(err)}`,
+            );
+            upsertBlock(sessionId, {
+              id: newLocalId("error"),
+              type: "error",
+              title: "Interrupt failed",
+              text: String(err),
+            });
+            chatView?.refresh();
+          });
+        } else {
+          outputChannel?.appendLine(
+            `[turn] Queued interrupt dropped: session not found (sessionId=${sessionId})`,
+          );
+        }
+      }
       chatView?.refresh();
       return;
-	    case "turn/completed":
-	      rt.sending = false;
-	      rt.lastTurnCompletedAtMs = Date.now();
-	      rt.activeTurnId = null;
-	      for (const id of rt.streamingAssistantItemIds) {
-	        const idx = rt.blockIndexById.get(id);
-	        if (idx === undefined) continue;
-	        const b = rt.blocks[idx];
-	        if (b && b.type === "assistant") (b as any).streaming = false;
-	      }
-	      rt.streamingAssistantItemIds.clear();
-	      markUnreadSession(sessionId);
-	      sessionPanels?.markTurnCompleted(sessionId);
-	      chatView?.refresh();
-	      return;
+    case "turn/completed":
+      rt.sending = false;
+      rt.lastTurnCompletedAtMs = Date.now();
+      rt.activeTurnId = null;
+      rt.pendingInterrupt = false;
+      for (const id of rt.streamingAssistantItemIds) {
+        const idx = rt.blockIndexById.get(id);
+        if (idx === undefined) continue;
+        const b = rt.blocks[idx];
+        if (b && b.type === "assistant") {
+          (b as any).streaming = false;
+          chatView?.postBlockUpsert(sessionId, b);
+        }
+      }
+      rt.streamingAssistantItemIds.clear();
+      markUnreadSession(sessionId);
+      sessionPanels?.markTurnCompleted(sessionId);
+      chatView?.refresh();
+      return;
     case "thread/tokenUsage/updated":
       rt.tokenUsage = (n as any).params.tokenUsage as ThreadTokenUsage;
       rt.statusText = formatTokenUsageStatus(rt.tokenUsage);
       chatView?.refresh();
       return;
-		    case "item/agentMessage/delta": {
-		      const id = (n as any).params.itemId as string;
-		      const block = getOrCreateBlock(rt, id, () => ({
-		        id,
-		        type: "assistant",
-		        text: "",
-		        streaming: true,
-		      }));
-		      const delta = (n as any).params.delta as string;
-		      if (block.type === "assistant") {
-		        block.text += delta;
-		        (block as any).streaming = true;
-		      }
-		      rt.streamingAssistantItemIds.add(id);
-		      markUnreadSession(sessionId);
-		      sessionPanels?.appendAssistantDelta(sessionId, delta);
-		      chatView?.refresh();
-		      return;
-		    }
+    case "item/agentMessage/delta": {
+      const id = (n as any).params.itemId as string;
+      const block = getOrCreateBlock(rt, id, () => ({
+        id,
+        type: "assistant",
+        text: "",
+        streaming: true,
+      }));
+      const delta = (n as any).params.delta as string;
+      if (block.type === "assistant") {
+        block.text += delta;
+        (block as any).streaming = true;
+      }
+      rt.streamingAssistantItemIds.add(id);
+      markUnreadSession(sessionId);
+      sessionPanels?.appendAssistantDelta(sessionId, delta);
+      chatView?.postBlockAppend(sessionId, id, "assistantText", delta, {
+        streaming: true,
+      });
+      return;
+    }
     case "item/reasoning/summaryTextDelta": {
       const id = (n as any).params.itemId as string;
       const block = getOrCreateBlock(rt, id, () => ({
@@ -2394,7 +3450,7 @@ function applyServerNotification(
         ensureParts(block.summaryParts, p.summaryIndex);
         block.summaryParts[p.summaryIndex] += p.delta;
       }
-      chatView?.refresh();
+      chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "item/reasoning/summaryPartAdded": {
@@ -2412,7 +3468,7 @@ function applyServerNotification(
           (n as any).params.summaryIndex as number,
         );
       }
-      chatView?.refresh();
+      chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "item/reasoning/textDelta": {
@@ -2429,7 +3485,7 @@ function applyServerNotification(
         ensureParts(block.rawParts, p.contentIndex);
         block.rawParts[p.contentIndex] += p.delta;
       }
-      chatView?.refresh();
+      chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "item/commandExecution/outputDelta": {
@@ -2447,9 +3503,9 @@ function applyServerNotification(
         terminalStdin: [],
         output: "",
       }));
-      if (block.type === "command")
-        block.output += (n as any).params.delta as string;
-      chatView?.refresh();
+      const delta = (n as any).params.delta as string;
+      if (block.type === "command") block.output += delta;
+      chatView?.postBlockAppend(sessionId, id, "commandOutput", delta);
       return;
     }
     case "item/commandExecution/terminalInteraction": {
@@ -2469,7 +3525,7 @@ function applyServerNotification(
       }));
       if (block.type === "command")
         block.terminalStdin.push((n as any).params.stdin as string);
-      chatView?.refresh();
+      chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "item/fileChange/outputDelta": {
@@ -2484,11 +3540,11 @@ function applyServerNotification(
         hasDiff: rt.latestDiff != null,
         diffs: [],
       }));
-      if (block.type === "fileChange")
-        block.detail += (n as any).params.delta as string;
+      const delta = (n as any).params.delta as string;
+      if (block.type === "fileChange") block.detail += delta;
       if (block.type === "fileChange")
         block.diffs = diffsForFiles(block.files, rt.latestDiff);
-      chatView?.refresh();
+      chatView?.postBlockAppend(sessionId, id, "fileChangeDetail", delta);
       return;
     }
     case "item/mcpToolCall/progress": {
@@ -2504,7 +3560,7 @@ function applyServerNotification(
       }));
       if (block.type === "mcp")
         block.detail += `${String((n as any).params.message ?? "")}\n`;
-      chatView?.refresh();
+      chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "turn/plan/updated": {
@@ -2522,19 +3578,20 @@ function applyServerNotification(
       chatView?.refresh();
       return;
     }
-	    case "turn/diff/updated": {
-	      rt.latestDiff = (n as any).params.diff as string;
-	      // Mark existing fileChange blocks as having a diff.
-	      for (const b of rt.blocks) {
-	        if (b.type === "fileChange") {
-	          b.hasDiff = true;
-	          b.diffs = diffsForFiles(b.files, rt.latestDiff);
-	        }
-	      }
-	      sessionPanels?.setLatestDiff(sessionId, rt.latestDiff);
-	      chatView?.refresh();
-	      return;
-	    }
+    case "turn/diff/updated": {
+      rt.latestDiff = (n as any).params.diff as string;
+      // Mark existing fileChange blocks as having a diff.
+      for (const b of rt.blocks) {
+        if (b.type === "fileChange") {
+          b.hasDiff = true;
+          b.diffs = diffsForFiles(b.files, rt.latestDiff);
+          chatView?.postBlockUpsert(sessionId, b);
+        }
+      }
+      sessionPanels?.setLatestDiff(sessionId, rt.latestDiff);
+      chatView?.refresh();
+      return;
+    }
     case "error": {
       upsertBlock(sessionId, {
         id: newLocalId("error"),
@@ -2598,6 +3655,7 @@ function applyItemLifecycle(
           block.rawParts = [...item.content];
         }
       }
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "commandExecution": {
@@ -2607,7 +3665,10 @@ function applyItemLifecycle(
         title: "Command",
         status: item.status,
         command: item.command,
-        hideCommandText: shouldHideCommandText(item.command, item.commandActions),
+        hideCommandText: shouldHideCommandText(
+          item.command,
+          item.commandActions,
+        ),
         actionsText: formatCommandActions(item.commandActions),
         cwd: item.cwd ?? null,
         exitCode: item.exitCode,
@@ -2629,6 +3690,7 @@ function applyItemLifecycle(
         if (completed && item.aggregatedOutput)
           block.output = item.aggregatedOutput;
       }
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "fileChange": {
@@ -2660,6 +3722,7 @@ function applyItemLifecycle(
         block.hasDiff = true;
         block.diffs = diffsForFiles(files, rt.latestDiff);
       }
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "mcpToolCall": {
@@ -2681,8 +3744,9 @@ function applyItemLifecycle(
         if (completed && item.error)
           block.detail += `\nerror: ${JSON.stringify(item.error)}\n`;
       }
+      chatView?.postBlockUpsert(sessionId, block);
       if (completed && item.result?.content) {
-        appendMcpImageBlocks(
+        void appendMcpImageBlocks(
           rt,
           sessionId,
           item.id,
@@ -2719,7 +3783,7 @@ function applyItemLifecycle(
         }
       }
 
-      upsertBlock(rt, {
+      upsertBlock(sessionId, {
         id: item.id,
         type: "webSearch",
         query: item.query,
@@ -2732,7 +3796,7 @@ function applyItemLifecycle(
       break;
     }
     case "enteredReviewMode": {
-      upsertBlock(rt, {
+      upsertBlock(sessionId, {
         id: item.id,
         type: "system",
         title: `Entered review mode (${statusText})`,
@@ -2741,7 +3805,7 @@ function applyItemLifecycle(
       break;
     }
     case "exitedReviewMode": {
-      upsertBlock(rt, {
+      upsertBlock(sessionId, {
         id: item.id,
         type: "system",
         title: `Exited review mode (${statusText})`,
@@ -2765,6 +3829,7 @@ function applyItemLifecycle(
       }
       if (completed) rt.streamingAssistantItemIds.delete(id);
       else rt.streamingAssistantItemIds.add(id);
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     default:
@@ -2785,9 +3850,15 @@ function upsertBlock(
   if (idx === undefined) {
     rt.blockIndexById.set(block.id, rt.blocks.length);
     rt.blocks.push(block);
+    if (typeof sessionIdOrRt === "string") {
+      chatView?.postBlockUpsert(sessionIdOrRt, block);
+    }
     return;
   }
   rt.blocks[idx] = block;
+  if (typeof sessionIdOrRt === "string") {
+    chatView?.postBlockUpsert(sessionIdOrRt, block);
+  }
 }
 
 function getOrCreateBlock(
@@ -2874,7 +3945,7 @@ function formatTokenUsageStatus(tokenUsage: ThreadTokenUsage): string {
       );
     })();
 
-    return `remaining=${remainingPct}% (${formatK(remainingTokens)}/${formatK(modelContextWindow)})`;
+    return `ctx remaining=${remainingPct}% (${formatK(remainingTokens)}/${formatK(modelContextWindow)})`;
   }
   return `tokens used=${formatK(total.totalTokens)}`;
 }
@@ -2926,28 +3997,80 @@ async function loadLocalImageDataUrl(
   }
 }
 
-function appendMcpImageBlocks(
+function enforceSessionImageAutoloadLimit(rt: SessionRuntime): void {
+  const keep = SESSION_IMAGE_AUTOLOAD_RECENT;
+  if (keep <= 0) return;
+  let kept = 0;
+  for (let i = rt.blocks.length - 1; i >= 0; i--) {
+    const b = rt.blocks[i];
+    if (!b) continue;
+
+    const refs: any[] =
+      b.type === "image"
+        ? [b as any]
+        : b.type === "imageGallery"
+          ? Array.isArray((b as any).images)
+            ? ((b as any).images as any[])
+            : []
+          : [];
+
+    for (let j = refs.length - 1; j >= 0; j--) {
+      const ref = refs[j];
+      const hasKey = typeof ref?.imageKey === "string" && ref.imageKey;
+      if (!hasKey) continue;
+      if (kept < keep) {
+        ref.autoLoad = true;
+        kept += 1;
+      } else {
+        ref.autoLoad = false;
+        // Ensure we don't keep a large inline src around for offloaded images.
+        if (typeof ref.src === "string") ref.src = "";
+      }
+    }
+  }
+}
+
+async function appendMcpImageBlocks(
   rt: SessionRuntime,
   sessionId: string,
   itemId: string,
   server: string,
   tool: string,
   content: ContentBlock[],
-): void {
+): Promise<void> {
   const images = content.filter(isImageContent);
   if (images.length === 0) return;
-  images.forEach((img, index) => {
-    const src = `data:${img.mimeType};base64,${img.data}`;
-    upsertBlock(rt, {
+  const cached: Array<{
+    imageKey: string;
+    mimeType: string;
+    byteLength: number;
+  }> = [];
+  for (let index = 0; index < images.length; index++) {
+    const img = images[index]!;
+    const bytes = Buffer.from(img.data, "base64");
+    const saved = await cacheImageBytes({
+      imageKey: `mcp-${sessionId}-${itemId}-${index}`,
+      prefix: `mcp-${server}-${tool}`,
+      mimeType: img.mimeType,
+      bytes,
+    });
+    cached.push(saved);
+    upsertBlock(sessionId, {
       id: `mcp-image:${itemId}:${index}`,
       type: "image",
       title: `MCP image (${server}.${tool})`,
-      src,
+      src: "",
+      imageKey: saved.imageKey,
+      mimeType: saved.mimeType,
+      byteLength: saved.byteLength,
+      autoLoad: true,
       alt: `mcp-image-${index + 1}`,
       caption: img.mimeType || null,
       role: "tool",
-    });
-  });
+    } as any);
+  }
+  void cached;
+  enforceSessionImageAutoloadLimit(rt);
   schedulePersistRuntime(sessionId);
 }
 
@@ -2958,26 +4081,48 @@ async function upsertImageViewBlock(
   imagePath: string,
   statusText: string,
 ): Promise<void> {
-  const result = await loadLocalImageDataUrl(imagePath);
-  if ("error" in result) {
-    upsertBlock(rt, {
+  const mimeType = imageMimeFromPath(imagePath);
+  if (!mimeType) {
+    upsertBlock(sessionId, {
       id: `imageView:${itemId}`,
       type: "error",
       title: `Image view (${statusText})`,
-      text: result.error,
+      text: `Unsupported image extension: ${imagePath}`,
     });
-  } else {
-    upsertBlock(rt, {
+    schedulePersistRuntime(sessionId);
+    return;
+  }
+
+  try {
+    const data = await fs.readFile(imagePath);
+    const saved = await cacheImageBytes({
+      imageKey: `imageView-${sessionId}-${itemId}`,
+      prefix: `imageView-${itemId}`,
+      mimeType,
+      bytes: Buffer.from(data),
+    });
+    upsertBlock(sessionId, {
       id: `imageView:${itemId}`,
       type: "image",
       title: `Image view (${statusText})`,
-      src: result.url,
+      src: "",
+      imageKey: saved.imageKey,
+      mimeType: saved.mimeType,
+      byteLength: saved.byteLength,
+      autoLoad: true,
       alt: path.basename(imagePath) || "image",
       caption: imagePath,
       role: "system",
+    } as any);
+    enforceSessionImageAutoloadLimit(rt);
+  } catch (err) {
+    upsertBlock(sessionId, {
+      id: `imageView:${itemId}`,
+      type: "error",
+      title: `Image view (${statusText})`,
+      text: `Failed to read image ${imagePath}: ${String(err)}`,
     });
   }
-  chatView?.refresh();
   schedulePersistRuntime(sessionId);
 }
 
@@ -3128,14 +4273,25 @@ function applyGlobalNotification(n: AnyServerNotification): void {
         .rateLimits as RateLimitSnapshot;
       const p = rateLimits.primary;
       const s = rateLimits.secondary;
-      const plan = rateLimits.planType ?? null;
-      const primary = p
-        ? `primary=${Math.round(p.usedPercent * 100) / 100}%`
-        : "primary=null";
-      const secondary = s
-        ? `secondary=${Math.round(s.usedPercent * 100) / 100}%`
-        : "secondary=null";
-      globalStatusText = `${primary} ${secondary} plan=${String(plan)}`;
+      const parts: string[] = [];
+      const tooltipLines: string[] = [];
+      if (p) {
+        const mins = p.windowDurationMins ?? null;
+        const label = mins ? rateLimitShortLabelFromMinutes(mins) : "primary";
+        parts.push(`${label}:${formatPercent2(p.usedPercent)}%`);
+        const reset = p.resetsAt ? formatResetsAtTooltip(p.resetsAt) : "不明";
+        tooltipLines.push(`${label} リセット: ${reset}`);
+      }
+      if (s) {
+        const mins = s.windowDurationMins ?? null;
+        const label = mins ? rateLimitShortLabelFromMinutes(mins) : "secondary";
+        parts.push(`${label}:${formatPercent2(s.usedPercent)}%`);
+        const reset = s.resetsAt ? formatResetsAtTooltip(s.resetsAt) : "不明";
+        tooltipLines.push(`${label} リセット: ${reset}`);
+      }
+      globalRateLimitStatusText = parts.length > 0 ? parts.join(" ") : null;
+      globalRateLimitStatusTooltip =
+        tooltipLines.length > 0 ? tooltipLines.join("\n") : null;
       chatView?.refresh();
       return;
     }
@@ -3245,13 +4401,16 @@ function formatMcpStatusSummary(): string | null {
   return ["MCP servers:", ...lines].join("\n");
 }
 
-function formatSessionConfigForDisplay(params: Record<string, unknown>): string {
+function formatSessionConfigForDisplay(
+  params: Record<string, unknown>,
+): string {
   const model = typeof params.model === "string" ? params.model : "default";
   const provider =
     typeof params.modelProvider === "string" ? params.modelProvider : "default";
   const sandbox =
     typeof params.sandbox === "string" ? params.sandbox : "default";
-  const plan = typeof params.planType === "string" ? params.planType : "default";
+  const plan =
+    typeof params.planType === "string" ? params.planType : "default";
   return `model=${model}\nprovider=${provider}\nsandbox=${sandbox}\nplan=${plan}`;
 }
 
@@ -3265,9 +4424,7 @@ function updateThreadStartedBlocks(): void {
     const lines = b.text
       .split("\n")
       .filter(
-        (l) =>
-          !l.startsWith("MCP servers:") &&
-          !/^\s*-?\s*[✓…•]/.test(l),
+        (l) => !l.startsWith("MCP servers:") && !/^\s*-?\s*[✓…•]/.test(l),
       );
     if (summary) lines.push(summary);
     const nextText = lines.join("\n");
@@ -3303,7 +4460,11 @@ function applyGlobalCodexEvent(method: string, params: unknown): void {
 
   // A-policy: show only a minimal allowlist of legacy (codex/event/*) events.
   // Everything else is handled by v2 notifications and would otherwise duplicate UI.
-  if (type !== "token_count" && type !== "mcp_startup_complete" && type !== "mcp_startup_update") {
+  if (
+    type !== "token_count" &&
+    type !== "mcp_startup_complete" &&
+    type !== "mcp_startup_update"
+  ) {
     return;
   }
 
@@ -3321,7 +4482,7 @@ function applyGlobalCodexEvent(method: string, params: unknown): void {
           0,
           Math.min(100, Math.round((remaining / ctx) * 100)),
         );
-        globalStatusText = `remaining=${remainingPct}% (${remaining}/${ctx})`;
+        globalStatusText = `ctx remaining=${remainingPct}% (${remaining}/${ctx})`;
       } else {
         globalStatusText = `tokens used=${info.total_tokens}`;
       }
@@ -3366,8 +4527,12 @@ function applyGlobalCodexEvent(method: string, params: unknown): void {
 
   if (type === "mcp_startup_update") {
     const server = typeof msg.server === "string" ? msg.server : "(unknown)";
-    const status = typeof msg.status === "object" && msg.status !== null ? msg.status : {};
-    const state = typeof (status as any).state === "string" ? (status as any).state : "unknown";
+    const status =
+      typeof msg.status === "object" && msg.status !== null ? msg.status : {};
+    const state =
+      typeof (status as any).state === "string"
+        ? (status as any).state
+        : "unknown";
     if (server !== "(unknown)") mcpStatusByServer.set(server, state);
     updateThreadStartedBlocks();
     return;
@@ -3418,7 +4583,8 @@ function applyCodexEvent(
       .map((p) => ({
         name: typeof p?.name === "string" ? p.name.trim() : "",
         description: typeof p?.description === "string" ? p.description : null,
-        argumentHint: typeof p?.argument_hint === "string" ? p.argument_hint : null,
+        argumentHint:
+          typeof p?.argument_hint === "string" ? p.argument_hint : null,
         content: typeof p?.content === "string" ? p.content : "",
       }))
       .filter((p) => !!p.name)
@@ -3432,7 +4598,10 @@ function applyCodexEvent(
     const server = typeof msg.server === "string" ? msg.server : "(unknown)";
     const status =
       typeof msg.status === "object" && msg.status !== null ? msg.status : {};
-    const state = typeof (status as any).state === "string" ? (status as any).state : "unknown";
+    const state =
+      typeof (status as any).state === "string"
+        ? (status as any).state
+        : "unknown";
     if (server !== "(unknown)") {
       mcpStatusByServer.set(server, state);
       updateThreadStartedBlocks();
@@ -3454,7 +4623,7 @@ function applyCodexEvent(
           0,
           Math.min(100, Math.round((remaining / ctx) * 100)),
         );
-        rt.statusText = `remaining=${remainingPct}% (${remaining}/${ctx})`;
+        rt.statusText = `ctx remaining=${remainingPct}% (${remaining}/${ctx})`;
       } else {
         rt.statusText = `tokens used=${info.total_tokens}`;
       }
@@ -3481,7 +4650,7 @@ function applyCodexEvent(
     const failed = Array.isArray(msg.failed) ? msg.failed : [];
     const cancelled = Array.isArray(msg.cancelled) ? msg.cancelled : [];
     if (failed.length === 0 && cancelled.length === 0) return;
-    upsertBlock(rt, {
+    upsertBlock(sessionId, {
       id: newLocalId("mcpStartup"),
       type: "system",
       title: "MCP startup issues",
@@ -3623,7 +4792,11 @@ function findRecentWebSearchBlockIdByQuery(
   return null;
 }
 
-function hydrateRuntimeFromThread(sessionId: string, thread: Thread): void {
+function hydrateRuntimeFromThread(
+  sessionId: string,
+  thread: Thread,
+  opts?: { force?: boolean },
+): void {
   const rt = ensureRuntime(sessionId);
 
   const hasConversationBlocks = rt.blocks.some((b) => {
@@ -3642,14 +4815,16 @@ function hydrateRuntimeFromThread(sessionId: string, thread: Thread): void {
         return false;
     }
   });
-  if (hasConversationBlocks) return;
+  if (hasConversationBlocks) rt.uiHydrationBlockedText = null;
+  if (!opts?.force && hasConversationBlocks) return;
 
   // Preserve non-conversation blocks that may have arrived before hydration (e.g. legacy warnings).
-  const preserved = rt.blocks.filter((b) =>
-    b.type === "info" ||
-    b.type === "system" ||
-    b.type === "note" ||
-    b.type === "error",
+  const preserved = rt.blocks.filter(
+    (b) =>
+      b.type === "info" ||
+      b.type === "system" ||
+      b.type === "note" ||
+      b.type === "error",
   );
 
   rt.blocks.length = 0;
@@ -3664,12 +4839,11 @@ function hydrateRuntimeFromThread(sessionId: string, thread: Thread): void {
           .filter((c) => c.type === "text")
           .map((c) => c.text)
           .join("\n");
-        if (text)
-          upsertBlock(rt, { id: item.id, type: "user", text });
+        if (text) upsertBlock(sessionId, { id: item.id, type: "user", text });
       }
       if (item.type === "agentMessage") {
         if (item.text)
-          upsertBlock(rt, {
+          upsertBlock(sessionId, {
             id: item.id,
             type: "assistant",
             text: item.text,
@@ -3679,7 +4853,11 @@ function hydrateRuntimeFromThread(sessionId: string, thread: Thread): void {
     }
   }
 
-  for (const b of preserved) upsertBlock(rt, b);
+  for (const b of preserved) upsertBlock(sessionId, b);
+
+  if (activeSessionId === sessionId) {
+    chatView?.syncBlocksForActiveSession();
+  }
 }
 
 function formatApprovalDetail(
@@ -3718,7 +4896,12 @@ function formatApprovalDetail(
 const SESSIONS_KEY = "codexMine.sessions.v1";
 type PersistedSession = Pick<
   Session,
-  "id" | "backendKey" | "workspaceFolderUri" | "title" | "threadId" | "customTitle"
+  | "id"
+  | "backendKey"
+  | "workspaceFolderUri"
+  | "title"
+  | "threadId"
+  | "customTitle"
 >;
 
 function loadSessions(
@@ -3773,97 +4956,27 @@ function toPersistedSession(session: Session): PersistedSession {
   return { id, backendKey, workspaceFolderUri, title, customTitle, threadId };
 }
 
-const RUNTIMES_KEY = "codexMine.sessionRuntime.v1";
-type PersistedRuntime = {
-  blocks: ChatBlock[];
-  latestDiff: string | null;
-  statusText: string | null;
-  lastTurnStartedAtMs: number | null;
-  lastTurnCompletedAtMs: number | null;
-};
-
-let persistedRuntimeCache: Record<string, PersistedRuntime> = {};
-let persistRuntimeTimer: NodeJS.Timeout | null = null;
-const dirtyRuntimeSessionIds = new Set<string>();
-
-function loadRuntimes(
-  context: vscode.ExtensionContext,
-  store: SessionStore,
-): void {
-  const raw = context.workspaceState.get<unknown>(RUNTIMES_KEY);
-  if (typeof raw !== "object" || raw === null) return;
-  persistedRuntimeCache = raw as Record<string, PersistedRuntime>;
-
-  for (const session of store.listAll()) {
-    const persisted = persistedRuntimeCache[session.id];
-    if (!persisted) continue;
-    restoreRuntime(session.id, persisted);
-  }
-}
-
-function restoreRuntime(sessionId: string, persisted: PersistedRuntime): void {
-  const rt = ensureRuntime(sessionId);
-  rt.blocks = (Array.isArray(persisted.blocks) ? persisted.blocks : []).filter(
-    (b) => !(typeof b === "object" && b !== null && (b as any).type === "image"),
-  );
-  for (const b of rt.blocks) {
-    if (b && typeof b === "object" && (b as any).type === "assistant") {
-      delete (b as any).streaming;
-    }
-  }
-  rt.latestDiff = persisted.latestDiff ?? null;
-  rt.statusText = persisted.statusText ?? null;
-  rt.lastTurnStartedAtMs = persisted.lastTurnStartedAtMs ?? null;
-  rt.lastTurnCompletedAtMs = persisted.lastTurnCompletedAtMs ?? null;
-  rt.sending = false;
-
-  rt.blockIndexById.clear();
-  for (let i = 0; i < rt.blocks.length; i++) {
-    const b = rt.blocks[i];
-    if (
-      typeof b === "object" &&
-      b !== null &&
-      typeof (b as any).id === "string"
-    ) {
-      rt.blockIndexById.set((b as any).id as string, i);
-    }
-  }
-}
-
 function schedulePersistRuntime(sessionId: string): void {
-  const context = extensionContext;
-  if (!context) return;
-
-  dirtyRuntimeSessionIds.add(sessionId);
-  if (persistRuntimeTimer) return;
-
-  persistRuntimeTimer = setTimeout(() => {
-    persistRuntimeTimer = null;
-    if (!sessions) return;
-
-    for (const id of dirtyRuntimeSessionIds) {
-      const rt = runtimeBySessionId.get(id);
-      if (!rt) continue;
-      // Only persist for sessions that still exist.
-      if (!sessions.getById(id)) continue;
-      persistedRuntimeCache[id] = {
-        blocks: rt.blocks.filter((b) => b.type !== "image"),
-        latestDiff: rt.latestDiff,
-        statusText: rt.statusText,
-        lastTurnStartedAtMs: rt.lastTurnStartedAtMs,
-        lastTurnCompletedAtMs: rt.lastTurnCompletedAtMs,
-      };
-    }
-    dirtyRuntimeSessionIds.clear();
-    void context.workspaceState.update(RUNTIMES_KEY, persistedRuntimeCache);
-  }, 250);
+  // Intentionally no-op: only UI-specific state is persisted (sessions list, hidden tabs, etc).
+  // Conversation history is re-hydrated from `thread/resume`, backed by ~/.codex/sessions.
+  void sessionId;
 }
 
-function deletePersistedRuntime(
+async function cleanupLegacyRuntimeCache(
   context: vscode.ExtensionContext,
-  sessionId: string,
-): void {
-  delete persistedRuntimeCache[sessionId];
-  dirtyRuntimeSessionIds.delete(sessionId);
-  void context.workspaceState.update(RUNTIMES_KEY, persistedRuntimeCache);
+): Promise<void> {
+  // Older versions cached full conversation blocks in workspaceState or storageUri, which
+  // can make the Extension Host sluggish. We no longer use this cache.
+  try {
+    await context.workspaceState.update(LEGACY_RUNTIMES_KEY, undefined);
+  } catch (err) {
+    outputChannel?.appendLine(
+      `[runtime] Failed to clear legacy workspaceState: ${String(err)}`,
+    );
+  }
+
+  const base = context.storageUri?.fsPath ?? null;
+  if (!base) return;
+  const dir = path.join(base, "sessionRuntime.v1");
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => null);
 }
