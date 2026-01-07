@@ -178,6 +178,8 @@ function main(): void {
     if (!e) throw new Error(`Webview DOM element missing: #${id}`);
     return e as T;
   };
+  const maybeGet = <T extends HTMLElement = HTMLElement>(id: string): T | null =>
+    (document.getElementById(id) as T | null) ?? null;
 
   const titleEl = mustGet("title");
   const statusTextEl = mustGet("statusText");
@@ -193,12 +195,12 @@ function main(): void {
   const attachmentsEl = mustGet("attachments");
   const returnToBottomBtn = mustGet<HTMLButtonElement>("returnToBottom");
   const sendBtn = mustGet<HTMLButtonElement>("send");
-  const diffBtn = mustGet<HTMLButtonElement>("diff");
   const newBtn = mustGet<HTMLButtonElement>("new");
   const resumeBtn = mustGet<HTMLButtonElement>("resume");
   const reloadBtn = mustGet<HTMLButtonElement>("reload");
-  const statusBtn = mustGet<HTMLButtonElement>("status");
   const settingsBtn = mustGet<HTMLButtonElement>("settings");
+  const diffBtn = maybeGet<HTMLButtonElement>("diff");
+  const statusBtn = maybeGet<HTMLButtonElement>("status");
   const tabsEl = mustGet("tabs");
   const modelBarEl = mustGet("modelBar");
   const footerBarEl = (() => {
@@ -1004,6 +1006,12 @@ function main(): void {
       kind: "slash",
     },
     {
+      insert: "/status ",
+      label: "/status",
+      detail: "Show status",
+      kind: "slash",
+    },
+    {
       insert: "/diff ",
       label: "/diff",
       detail: "Open Latest Diff",
@@ -1035,11 +1043,13 @@ function main(): void {
       agents: false,
       cliVariant: "unknown" as const,
     };
+    const base =
+      caps.cliVariant === "codex-mine" ? baseSlashSuggestions : ([] as const);
     const ui = caps.agents
       ? uiSlashSuggestions
       : uiSlashSuggestions.filter((s) => s.label !== "/agents");
     const reserved = new Set(
-      [...baseSlashSuggestions, ...ui].map((s) => s.label.replace(/^\//, "")),
+      [...base, ...ui].map((s) => s.label.replace(/^\//, "")),
     );
     const custom = (state.customPrompts ?? [])
       .map((p) => {
@@ -1055,7 +1065,7 @@ function main(): void {
         } as SuggestItem;
       })
       .filter(Boolean) as SuggestItem[];
-    return [...baseSlashSuggestions, ...custom, ...ui];
+    return [...base, ...custom, ...ui];
   }
 
   const atSuggestions: SuggestItem[] = [
@@ -1392,13 +1402,36 @@ function main(): void {
     // (require at least one "/") to avoid accidental linkification (e.g. emails).
     // For <code> tokens, we allow basename-style paths like "README.md:10" and
     // ".env.local:23" because they are explicitly formatted by the author.
-    const fileTokenRe =
-      /(?:\.?\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?/g;
-    const fileTokenWithAtRe =
-      /@?(?:\.?\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?/g;
+    // Allow Unicode letters/numbers in path segments so e.g. "docs/日本語/仕様.md:10"
+    // is recognized. Keep other constraints (requires "." extension; plain text
+    // requires at least one "/") to avoid over-linkifying.
+    //
+    // Policy:
+    // - Outside code blocks: allow full-width space (　) but do NOT allow ASCII
+    //   spaces inside path segments. This keeps linkification conservative.
+    // - Inside code blocks (<pre><code>): allow ASCII spaces too, so paths from
+    //   tool output like "確認事項 ver1.1_記入済み.docx" can be linkified.
+    //
+    // We also allow "・" (Japanese middle dot), which commonly appears in names.
+    const pathSegmentNoAsciiSpace = String.raw`[\p{L}\p{N}\p{M}_@.\-・　]+`;
+    const pathSegmentWithAsciiSpace = String.raw`[\p{L}\p{N}\p{M}_@.\-・　 ]+`;
+    const fileTokenRe = new RegExp(
+      String.raw`(?:\.?\/)?${pathSegmentNoAsciiSpace}(?:\/${pathSegmentNoAsciiSpace})+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?`,
+      "gu",
+    );
+    const fileTokenWithAtRe = new RegExp(
+      String.raw`@?(?:\.?\/)?${pathSegmentNoAsciiSpace}(?:\/${pathSegmentNoAsciiSpace})+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?`,
+      "gu",
+    );
+    const codeBlockFileTokenWithAtRe = new RegExp(
+      String.raw`@?(?:\.?\/)?${pathSegmentWithAsciiSpace}(?:\/${pathSegmentWithAsciiSpace})+\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?`,
+      "gu",
+    );
 
-    const codeFileTokenRe =
-      /^(?:\.?\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)*\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?$/;
+    const codeFileTokenRe = new RegExp(
+      String.raw`^(?:\.?\/)?${pathSegmentNoAsciiSpace}(?:\/${pathSegmentNoAsciiSpace})*\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?$`,
+      "u",
+    );
 
     const urlRe = /https?:\/\/[^\s<>()]+/gi;
 
@@ -1415,7 +1448,9 @@ function main(): void {
       const el = code as HTMLElement;
       if (el.dataset.openFile) continue;
       const raw = (el.textContent || "").trim();
-      if (!raw || /\s/.test(raw)) continue;
+      // Keep inline <code> conservative: treat ASCII whitespace as a delimiter,
+      // but allow full-width space (　) in file names.
+      if (!raw || /[ \t\r\n]/.test(raw)) continue;
       if (/^https?:\/\//i.test(raw)) {
         const normalizedUrl = normalizeToken(raw);
         if (!normalizedUrl) continue;
@@ -1446,17 +1481,22 @@ function main(): void {
 
     for (const node of textNodes) {
       const rawText = node.nodeValue || "";
+      const parentEl = node.parentElement;
+      const inCodeBlock = parentEl
+        ? Boolean(parentEl.closest("pre > code, pre code"))
+        : false;
 
       const appendTextWithFileLinks = (
         frag: DocumentFragment,
         text: string,
       ): boolean => {
-        fileTokenWithAtRe.lastIndex = 0;
+        const fileRe = inCodeBlock ? codeBlockFileTokenWithAtRe : fileTokenWithAtRe;
+        fileRe.lastIndex = 0;
         let m: RegExpExecArray | null = null;
         let lastIdx = 0;
         let changed = false;
 
-        while ((m = fileTokenWithAtRe.exec(text))) {
+        while ((m = fileRe.exec(text))) {
           changed = true;
           const start = m.index;
           const end = start + m[0].length;
@@ -2072,12 +2112,12 @@ function main(): void {
       statusTextEl.classList.remove("clickable");
       statusPopoverEnabled = false;
     }
-    diffBtn.disabled = !s.latestDiff;
+    if (diffBtn) diffBtn.disabled = !s.latestDiff;
     sendBtn.disabled = !s.activeSession;
     sendBtn.dataset.mode = s.sending ? "stop" : "send";
     sendBtn.setAttribute("aria-label", s.sending ? "Stop" : "Send");
     sendBtn.title = s.sending ? "Stop (Esc)" : "Send (Enter)";
-    statusBtn.disabled = !s.activeSession || s.sending;
+    if (statusBtn) statusBtn.disabled = !s.activeSession || s.sending;
     resumeBtn.disabled = s.sending;
     attachBtn.disabled = !s.activeSession;
     const variant = s.capabilities?.cliVariant ?? "unknown";
@@ -2094,6 +2134,7 @@ function main(): void {
         : variant === "codex"
           ? "CLI: codex (Settings)"
           : "Settings";
+    if (variant !== "codex-mine" && rewindTurnIndex !== null) setEditMode(null);
     // Keep input enabled so the user can draft messages even before selecting a session.
     // Sending is still guarded by sendBtn.disabled and sendCurrentInput().
     inputEl.disabled = false;
@@ -2527,6 +2568,7 @@ function main(): void {
         );
 
         if (block.type === "user") {
+          const variant = state.capabilities?.cliVariant ?? "unknown";
           userTurnIndex += 1;
           div.dataset.turnIndex = String(userTurnIndex);
 
@@ -2572,9 +2614,14 @@ function main(): void {
           const editBtn = document.createElement("button");
           editBtn.className = "msgActionBtn";
           editBtn.textContent = "Edit";
-          editBtn.disabled = Boolean(state.sending);
+          editBtn.disabled = Boolean(state.sending) || variant !== "codex-mine";
+          editBtn.title =
+            variant === "codex-mine"
+              ? "Edit this turn (rewind)"
+              : "Edit (codex-mine only)";
           editBtn.addEventListener("click", () => {
             if (state.sending) return;
+            if (variant !== "codex-mine") return;
             setEditMode(userTurnIndex, block.text);
             inputEl.focus();
           });
@@ -2918,6 +2965,14 @@ function main(): void {
   }
 
   function setEditMode(next: number | null, presetText?: string): void {
+    const variant = state.capabilities?.cliVariant ?? "unknown";
+    if (next !== null && variant !== "codex-mine") {
+      vscode.postMessage({
+        type: "uiError",
+        message: "Edit/Rewind is only supported when using codex-mine backend.",
+      });
+      return;
+    }
     rewindTurnIndex = next;
 
     if (typeof presetText === "string") {
@@ -2948,6 +3003,7 @@ function main(): void {
   function sendCurrentInput(): void {
     if (!state.activeSession) return;
     if (state.sending) return;
+    const variant = state.capabilities?.cliVariant ?? "unknown";
     const text = inputEl.value;
     const trimmed = text.trim();
     if (!trimmed && pendingImages.length === 0) return;
@@ -2956,7 +3012,10 @@ function main(): void {
         type: "sendWithImages",
         text,
         images: pendingImages.map((img) => ({ name: img.name, url: img.url })),
-        rewind: rewindTurnIndex === null ? null : { turnIndex: rewindTurnIndex },
+        rewind:
+          variant === "codex-mine" && rewindTurnIndex !== null
+            ? { turnIndex: rewindTurnIndex }
+            : null,
       });
       pendingImages.splice(0, pendingImages.length);
       renderAttachments();
@@ -2964,7 +3023,10 @@ function main(): void {
       vscode.postMessage({
         type: "send",
         text,
-        rewind: rewindTurnIndex === null ? null : { turnIndex: rewindTurnIndex },
+        rewind:
+          variant === "codex-mine" && rewindTurnIndex !== null
+            ? { turnIndex: rewindTurnIndex }
+            : null,
       });
     }
 
@@ -3116,12 +3178,16 @@ function main(): void {
   reloadBtn.addEventListener("click", () =>
     state.reloading ? undefined : vscode.postMessage({ type: "reloadSession" }),
   );
-  statusBtn.addEventListener("click", () =>
-    vscode.postMessage({ type: "showStatus" }),
-  );
-  diffBtn.addEventListener("click", () =>
-    vscode.postMessage({ type: "openDiff" }),
-  );
+  if (statusBtn) {
+    statusBtn.addEventListener("click", () =>
+      vscode.postMessage({ type: "showStatus" }),
+    );
+  }
+  if (diffBtn) {
+    diffBtn.addEventListener("click", () =>
+      vscode.postMessage({ type: "openDiff" }),
+    );
+  }
   settingsBtn.addEventListener("click", () =>
     vscode.postMessage({ type: "selectCliVariant" }),
   );
@@ -3790,8 +3856,10 @@ function main(): void {
     // If the link is explicitly a file reference, treat it as such even if it
     // looks like it has a URI scheme (e.g. "README.md:10" would otherwise be
     // misclassified as scheme="readme.md").
-    const explicitFileRefRe =
-      /^(?:\.{0,2}\/)?[A-Za-z0-9_@.-]+(?:\/[A-Za-z0-9_@.-]+)*\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?$/;
+    const explicitFileRefRe = new RegExp(
+      String.raw`^(?:\.{0,2}\/)?[\p{L}\p{N}\p{M}_@.-]+(?:\/[\p{L}\p{N}\p{M}_@.-]+)*\.[A-Za-z0-9]{1,8}(?:(?::\d+(?::\d+)?)|(?:#L\d+(?:C\d+)?))?$`,
+      "u",
+    );
     if (explicitFileRefRe.test(decoded)) {
       const normalized = decoded.replace(/^\/+/, "");
       e.preventDefault();
