@@ -65,7 +65,7 @@ The extension contributes a **Codex UI** activity bar container with:
 
 ### 5.1 Input history
 
-- Sent messages are stored in an in-memory history.
+- Sent messages are stored in an in-memory history (per session).
 - Up/Down arrow cycles through the history when the cursor is at the start/end of the input (implementation detail).
 
 ## 6. Slash commands
@@ -73,8 +73,14 @@ The extension contributes a **Codex UI** activity bar container with:
 Supported commands (handled by the extension):
 
 - `/new` - create a new session
+- `/init` - generate an `AGENTS.md` (skips if it already exists)
+- `/resume` - resume from history
+- `/status` - show status
+- `/compact` - compact context (codez backend only)
 - `/diff` - open latest diff
 - `/rename <title>` - rename session
+- `/skills` - browse skills
+- `/agents` - browse agents (codez backend only)
 - `/help` - show help
 
 Custom prompts:
@@ -84,13 +90,14 @@ Custom prompts:
 - If the backend sends `list_custom_prompts_response`, the list is replaced with that payload
 - Commands are invoked as `/prompts:<prompt-name>`
 - The prompt body is expanded before sending (supports `$1..$9`, `$ARGUMENTS`, and `$NAME` placeholders)
+- Prompts are reloaded when a session is created or selected in the extension
+- Prompt arguments are parsed with `shell-quote` (shlex-like quoting support)
 
 Unknown commands are passed through to the backend (no local error).
-Custom prompts only execute via `/prompts:<name>`; UI commands (`/new`, `/diff`, `/rename`, `/help`)
+Custom prompts only execute via `/prompts:<name>`; built-in commands (e.g. `/new`, `/init`, `/diff`, `/help`)
 keep their local behavior even if a prompt shares the same name.
 
 ## 7. Mentions
-
 
 Mentions follow a CLI-like rule: `@...` must start on a whitespace boundary.
 
@@ -115,8 +122,9 @@ Mentions follow a CLI-like rule: `@...` must start on a whitespace boundary.
 The webview provides in-input suggestions for:
 
 - Slash commands, in this order:
-  1) Custom prompts from `$CODEX_HOME/prompts`
-  2) UI commands (`/new`, `/diff`, `/rename`, `/help`)
+  1. Built-in commands (e.g. `/compact` when using codez)
+  2. Custom prompts from `$CODEX_HOME/prompts`
+  3. UI commands (`/new`, `/init`, `/resume`, `/status`, `/diff`, `/rename`, `/skills`, `/agents`, `/help`)
 - Mentions (`@selection`, file paths)
 
 ### 8.1 File suggestions
@@ -140,11 +148,15 @@ The webview provides in-input suggestions for:
   - External links open via `openExternal`.
   - Workspace-relative links (e.g. `README.md`, `./docs/spec.md`, `/README.md`) open as files.
   - `#L10` / `#L10C5` fragments jump to the corresponding position.
+  - `:10` / `:10:5` suffixes (line / line:column) are also supported.
 
 ### 9.2 Ctrl/Cmd-click file links
 
 - A file-like string rendered as a link triggers `openFile`.
 - The extension resolves workspace-relative paths against the active session workspace root.
+- Manual check:
+  - Markdown link: `[README.md:10](README.md:10)` opens `README.md` at line 10.
+  - Code token: `` `.env.local:23` `` opens `.env.local` at line 23.
 
 ## 10. Persistence
 
@@ -174,7 +186,7 @@ The webview stores UI state with `vscode.setState()`:
 
 The status line (below the composer) shows:
 
-- `ctx remaining=<percent> (<used>/<max>)`
+- `remaining=<percent> (<used>/<max>)`
 - `worked=<seconds>s`
 
 Token breakdown is intentionally not shown.
@@ -193,6 +205,7 @@ Example: `thread/started`
   - Working directory
   - CLI version
   - Git origin
+  - MCP servers summary (`MCP servers: <name>=<state>, ...`) if any `mcp_startup_update` has been received. The summary is refreshed in-place when further MCP updates arrive.
 
 ### 12.2 Turn/Item events
 
@@ -223,6 +236,7 @@ Example: `thread/started`
 ### 12.7 Unknown/unhandled events
 
 - Unknown events are collected into a debug block ("Other events (debug)") so they remain inspectable.
+- MCP startup updates (`mcp_startup_update`) are shown only in the global notice (see 12.1) to avoid duplicate legacy blocks in sessions.
 
 ## 13. Colors
 

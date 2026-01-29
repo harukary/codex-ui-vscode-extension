@@ -9,12 +9,13 @@
 !dist/**
 !resources/**
 !docs/spec.md
+!node_modules/shell-quote/**
+!node_modules/@iarna/toml/**
 
 # Keep source maps out of the VSIX
 **/*.map
 
 # Exclude dev files
-node_modules/**
 src/**
 scripts/**
 .vscode/**
@@ -24,3 +25,4 @@ scripts/**
 tsconfig.json
 pnpm-lock.yaml
 codex-ui-vscode-extension-*.vsix
+vsix/**
