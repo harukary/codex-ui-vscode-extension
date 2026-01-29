@@ -2,29 +2,50 @@ import * as vscode from "vscode";
 
 import type { Session } from "../sessions";
 
-type ChatLine =
+export type SessionPanelChatLine =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
   | { kind: "system"; text: string };
 
 export class SessionPanel implements vscode.Disposable {
   private readonly panel: vscode.WebviewPanel;
-  private readonly transcript: ChatLine[] = [];
+  private readonly transcript: SessionPanelChatLine[] = [];
   private latestDiff: string | null = null;
+  private baseTitle: string;
+  private unread = false;
+  private pendingAssistantDelta = "";
+  private assistantDeltaFlushTimer: NodeJS.Timeout | null = null;
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
     public readonly session: Session,
     private readonly onDispose: (sessionId: string) => void,
   ) {
+    this.baseTitle = session.title;
     this.panel = vscode.window.createWebviewPanel(
-      "codexMine.session",
-      session.title,
+      "codez.session",
+      this.baseTitle,
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
       {
         enableScripts: true,
         retainContextWhenHidden: true,
       },
+    );
+
+    this.panel.onDidChangeViewState(
+      () => {
+        if (this.panel.active) this.clearUnread();
+      },
+      null,
+      this.context.subscriptions,
+    );
+
+    vscode.window.onDidChangeWindowState(
+      (e) => {
+        if (e.focused && this.panel.active) this.clearUnread();
+      },
+      null,
+      this.context.subscriptions,
     );
 
     this.panel.onDidDispose(
@@ -48,12 +69,23 @@ export class SessionPanel implements vscode.Disposable {
     this.panel.reveal(undefined, preserveFocus);
   }
 
+  public updateTitle(title: string): void {
+    this.baseTitle = title;
+    this.panel.title = this.unread ? `● ${this.baseTitle}` : this.baseTitle;
+  }
+
   public dispose(): void {
     // no-op; panel disposal is handled by VS Code
   }
 
   public setLatestDiff(diff: string): void {
     this.latestDiff = diff;
+    this.postState();
+  }
+
+  public setTranscript(transcript: SessionPanelChatLine[]): void {
+    this.transcript.length = 0;
+    this.transcript.push(...transcript);
     this.postState();
   }
 
@@ -66,16 +98,43 @@ export class SessionPanel implements vscode.Disposable {
   public appendAssistantDelta(delta: string): void {
     const last = this.transcript.at(-1);
     if (!last || last.kind !== "assistant") {
+      // The webview is not guaranteed to have an "active" assistant bubble yet.
+      // Keep the slow full-state render for this structural change.
       this.transcript.push({ kind: "assistant", text: delta });
+      this.postState();
     } else {
       last.text += delta;
+      this.pendingAssistantDelta += delta;
+      if (this.pendingAssistantDelta.length >= 64 * 1024) {
+        this.flushAssistantDelta();
+      } else {
+        this.scheduleAssistantDeltaFlush();
+      }
     }
-    this.postState();
+    this.markUnreadIfInactive();
   }
 
   public addSystemMessage(text: string): void {
     this.transcript.push({ kind: "system", text });
     this.postState();
+  }
+
+  public markUnread(): void {
+    this.markUnreadIfInactive();
+  }
+
+  private clearUnread(): void {
+    if (!this.unread) return;
+    this.unread = false;
+    this.panel.title = this.baseTitle;
+  }
+
+  private markUnreadIfInactive(): void {
+    if (this.panel.active && this.panel.visible && vscode.window.state.focused)
+      return;
+    if (this.unread) return;
+    this.unread = true;
+    this.panel.title = `● ${this.baseTitle}`;
   }
 
   private render(): void {
@@ -134,8 +193,27 @@ export class SessionPanel implements vscode.Disposable {
 
       window.addEventListener("message", (event) => {
         const msg = event.data;
-        if (!msg || msg.type !== "state") return;
-        render(msg.state);
+        if (!msg) return;
+        if (msg.type === "state") {
+          render(msg.state);
+          return;
+        }
+        if (msg.type === "assistantDelta") {
+          const delta = typeof msg.delta === "string" ? msg.delta : "";
+          if (!delta) return;
+          const preEls = logEl.querySelectorAll(".msg.assistant pre");
+          const pre = preEls.length > 0 ? preEls[preEls.length - 1] : null;
+          if (!pre) return;
+
+          const last = pre.lastChild;
+          if (last && last.nodeType === Node.TEXT_NODE) {
+            last.appendData(delta);
+          } else {
+            pre.appendChild(document.createTextNode(delta));
+          }
+          window.scrollTo(0, document.body.scrollHeight);
+          return;
+        }
       });
 
       sendBtn.addEventListener("click", () => {
@@ -161,6 +239,25 @@ export class SessionPanel implements vscode.Disposable {
     });
   }
 
+  private postAssistantDelta(delta: string): void {
+    this.panel.webview.postMessage({ type: "assistantDelta", delta });
+  }
+
+  private scheduleAssistantDeltaFlush(): void {
+    if (this.assistantDeltaFlushTimer) return;
+    this.assistantDeltaFlushTimer = setTimeout(() => {
+      this.assistantDeltaFlushTimer = null;
+      this.flushAssistantDelta();
+    }, 16);
+  }
+
+  private flushAssistantDelta(): void {
+    const delta = this.pendingAssistantDelta;
+    if (!delta) return;
+    this.pendingAssistantDelta = "";
+    this.postAssistantDelta(delta);
+  }
+
   private onMessage(msg: unknown): void {
     if (typeof msg !== "object" || msg === null) return;
     const anyMsg = msg as Record<string, unknown>;
@@ -170,13 +267,13 @@ export class SessionPanel implements vscode.Disposable {
       return;
     }
     if (type === "sendMessage") {
-      void vscode.commands.executeCommand("codexMine.sendMessage", {
+      void vscode.commands.executeCommand("codez.sendMessage", {
         sessionId: this.session.id,
       });
       return;
     }
     if (type === "openDiff") {
-      void vscode.commands.executeCommand("codexMine.openLatestDiff", {
+      void vscode.commands.executeCommand("codez.openLatestDiff", {
         sessionId: this.session.id,
       });
       return;

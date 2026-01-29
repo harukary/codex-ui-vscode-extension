@@ -1,9 +1,13 @@
 {
   "name": "codex-ui-vscode-extension",
-  "version": "0.0.2",
+  "version": "0.2.7",
   "displayName": "Codex UI",
   "publisher": "harukary7518",
   "description": "Use Codex CLI (app-server) inside VS Code: sessions, chat, tools, diffs.",
+  "sponsor": {
+    "url": "https://buymeacoffee.com/harukary7518"
+  },
+  "icon": "resources/icon.png",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -17,71 +21,149 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:codexMine.startBackend",
-    "onCommand:codexMine.newSession",
-    "onCommand:codexMine.sendMessage",
-    "onCommand:codexMine.openSession",
-    "onCommand:codexMine.openLatestDiff",
-    "onCommand:codexMine.selectSession",
-    "onCommand:codexMine.renameSession",
-    "onCommand:codexMine.sessionMenu",
-    "onCommand:codexMine.hideSessionTab",
-    "onCommand:codexMine.closeSession",
-    "onCommand:codexMine.respondApproval",
-    "onView:codexMine.chatView"
+    "onCommand:codez.startBackend",
+    "onCommand:codez.newSession",
+    "onCommand:codez.sendMessage",
+    "onCommand:codez.openSession",
+    "onCommand:codez.openSessionPanel",
+    "onCommand:codez.clearRuntimeCache",
+    "onCommand:codez.openLatestDiff",
+    "onCommand:codez.selectSession",
+    "onCommand:codez.renameSession",
+    "onCommand:codez.sessionMenu",
+    "onCommand:codez.hideSessionTab",
+    "onCommand:codez.closeSession",
+    "onCommand:codez.copySessionId",
+    "onCommand:codez.respondApproval",
+    "onCommand:codez.showStatus",
+    "onCommand:codez.interruptTurn",
+    "onCommand:codez.reloadSession",
+    "onCommand:codez.debug.stressUi",
+    "onCommand:codez.debug.stopStressUi",
+    "onCommand:codez._dev.askUserQuestionDemo",
+    "onCommand:codez.showSkills",
+    "onCommand:codez.showAgents",
+    "onCommand:codez.resumeFromHistory",
+    "onCommand:codez.migrateSessionsV1",
+    "onCommand:codez.switchAccount",
+    "onView:codez.chatView",
+    "onView:codez.sessionsView"
   ],
   "contributes": {
     "commands": [
       {
-        "command": "codexMine.startBackend",
-        "title": "Codex UI: Start Backend (app-server)"
+        "command": "codez.startBackend",
+        "title": "Codex UI: Start Backend(s)"
       },
       {
-        "command": "codexMine.newSession",
+        "command": "codez.newSession",
         "title": "Codex UI: New Session"
       },
       {
-        "command": "codexMine.sendMessage",
+        "command": "codez.sendMessage",
         "title": "Codex UI: Send Message"
       },
       {
-        "command": "codexMine.openSession",
+        "command": "codez.openSession",
         "title": "Codex UI: Open Session"
       },
       {
-        "command": "codexMine.openLatestDiff",
+        "command": "codez.openSessionPanel",
+        "title": "Codex UI: Open Session (Editor Tab)"
+      },
+      {
+        "command": "codez.clearRuntimeCache",
+        "title": "Codex UI: Clear Runtime Cache (Workspace)"
+      },
+      {
+        "command": "codez.openLatestDiff",
         "title": "Codex UI: Open Latest Diff"
       },
       {
-        "command": "codexMine.selectSession",
+        "command": "codez.selectSession",
         "title": "Codex UI: Select Session"
       },
       {
-        "command": "codexMine.renameSession",
+        "command": "codez.renameSession",
         "title": "Codex UI: Rename Session"
       },
       {
-        "command": "codexMine.sessionMenu",
+        "command": "codez.sessionMenu",
         "title": "Codex UI: Session Menu"
       },
       {
-        "command": "codexMine.hideSessionTab",
+        "command": "codez.hideSessionTab",
         "title": "Codex UI: Hide Session Tab"
       },
       {
-        "command": "codexMine.closeSession",
+        "command": "codez.closeSession",
         "title": "Codex UI: Close Session (Hide from Sessions)"
       },
       {
-        "command": "codexMine.respondApproval",
+        "command": "codez.copySessionId",
+        "title": "Codex UI: Copy Session ID"
+      },
+      {
+        "command": "codez.respondApproval",
         "title": "Codex UI: Respond Approval"
+      },
+      {
+        "command": "codez.showStatus",
+        "title": "Codex UI: Status"
+      },
+      {
+        "command": "codez.interruptTurn",
+        "title": "Codex UI: Interrupt Turn"
+      },
+      {
+        "command": "codez.reloadSession",
+        "title": "Codex UI: Reload Session (Config)"
+      },
+      {
+        "command": "codez.debug.stressUi",
+        "title": "Codex UI: Debug Stress (UI streaming)"
+      },
+      {
+        "command": "codez.debug.stopStressUi",
+        "title": "Codex UI: Debug Stop Stress (UI streaming)"
+      },
+      {
+        "command": "codez._dev.askUserQuestionDemo",
+        "title": "Codex UI (Dev): AskUserQuestion Demo"
+      },
+      {
+        "command": "codez.showSkills",
+        "title": "Codex UI: Skills"
+      },
+      {
+        "command": "codez.showAgents",
+        "title": "Codex UI: Agents (codez)"
+      },
+      {
+        "command": "codez.resumeFromHistory",
+        "title": "Codex UI: Resume from History"
+      },
+      {
+        "command": "codez.migrateSessionsV1",
+        "title": "Codex UI: Migrate Sessions (v1 -> v2)"
+      },
+      {
+        "command": "codez.switchAccount",
+        "title": "Codex UI: Switch Account"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codez._dev.askUserQuestionDemo",
+        "key": "f8",
+        "when": "true"
       }
     ],
     "menus": {
       "view/item/context": [
         {
-          "command": "codexMine.closeSession",
-          "when": "view == codexMine.sessionsView && viewItem == codexMine.session",
+          "command": "codez.closeSession",
+          "when": "view == codez.sessionsView && viewItem == codez.session",
           "group": "navigation"
         }
       ]
@@ -89,20 +171,20 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "codexMine",
+          "id": "codez",
           "title": "Codex UI",
-          "icon": "resources/codex-mine.svg"
+          "icon": "resources/codez.svg"
         }
       ]
     },
     "views": {
-      "codexMine": [
+      "codez": [
         {
-          "id": "codexMine.sessionsView",
+          "id": "codez.sessionsView",
           "name": "Sessions"
         },
         {
-          "id": "codexMine.chatView",
+          "id": "codez.chatView",
           "name": "Chat",
           "type": "webview"
         }
@@ -111,12 +193,27 @@
     "configuration": {
       "title": "Codex UI",
       "properties": {
-        "codexMine.backend.command": {
+        "codez.cli.commands.codex": {
           "type": "string",
           "default": "codex",
-          "description": "Backend CLI command to spawn (e.g. codex)."
+          "description": "CLI command for Codex."
         },
-        "codexMine.backend.args": {
+        "codez.cli.commands.codez": {
+          "type": "string",
+          "default": "codez",
+          "description": "CLI command for codez."
+        },
+        "codez.cli.commands.upstream": {
+          "type": "string",
+          "default": "codex",
+          "description": "DEPRECATED: use codez.cli.commands.codex"
+        },
+        "codez.cli.commands.mine": {
+          "type": "string",
+          "default": "codez",
+          "description": "DEPRECATED: use codez.cli.commands.codez"
+        },
+        "codez.backend.args": {
           "type": "array",
           "items": {
             "type": "string"
@@ -126,12 +223,27 @@
           ],
           "description": "Arguments passed to the backend command."
         },
-        "codexMine.debug.logRpcPayloads": {
+        "codez.opencode.command": {
+          "type": "string",
+          "default": "opencode",
+          "description": "CLI command for opencode (used when starting the opencode backend)."
+        },
+        "codez.opencode.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "serve"
+          ],
+          "description": "Arguments passed to the opencode command (used when starting the opencode backend). The extension will append --hostname/--port as needed."
+        },
+        "codez.debug.logRpcPayloads": {
           "type": "boolean",
           "default": false,
           "description": "Log full JSON-RPC payloads to the output channel (may include sensitive data)."
         },
-        "codexMine.approvals.defaultDecision": {
+        "codez.approvals.defaultDecision": {
           "type": "string",
           "enum": [
             "prompt",
@@ -149,11 +261,17 @@
     "watch": "tsc -p . -w",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "vsix:package": "pnpm run compile && npx --yes @vscode/vsce package",
-    "regen:protocol": "node ./scripts/regen-protocol.js"
+    "vsix:package": "pnpm run compile && mkdir -p vsix && npx --yes @vscode/vsce package --out vsix/codex-ui-vscode-extension-${npm_package_version}.vsix",
+    "vsix:install": "pnpm run vsix:package && code --install-extension vsix/codex-ui-vscode-extension-${npm_package_version}.vsix --force",
+    "regen:protocol": "node ./scripts/regen-protocol.js --codex-bin ../codex-rs/target/debug/codex"
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "shell-quote": "^1.8.1"
   },
   "devDependencies": {
     "@types/node": "^20.19.18",
+    "@types/shell-quote": "^1.7.5",
     "@types/vscode": "^1.90.0",
     "markdown-it": "^14.1.0",
     "prettier": "^3.6.2",
