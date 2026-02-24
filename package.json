@@ -1,6 +1,6 @@
 {
   "name": "codex-ui-vscode-extension",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "displayName": "Codex UI",
   "publisher": "harukary7518",
   "description": "Use Codex CLI (app-server) inside VS Code: sessions, chat, tools, diffs.",
@@ -21,144 +21,139 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:codez.startBackend",
-    "onCommand:codez.newSession",
-    "onCommand:codez.sendMessage",
-    "onCommand:codez.openSession",
-    "onCommand:codez.openSessionPanel",
-    "onCommand:codez.clearRuntimeCache",
-    "onCommand:codez.openLatestDiff",
-    "onCommand:codez.selectSession",
-    "onCommand:codez.renameSession",
-    "onCommand:codez.sessionMenu",
-    "onCommand:codez.hideSessionTab",
-    "onCommand:codez.closeSession",
-    "onCommand:codez.copySessionId",
-    "onCommand:codez.respondApproval",
-    "onCommand:codez.showStatus",
-    "onCommand:codez.interruptTurn",
-    "onCommand:codez.reloadSession",
-    "onCommand:codez.debug.stressUi",
-    "onCommand:codez.debug.stopStressUi",
-    "onCommand:codez.showSkills",
-    "onCommand:codez.showAgents",
-    "onCommand:codez.resumeFromHistory",
-    "onCommand:codez.migrateSessionsV1",
-    "onCommand:codez.switchAccount",
-    "onView:codez.chatView",
-    "onView:codez.sessionsView"
+    "onCommand:codex.startBackend",
+    "onCommand:codex.newSession",
+    "onCommand:codex.sendMessage",
+    "onCommand:codex.openSession",
+    "onCommand:codex.openSessionPanel",
+    "onCommand:codex.clearRuntimeCache",
+    "onCommand:codex.openLatestDiff",
+    "onCommand:codex.selectSession",
+    "onCommand:codex.renameSession",
+    "onCommand:codex.sessionMenu",
+    "onCommand:codex.hideSessionTab",
+    "onCommand:codex.closeSession",
+    "onCommand:codex.copySessionId",
+    "onCommand:codex.respondApproval",
+    "onCommand:codex.showStatus",
+    "onCommand:codex.interruptTurn",
+    "onCommand:codex.reloadSession",
+    "onCommand:codex.debug.stressUi",
+    "onCommand:codex.debug.stopStressUi",
+    "onCommand:codex.showSkills",
+    "onCommand:codex.showAgents",
+    "onCommand:codex.resumeFromHistory",
+    "onCommand:codex.migrateSessionsV1",
+    "onView:codex.chatView",
+    "onView:codex.sessionsView"
   ],
   "contributes": {
     "commands": [
       {
-        "command": "codez.startBackend",
+        "command": "codex.startBackend",
         "title": "Codex UI: Start Backend(s)"
       },
       {
-        "command": "codez.newSession",
+        "command": "codex.newSession",
         "title": "Codex UI: New Session"
       },
       {
-        "command": "codez.sendMessage",
+        "command": "codex.sendMessage",
         "title": "Codex UI: Send Message"
       },
       {
-        "command": "codez.openSession",
+        "command": "codex.openSession",
         "title": "Codex UI: Open Session"
       },
       {
-        "command": "codez.openSessionPanel",
+        "command": "codex.openSessionPanel",
         "title": "Codex UI: Open Session (Editor Tab)"
       },
       {
-        "command": "codez.clearRuntimeCache",
+        "command": "codex.clearRuntimeCache",
         "title": "Codex UI: Clear Runtime Cache (Workspace)"
       },
       {
-        "command": "codez.openLatestDiff",
+        "command": "codex.openLatestDiff",
         "title": "Codex UI: Open Latest Diff"
       },
       {
-        "command": "codez.selectSession",
+        "command": "codex.selectSession",
         "title": "Codex UI: Select Session"
       },
       {
-        "command": "codez.renameSession",
+        "command": "codex.renameSession",
         "title": "Codex UI: Rename Session"
       },
       {
-        "command": "codez.sessionMenu",
+        "command": "codex.sessionMenu",
         "title": "Codex UI: Session Menu"
       },
       {
-        "command": "codez.hideSessionTab",
+        "command": "codex.hideSessionTab",
         "title": "Codex UI: Hide Session Tab"
       },
       {
-        "command": "codez.closeSession",
+        "command": "codex.closeSession",
         "title": "Codex UI: Close Session (Hide from Sessions)"
       },
       {
-        "command": "codez.copySessionId",
+        "command": "codex.copySessionId",
         "title": "Codex UI: Copy Session ID"
       },
       {
-        "command": "codez.respondApproval",
+        "command": "codex.respondApproval",
         "title": "Codex UI: Respond Approval"
       },
       {
-        "command": "codez.showStatus",
+        "command": "codex.showStatus",
         "title": "Codex UI: Status"
       },
       {
-        "command": "codez.interruptTurn",
+        "command": "codex.interruptTurn",
         "title": "Codex UI: Interrupt Turn"
       },
       {
-        "command": "codez.reloadSession",
+        "command": "codex.reloadSession",
         "title": "Codex UI: Reload Session (Config)"
       },
       {
-        "command": "codez.debug.stressUi",
+        "command": "codex.debug.stressUi",
         "title": "Codex UI: Debug Stress (UI streaming)"
       },
       {
-        "command": "codez.debug.stopStressUi",
+        "command": "codex.debug.stopStressUi",
         "title": "Codex UI: Debug Stop Stress (UI streaming)"
       },
       {
-        "command": "codez.showSkills",
+        "command": "codex.showSkills",
         "title": "Codex UI: Skills"
       },
       {
-        "command": "codez.showAgents",
-        "title": "Codex UI: Agents (codez)"
+        "command": "codex.showAgents",
+        "title": "Codex UI: Agents (codex)"
       },
       {
-        "command": "codez.resumeFromHistory",
+        "command": "codex.resumeFromHistory",
         "title": "Codex UI: Resume from History"
       },
       {
-        "command": "codez.migrateSessionsV1",
+        "command": "codex.migrateSessionsV1",
         "title": "Codex UI: Migrate Sessions (v1 -> v2)"
-      },
-      {
-        "command": "codez.switchAccount",
-        "title": "Codex UI: Switch Account"
       }
     ],
     "keybindings": [
       {
-        "command": "codez.cycleCollaborationMode",
+        "command": "codex.cycleCollaborationMode",
         "key": "shift+tab",
-        "when": "view == codez.chatView"
+        "when": "view == codex.chatView"
       }
     ],
     "menus": {
       "view/item/context": [
         {
-          "command": "codez.closeSession",
-          "when": "view == codez.sessionsView && viewItem == codez.session",
+          "command": "codex.closeSession",
+          "when": "view == codex.sessionsView && viewItem == codex.session",
           "group": "navigation"
         }
       ]
@@ -166,20 +161,20 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "codez",
+          "id": "codex",
           "title": "Codex UI",
-          "icon": "resources/codez.svg"
+          "icon": "resources/codex.svg"
         }
       ]
     },
     "views": {
-      "codez": [
+      "codex": [
         {
-          "id": "codez.sessionsView",
+          "id": "codex.sessionsView",
           "name": "Sessions"
         },
         {
-          "id": "codez.chatView",
+          "id": "codex.chatView",
           "name": "Chat",
           "type": "webview"
         }
@@ -188,27 +183,17 @@
     "configuration": {
       "title": "Codex UI",
       "properties": {
-        "codez.cli.commands.codex": {
+        "codex.cli.commands.codex": {
           "type": "string",
           "default": "codex",
           "description": "CLI command for Codex."
         },
-        "codez.cli.commands.codez": {
-          "type": "string",
-          "default": "codez",
-          "description": "CLI command for codez."
-        },
-        "codez.cli.commands.upstream": {
+        "codex.cli.commands.upstream": {
           "type": "string",
           "default": "codex",
-          "description": "DEPRECATED: use codez.cli.commands.codex"
+          "description": "DEPRECATED: use codex.cli.commands.codex"
         },
-        "codez.cli.commands.mine": {
-          "type": "string",
-          "default": "codez",
-          "description": "DEPRECATED: use codez.cli.commands.codez"
-        },
-        "codez.backend.args": {
+        "codex.backend.args": {
           "type": "array",
           "items": {
             "type": "string"
@@ -216,14 +201,14 @@
           "default": [
             "app-server"
           ],
-          "description": "Arguments passed to the backend command."
+          "description": "Arguments passed to the codex backend command."
         },
-        "codez.opencode.command": {
+        "codex.opencode.command": {
           "type": "string",
           "default": "opencode",
           "description": "CLI command for opencode (used when starting the opencode backend)."
         },
-        "codez.opencode.args": {
+        "codex.opencode.args": {
           "type": "array",
           "items": {
             "type": "string"
@@ -233,12 +218,12 @@
           ],
           "description": "Arguments passed to the opencode command (used when starting the opencode backend). The extension will append --hostname/--port as needed."
         },
-        "codez.debug.logRpcPayloads": {
+        "codex.debug.logRpcPayloads": {
           "type": "boolean",
           "default": false,
           "description": "Log full JSON-RPC payloads to the output channel (may include sensitive data)."
         },
-        "codez.approvals.defaultDecision": {
+        "codex.approvals.defaultDecision": {
           "type": "string",
           "enum": [
             "prompt",
@@ -248,30 +233,30 @@
           "default": "prompt",
           "description": "Default decision for server-initiated approval requests."
         },
-        "codez.ui.clearHistoryOnCompact": {
+        "codex.ui.clearHistoryOnCompact": {
           "type": "boolean",
           "default": false,
           "description": "After context compaction, clear the in-memory chat history to reduce memory usage (use 'Load history' to re-hydrate)."
         },
-        "codez.ui.clearHistoryOnCompactKeepPairs": {
+        "codex.ui.clearHistoryOnCompactKeepPairs": {
           "type": "number",
           "default": 10,
           "minimum": 0,
-          "description": "When codez.ui.clearHistoryOnCompact is enabled, keep this many recent user/assistant pairs in the UI."
+          "description": "When clearHistoryOnCompact is enabled, keep this many recent user/assistant pairs in the UI."
         }
       }
     }
   },
   "scripts": {
-    "compile": "node ./scripts/check-generated.js && node ./scripts/prepare-webview-vendors.js && tsc -p .",
+    "compile": "node ./scripts/check-generated.js && node ./scripts/prepare-webview-vendors.js && tsc -p . && node ./scripts/vendor-runtime-deps.js",
     "watch": "tsc -p . -w",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "vsix:package": "pnpm run compile && mkdir -p vsix && npx --yes @vscode/vsce package --out vsix/codex-ui-vscode-extension-${npm_package_version}.vsix",
+    "vsix:package": "pnpm run compile && mkdir -p vsix && npx --yes @vscode/vsce package --no-dependencies --out vsix/codex-ui-vscode-extension-${npm_package_version}.vsix",
     "vsix:install": "pnpm run vsix:package && code --install-extension vsix/codex-ui-vscode-extension-${npm_package_version}.vsix --force",
-    "vsce:publish": "npx --yes @vscode/vsce publish",
+    "vsce:publish": "pnpm run compile && npx --yes @vscode/vsce publish --no-dependencies",
     "regen:protocol": "node ./scripts/regen-protocol.js --codex-bin ../codex-rs/target/debug/codex"
   },
   "dependencies": {

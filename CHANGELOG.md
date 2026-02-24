@@ -2,9 +2,13 @@
 
 この拡張はまだ初期段階です。互換性が壊れる変更が入る可能性があります。
 
-## Unreleased
+## 0.2.14
 
-_No unreleased changes yet._
+- **Backends**
+  - `codez` backend のサポートを終了（EOL）し、利用可能 backend を `codex` / `opencode` の2系統へ整理
+- **UI / Commands**
+  - Rewind/Edit と `/compact` の対応バックエンド表記を `codex` 基準へ更新
+  - `/account` は `read/logout` に簡素化し、`account/list` / `account/switch` 依存を削除
 
 ## 0.2.13
 
