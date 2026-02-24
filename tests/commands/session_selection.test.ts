@@ -42,10 +42,10 @@ describe("session_selection", () => {
     ).toBe("activate");
   });
 
-  it("forces load history for codez/opencode when user blocks miss turnId", () => {
+  it("forces load history for codex/opencode when user blocks miss turnId", () => {
     expect(
       shouldForceLoadHistoryForRewind({
-        backendId: "codez",
+        backendId: "codex",
         hasUserBlockWithoutTurnId: true,
       }),
     ).toBe(true);
@@ -57,16 +57,16 @@ describe("session_selection", () => {
     ).toBe(true);
   });
 
-  it("does not force load history for codex or when turnId exists", () => {
+  it("does not force load history when turnId exists", () => {
     expect(
       shouldForceLoadHistoryForRewind({
         backendId: "codex",
-        hasUserBlockWithoutTurnId: true,
+        hasUserBlockWithoutTurnId: false,
       }),
     ).toBe(false);
     expect(
       shouldForceLoadHistoryForRewind({
-        backendId: "codez",
+        backendId: "opencode",
         hasUserBlockWithoutTurnId: false,
       }),
     ).toBe(false);

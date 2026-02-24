@@ -15,10 +15,10 @@ import {
 describe("session_actions", () => {
   it("parses valid reopen command args", () => {
     expect(
-      parseReopenCommandArgs({ sessionId: "s1", backendId: "codez" }),
+      parseReopenCommandArgs({ sessionId: "s1", backendId: "codex" }),
     ).toEqual({
       sessionId: "s1",
-      backendId: "codez",
+      backendId: "codex",
     });
   });
 
@@ -30,14 +30,14 @@ describe("session_actions", () => {
     ).toBeNull();
   });
 
-  it("allows reopen only in codex/codez family", () => {
-    expect(canReopenToBackend("codex", "codez")).toEqual({ ok: true });
-    expect(canReopenToBackend("codez", "codex")).toEqual({ ok: true });
+  it("allows reopen only within each backend", () => {
+    expect(canReopenToBackend("codex", "codex")).toEqual({ ok: true });
+    expect(canReopenToBackend("opencode", "opencode")).toEqual({ ok: true });
     expect(canReopenToBackend("opencode", "codex")).toEqual({
       ok: false,
       message: REOPEN_INCOMPATIBLE_MESSAGE,
     });
-    expect(canReopenToBackend("codez", "opencode")).toEqual({
+    expect(canReopenToBackend("codex", "opencode")).toEqual({
       ok: false,
       message: REOPEN_INCOMPATIBLE_MESSAGE,
     });
@@ -46,14 +46,14 @@ describe("session_actions", () => {
   it("decides reopen action from compatibility and existing session", () => {
     expect(
       evaluateReopenSessionAction({
-        sourceBackendId: "codez",
+        sourceBackendId: "codex",
         targetBackendId: "codex",
         existingSessionId: "existing-1",
       }),
     ).toEqual({ ok: true, action: "reuseExisting" });
     expect(
       evaluateReopenSessionAction({
-        sourceBackendId: "codez",
+        sourceBackendId: "codex",
         targetBackendId: "codex",
         existingSessionId: null,
       }),
@@ -73,7 +73,7 @@ describe("session_actions", () => {
   it("evaluates reload guard for unsupported backend", () => {
     expect(
       evaluateReloadSessionGuard({
-        backendId: "codex",
+        backendId: "opencode",
         hasWorkspaceFolder: true,
         sending: false,
         reloading: false,
@@ -89,7 +89,7 @@ describe("session_actions", () => {
   it("evaluates reload guard for missing workspace", () => {
     expect(
       evaluateReloadSessionGuard({
-        backendId: "codez",
+        backendId: "codex",
         hasWorkspaceFolder: false,
         sending: false,
         reloading: false,
@@ -105,7 +105,7 @@ describe("session_actions", () => {
   it("evaluates reload guard for sending and reloading", () => {
     expect(
       evaluateReloadSessionGuard({
-        backendId: "codez",
+        backendId: "codex",
         hasWorkspaceFolder: true,
         sending: true,
         reloading: false,
@@ -118,7 +118,7 @@ describe("session_actions", () => {
     });
     expect(
       evaluateReloadSessionGuard({
-        backendId: "codez",
+        backendId: "codex",
         hasWorkspaceFolder: true,
         sending: false,
         reloading: true,
@@ -134,7 +134,7 @@ describe("session_actions", () => {
   it("evaluates reload guard for other running session", () => {
     expect(
       evaluateReloadSessionGuard({
-        backendId: "codez",
+        backendId: "codex",
         hasWorkspaceFolder: true,
         sending: false,
         reloading: false,
@@ -150,7 +150,7 @@ describe("session_actions", () => {
   it("allows reload only when all preconditions pass", () => {
     expect(
       evaluateReloadSessionGuard({
-        backendId: "codez",
+        backendId: "codex",
         hasWorkspaceFolder: true,
         sending: false,
         reloading: false,

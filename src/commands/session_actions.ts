@@ -2,9 +2,9 @@ import type { BackendId } from "../sessions";
 import { canReopenSessionInBackend, isSessionBackendId } from "../session_backend";
 
 export const REOPEN_INCOMPATIBLE_MESSAGE =
-  "This thread is not compatible with opencode history, so it cannot be reopened across codex/codez <-> opencode.";
+  "This thread is not compatible with opencode history, so it cannot be reopened across codex <-> opencode.";
 export const RELOAD_UNSUPPORTED_MESSAGE =
-  "Reload is supported for codez sessions only.";
+  "Reload is supported for codex sessions only.";
 export const RELOAD_SENDING_MESSAGE =
   "Cannot reload while a turn is in progress.";
 export const RELOAD_OTHER_SESSION_RUNNING_MESSAGE =
@@ -62,7 +62,7 @@ export function evaluateReloadSessionGuard(args: {
 }):
   | { ok: true }
   | { ok: false; kind: "info" | "error" | "silent"; message: string | null } {
-  if (args.backendId !== "codez") {
+  if (args.backendId !== "codex") {
     return { ok: false, kind: "info", message: RELOAD_UNSUPPORTED_MESSAGE };
   }
   if (!args.hasWorkspaceFolder) {

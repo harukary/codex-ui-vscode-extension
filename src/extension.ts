@@ -70,7 +70,7 @@ import { SessionPanelManager } from "./ui/session_panel_manager";
 import { SessionTreeDataProvider } from "./ui/session_tree";
 
 const REWIND_STEP_TIMEOUT_MS = 120_000;
-const LAST_ACTIVE_SESSION_KEY = "codez.lastActiveSessionId.v1";
+const LAST_ACTIVE_SESSION_KEY = "codex.lastActiveSessionId.v1";
 const DEFAULT_PROJECT_DOC_FILENAME = "AGENTS.md";
 
 let backendManager: BackendManager | null = null;
@@ -125,6 +125,26 @@ const IMAGE_CACHE_MAX_ITEMS = 500;
 const IMAGE_CACHE_MAX_TOTAL_BYTES = 250_000_000;
 const SESSION_IMAGE_AUTOLOAD_RECENT = 24;
 const USER_INPUT_IMAGE_DIRNAME = "user-input-images.v1";
+const AUTH_FILE_BASENAME = "auth.json";
+const AUTH_PROFILES_DIRNAME = "auth-profiles.v1";
+const AUTH_PROFILES_ACTIVE_FILENAME = "active-profile.txt";
+const AUTH_PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+type AuthProfileEntry = {
+  name: string;
+  kind?: "apiKey" | "chatgpt";
+  email?: string;
+};
+
+type AuthProfileListResult = {
+  activeAccount: string | null;
+  accounts: AuthProfileEntry[];
+};
+
+type AuthProfileSwitchResult = AuthProfileListResult & {
+  created: boolean;
+  restarted: boolean;
+};
 
 async function withTimeout<T>(
   label: string,
@@ -409,10 +429,10 @@ async function loadCachedImageBase64(imageKey: string): Promise<{
   return { mimeType: meta.mimeType, base64: data.toString("base64") };
 }
 
-const HIDDEN_TAB_SESSIONS_KEY = "codez.hiddenTabSessions.v1";
-const TAB_ORDER_KEY = "codez.tabOrder.v1";
-const WORKSPACE_COLOR_OVERRIDES_KEY = "codez.workspaceColorOverrides.v1";
-const LEGACY_RUNTIMES_KEY = "codez.sessionRuntime.v1";
+const HIDDEN_TAB_SESSIONS_KEY = "codex.hiddenTabSessions.v1";
+const TAB_ORDER_KEY = "codex.tabOrder.v1";
+const WORKSPACE_COLOR_OVERRIDES_KEY = "codex.workspaceColorOverrides.v1";
+const LEGACY_RUNTIMES_KEY = "codex.sessionRuntime.v1";
 const hiddenTabSessionIds = new Set<string>();
 const unreadSessionIds = new Set<string>();
 const WORKSPACE_COLOR_PALETTE = [
@@ -477,6 +497,8 @@ type SessionRuntime = {
   pendingInterrupt: boolean;
   lastTurnStartedAtMs: number | null;
   lastTurnCompletedAtMs: number | null;
+  lastActivityAtMs: number | null;
+  stalledTurnNoticeAtMs: number | null;
   v2NotificationsSeen: boolean;
   blockIndexById: Map<string, number>;
   legacyPatchTargetByCallId: Map<string, string>;
@@ -487,6 +509,7 @@ type SessionRuntime = {
       title: string;
       detail: string;
       canAcceptForSession: boolean;
+      sessionId: string;
       method: string;
       itemId: string;
       reason: string | null;
@@ -529,6 +552,8 @@ const collaborationPresetsByBackend = new Map<
 const PROMPTS_CMD_PREFIX = "prompts";
 const loggedAgentScanErrors = new Set<string>();
 const UNHANDLED_DEBUG_MAX_CHARS = 100_000;
+const STALE_RUNNING_WARNING_MS = 120_000;
+const STALE_WATCHDOG_INTERVAL_MS = 10_000;
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
@@ -558,12 +583,12 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       void vscode.window
         .showInformationMessage(
-          "Saved session format has been updated. Run the migration command to restore legacy (v1) sessions and assign them to codex/codez/opencode.",
+          "Saved session format has been updated. Run the migration command to restore legacy (v1) sessions and assign them to codex/opencode.",
           "Migrate",
         )
         .then((picked) => {
           if (picked === "Migrate") {
-            void vscode.commands.executeCommand("codez.migrateSessionsV1");
+            void vscode.commands.executeCommand("codex.migrateSessionsV1");
           }
         });
     }
@@ -586,10 +611,10 @@ export function activate(context: vscode.ExtensionContext): void {
     sessionTree?.refresh();
     setActiveSession(s.id);
     void ensureModelsFetched(s);
-    void showCodezViewContainer();
+    void showCodexViewContainer();
   };
   backendManager.onApprovalRequest = async (session, req) => {
-    const requestKey = requestKeyFromId(req.id);
+    const requestKey = requestKeyFromSessionAndId(session.id, req.id);
     const rt = ensureRuntime(session.id);
 
     const item =
@@ -618,6 +643,7 @@ export function activate(context: vscode.ExtensionContext): void {
       title,
       detail,
       canAcceptForSession: true,
+      sessionId: session.id,
       method: req.method,
       itemId: req.params.itemId,
       reason,
@@ -625,19 +651,39 @@ export function activate(context: vscode.ExtensionContext): void {
       cwd: fallbackCwd,
       grantRoot: fallbackGrantRoot,
     });
+    if (activeSessionId !== session.id) {
+      setActiveSession(session.id);
+      chatView?.toast(
+        "info",
+        "Approval required. Switched to the requesting session.",
+      );
+    }
     chatView?.refresh();
-    void showCodezViewContainer();
+    void showCodexViewContainer();
 
     return await new Promise((resolve) => {
       rt.approvalResolvers.set(requestKey, resolve);
     });
   };
 
+  const staleWatchdogTimer = setInterval(() => {
+    try {
+      checkForStaleSendingStates();
+    } catch (err) {
+      outputChannel?.appendLine(
+        "[watchdog] Failed to inspect stale sending states: " + String(err),
+      );
+    }
+  }, STALE_WATCHDOG_INTERVAL_MS);
+  context.subscriptions.push({
+    dispose: () => clearInterval(staleWatchdogTimer),
+  });
+
   diffProvider = new DiffDocumentProvider();
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
-      "codez-diff",
+      "codex-diff",
       diffProvider,
     ),
   );
@@ -651,7 +697,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   context.subscriptions.push(sessionTree);
   context.subscriptions.push(
-    vscode.window.createTreeView("codez.sessionsView", {
+    vscode.window.createTreeView("codex.sessionsView", {
       treeDataProvider: sessionTree,
     }),
   );
@@ -733,9 +779,9 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         return;
       }
-      if (session.backendId !== "codez" && session.backendId !== "opencode") {
+      if (session.backendId !== "codex" && session.backendId !== "opencode") {
         void vscode.window.showInformationMessage(
-          "Rewind is supported for codez/opencode sessions only.",
+          "Rewind is supported for codex/opencode sessions only.",
         );
         return;
       }
@@ -760,7 +806,10 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         return;
       }
-      if (session.backendId === "opencode" && bm.isOpencodeSessionBusy(session)) {
+      if (
+        session.backendId === "opencode" &&
+        bm.isOpencodeSessionBusy(session)
+      ) {
         void vscode.window.showErrorMessage(
           "Cannot rewind because the OpenCode session is busy. Stop it and try again.",
         );
@@ -906,15 +955,7 @@ export function activate(context: vscode.ExtensionContext): void {
     },
     async (session) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
-      return await backendManager.listAccounts(session);
-    },
-    async (session) => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
       return await backendManager.readAccount(session);
-    },
-    async (session, params) => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
-      return await backendManager.switchAccount(session, params);
     },
     async (session) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
@@ -987,7 +1028,7 @@ export function activate(context: vscode.ExtensionContext): void {
           .filter((name) => name.length > 0);
       }
 
-      if (session.backendId !== "codez") return [];
+      if (session.backendId !== "codex") return [];
 
       const folder = resolveWorkspaceFolderForSession(session);
       if (!folder)
@@ -1032,7 +1073,7 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage("No session selected.");
         return;
       }
-      await vscode.commands.executeCommand("codez.openLatestDiff", {
+      await vscode.commands.executeCommand("codex.openLatestDiff", {
         sessionId: session.id,
       });
     },
@@ -1081,7 +1122,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!session) return;
     try {
       // Ensure the view is visible so the user sees the restored conversation.
-      await showCodezViewContainer();
+      await showCodexViewContainer();
       setActiveSession(session.id);
       const res = await backendManager.resumeSession(session);
       void ensureModelsFetched(session);
@@ -1094,14 +1135,14 @@ export function activate(context: vscode.ExtensionContext): void {
   })();
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.startBackend", async () => {
+    vscode.commands.registerCommand("codex.startBackend", async () => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       const bm = backendManager;
 
       const folder = await pickWorkspaceFolder();
       if (!folder) return;
 
-      const backendIds: BackendId[] = ["codez", "codex", "opencode"];
+      const backendIds: BackendId[] = ["codex", "opencode"];
       const picked = await vscode.window.showQuickPick(
         backendIds.map((backendId) => {
           const running = bm.getRunningCommandForBackendId(folder, backendId);
@@ -1127,7 +1168,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.clearRuntimeCache", async () => {
+    vscode.commands.registerCommand("codex.clearRuntimeCache", async () => {
       if (!extensionContext) throw new Error("extensionContext is not set");
       if (!sessions) throw new Error("sessions is not initialized");
 
@@ -1162,16 +1203,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.pickWorkspaceColor",
+      "codex.pickWorkspaceColor",
       async (args?: unknown) => {
         const workspaceFolderUri =
           typeof (args as any)?.workspaceFolderUri === "string"
             ? String((args as any).workspaceFolderUri)
             : "";
         if (!workspaceFolderUri) {
-          void vscode.window.showErrorMessage(
-            "Invalid workspaceFolderUri.",
-          );
+          void vscode.window.showErrorMessage("Invalid workspaceFolderUri.");
           return;
         }
 
@@ -1245,7 +1284,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.newSession",
+      "codex.newSession",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -1293,13 +1332,13 @@ export function activate(context: vscode.ExtensionContext): void {
         );
         setActiveSession(session.id);
         void ensureModelsFetched(session);
-        await showCodezViewContainer();
+        await showCodexViewContainer();
       },
     ),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.migrateSessionsV1", async () => {
+    vscode.commands.registerCommand("codex.migrateSessionsV1", async () => {
       if (!extensionContext) throw new Error("extensionContext is not set");
       if (!sessions) throw new Error("sessions is not initialized");
 
@@ -1327,7 +1366,7 @@ export function activate(context: vscode.ExtensionContext): void {
         } catch {
           // Keep original label.
         }
-        const backendChoices: BackendId[] = ["codez", "codex", "opencode"];
+        const backendChoices: BackendId[] = ["codex", "opencode"];
         const items: Array<
           vscode.QuickPickItem & { backendId: BackendId | null }
         > = [
@@ -1423,7 +1462,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.resumeFromHistory", async () => {
+    vscode.commands.registerCommand("codex.resumeFromHistory", async () => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
       if (!extensionContext) throw new Error("extensionContext is not set");
@@ -1612,7 +1651,7 @@ export function activate(context: vscode.ExtensionContext): void {
         void ensureModelsFetched(session);
         hydrateRuntimeFromThread(session.id, resumed.thread);
         setActiveSession(session.id);
-        await showCodezViewContainer();
+        await showCodexViewContainer();
         return;
       }
     }),
@@ -1620,7 +1659,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.reopenSessionInBackend",
+      "codex.reopenSessionInBackend",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -1651,7 +1690,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
         if (reopenAction.action === "reuseExisting" && existing) {
           setActiveSession(existing.id);
-          await showCodezViewContainer();
+          await showCodexViewContainer();
           return;
         }
 
@@ -1680,7 +1719,7 @@ export function activate(context: vscode.ExtensionContext): void {
           void ensureModelsFetched(session);
           hydrateRuntimeFromThread(session.id, resumed.thread);
           setActiveSession(session.id);
-          await showCodezViewContainer();
+          await showCodexViewContainer();
         } catch (err) {
           output.appendLine(`[resume] Failed to reopen thread: ${String(err)}`);
           sessions.remove(session.id);
@@ -1696,7 +1735,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.interruptTurn", async () => {
+    vscode.commands.registerCommand("codex.interruptTurn", async () => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
 
@@ -1746,7 +1785,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.reloadSession", async () => {
+    vscode.commands.registerCommand("codex.reloadSession", async () => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
 
@@ -1828,7 +1867,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.debug.stressUi", async () => {
+    vscode.commands.registerCommand("codex.debug.stressUi", async () => {
       if (!sessions) throw new Error("sessions is not initialized");
       if (!outputChannel) throw new Error("outputChannel is not initialized");
       if (!chatView) throw new Error("chatView is not initialized");
@@ -1970,7 +2009,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.debug.stopStressUi", async () => {
+    vscode.commands.registerCommand("codex.debug.stopStressUi", async () => {
       if (!outputChannel) throw new Error("outputChannel is not initialized");
       if (!stressUiJob) {
         void vscode.window.showInformationMessage(
@@ -1984,7 +2023,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.showStatus", async () => {
+    vscode.commands.registerCommand("codex.showStatus", async () => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
 
@@ -2094,108 +2133,54 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codez.switchAccount", async () => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
-      if (!sessions) throw new Error("sessions is not initialized");
-      const bm = backendManager;
+    vscode.commands.registerCommand(
+      "codex._internal.accountProfileList",
+      async (args?: unknown) => {
+        if (!sessions) throw new Error("sessions is not initialized");
 
-      const session = activeSessionId
-        ? sessions.getById(activeSessionId)
-        : null;
-      if (!session) {
-        void vscode.window.showErrorMessage("No session selected.");
-        return;
-      }
-
-      if (session.backendId !== "codez") {
-        void vscode.window.showInformationMessage(
-          "Account creation/switching is supported for codez sessions only.",
-        );
-        return;
-      }
-
-      const list = await bm.listAccounts(session);
-      const active = list.activeAccount ?? null;
-
-      type PickItem =
-        | (vscode.QuickPickItem & { itemKind: "account"; name: string })
-        | (vscode.QuickPickItem & { itemKind: "create" });
-
-      const items: PickItem[] = list.accounts.map((a) => {
-        const description =
-          a.kind === "chatgpt"
-            ? a.email
-              ? `chatgpt (${a.email})`
-              : "chatgpt"
-            : a.kind === "apiKey"
-              ? "apiKey"
-              : undefined;
-
-        return {
-          itemKind: "account",
-          name: a.name,
-          label: a.name,
-          description,
-          detail: active === a.name ? "active" : undefined,
-        };
-      });
-      items.push({
-        itemKind: "create",
-        label: "+ Create new account…",
-        description: "Use [A-Za-z0-9_-], 1..64 chars",
-      });
-
-      const picked = await vscode.window.showQuickPick(items, {
-        title: "Switch account",
-        placeHolder: "Select an account",
-      });
-      if (!picked) return;
-
-      const validateName = (name: string): string | null => {
-        const trimmed = name.trim();
-        if (trimmed.length === 0) return "Account name cannot be empty.";
-        if (trimmed.length > 64)
-          return "Account name is too long (max 64 chars).";
-        if (!/^[A-Za-z0-9_-]+$/.test(trimmed))
-          return "Invalid account name. Use only [A-Za-z0-9_-].";
-        return null;
-      };
-
-      const doSwitch = async (
-        name: string,
-        createIfMissing: boolean,
-      ): Promise<void> => {
-        await bm.switchAccount(session, { name, createIfMissing });
-        void vscode.window.showInformationMessage(
-          `Switched active account to ${name}.`,
-        );
-      };
-
-      if (picked.itemKind === "create") {
-        const name = await vscode.window.showInputBox({
-          title: "Create account",
-          prompt: "Account name",
-          placeHolder: "e.g. work, personal, team_a",
-          validateInput: (value) => validateName(value) ?? undefined,
-        });
-        if (!name) return;
-        const trimmed = name.trim();
-        const err = validateName(trimmed);
-        if (err) {
-          void vscode.window.showErrorMessage(err);
-          return;
+        const session =
+          parseSessionArg(args, sessions) ??
+          (activeSessionId ? sessions.getById(activeSessionId) : null);
+        if (!session) throw new Error("No session selected.");
+        if (session.backendId !== "codex") {
+          return { activeAccount: null, accounts: [] } as AuthProfileListResult;
         }
-        await doSwitch(trimmed, true);
-        return;
-      }
 
-      await doSwitch(picked.name, false);
-    }),
+        return await listAuthProfilesFromDisk();
+      },
+    ),
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.showSkills",
+      "codex._internal.accountProfileSwitch",
+      async (args?: unknown) => {
+        if (!sessions) throw new Error("sessions is not initialized");
+        if (typeof args !== "object" || args === null) {
+          throw new Error("Invalid arguments.");
+        }
+
+        const session =
+          parseSessionArg(args, sessions) ??
+          (activeSessionId ? sessions.getById(activeSessionId) : null);
+        if (!session) throw new Error("No session selected.");
+
+        const rec = args as Record<string, unknown>;
+        const name = typeof rec["name"] === "string" ? rec["name"].trim() : "";
+        const createIfMissing = rec["createIfMissing"] === true;
+        if (!name) throw new Error("Missing profile name.");
+
+        return await switchAuthProfile(session, {
+          name,
+          createIfMissing,
+        });
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codex.showSkills",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2215,7 +2200,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.cycleCollaborationMode",
+      "codex.cycleCollaborationMode",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2285,7 +2270,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.showAgents",
+      "codex.showAgents",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
 
@@ -2305,9 +2290,9 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        if (session.backendId !== "codez") {
+        if (session.backendId !== "codex") {
           void vscode.window.showInformationMessage(
-            "Agents are available for codez sessions only.",
+            "Agents are available for codex sessions only.",
           );
           return;
         }
@@ -2348,7 +2333,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.sessionMenu",
+      "codex.sessionMenu",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
         const session = parseSessionArg(args, sessions);
@@ -2369,27 +2354,27 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!picked) return;
 
         if (picked.action === "copySessionId") {
-          await vscode.commands.executeCommand("codez.copySessionId", {
+          await vscode.commands.executeCommand("codex.copySessionId", {
             sessionId: session.id,
           });
           return;
         }
 
         if (picked.action === "rename") {
-          await vscode.commands.executeCommand("codez.renameSession", {
+          await vscode.commands.executeCommand("codex.renameSession", {
             sessionId: session.id,
           });
           return;
         }
 
         if (picked.action === "openPanel") {
-          await vscode.commands.executeCommand("codez.openSessionPanel", {
+          await vscode.commands.executeCommand("codex.openSessionPanel", {
             sessionId: session.id,
           });
           return;
         }
 
-        await vscode.commands.executeCommand("codez.hideSessionTab", {
+        await vscode.commands.executeCommand("codex.hideSessionTab", {
           sessionId: session.id,
         });
       },
@@ -2398,7 +2383,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.hideSessionTab",
+      "codex.hideSessionTab",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
         const session = parseSessionArg(args, sessions);
@@ -2427,7 +2412,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez._internal.moveWorkspaceTab",
+      "codex._internal.moveWorkspaceTab",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
         if (!extensionContext) throw new Error("extensionContext is not set");
@@ -2487,7 +2472,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez._internal.moveSessionTab",
+      "codex._internal.moveSessionTab",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
         if (!extensionContext) throw new Error("extensionContext is not set");
@@ -2554,7 +2539,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.closeSession",
+      "codex.closeSession",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
         if (!extensionContext) throw new Error("extensionContext is not set");
@@ -2617,7 +2602,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.copySessionId",
+      "codex.copySessionId",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
         const session = parseSessionArg(args, sessions);
@@ -2634,7 +2619,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.sendMessage",
+      "codex.sendMessage",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2662,14 +2647,14 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         setActiveSession(session.id);
-        await showCodezViewContainer();
+        await showCodexViewContainer();
       },
     ),
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.openSession",
+      "codex.openSession",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2681,18 +2666,24 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        const res = await backendManager.resumeSession(session);
-        void ensureModelsFetched(session);
-        hydrateRuntimeFromThread(session.id, res.thread);
+        if (shouldSkipResumeForSessionOpen(session)) {
+          output.appendLine(
+            `[resume] Skipped for openSession: running sessionId=${session.id} threadId=${session.threadId}`,
+          );
+        } else {
+          const res = await backendManager.resumeSession(session);
+          void ensureModelsFetched(session);
+          hydrateRuntimeFromThread(session.id, res.thread);
+        }
         setActiveSession(session.id);
-        await showCodezViewContainer();
+        await showCodexViewContainer();
       },
     ),
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez._internal.loadHistoryForSession",
+      "codex._internal.loadHistoryForSession",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2739,14 +2730,14 @@ export function activate(context: vscode.ExtensionContext): void {
         } else {
           setActiveSession(session.id);
         }
-        await showCodezViewContainer();
+        await showCodexViewContainer();
       },
     ),
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.openSessionPanel",
+      "codex.openSessionPanel",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2759,9 +2750,15 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        const res = await backendManager.resumeSession(session);
-        void ensureModelsFetched(session);
-        hydrateRuntimeFromThread(session.id, res.thread);
+        if (shouldSkipResumeForSessionOpen(session)) {
+          output.appendLine(
+            `[resume] Skipped for openSessionPanel: running sessionId=${session.id} threadId=${session.threadId}`,
+          );
+        } else {
+          const res = await backendManager.resumeSession(session);
+          void ensureModelsFetched(session);
+          hydrateRuntimeFromThread(session.id, res.thread);
+        }
         setActiveSession(session.id);
 
         const rt = ensureRuntime(session.id);
@@ -2775,7 +2772,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.openLatestDiff",
+      "codex.openLatestDiff",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2804,7 +2801,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.selectSession",
+      "codex.selectSession",
       async (args?: unknown) => {
         if (!backendManager)
           throw new Error("backendManager is not initialized");
@@ -2819,7 +2816,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // Switch tab first so unread/badge state updates immediately.
         // Use a single activation to avoid duplicate prompt refreshes.
         setActiveSession(session.id);
-        await showCodezViewContainer();
+        await showCodexViewContainer();
 
         const rt = ensureRuntime(session.id);
         const selection = decideSessionSelection(hasConversationBlocks(rt));
@@ -2833,9 +2830,12 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        await vscode.commands.executeCommand("codez._internal.loadHistoryForSession", {
-          sessionId: session.id,
-        });
+        await vscode.commands.executeCommand(
+          "codex._internal.loadHistoryForSession",
+          {
+            sessionId: session.id,
+          },
+        );
       },
     ),
   );
@@ -2845,7 +2845,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.renameSession",
+      "codex.renameSession",
       async (args?: unknown) => {
         if (!sessions) throw new Error("sessions is not initialized");
 
@@ -2877,12 +2877,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "codez.respondApproval",
+      "codex.respondApproval",
       async (args?: unknown) => {
         if (typeof args !== "object" || args === null) return;
         const o = args as Record<string, unknown>;
         const requestKey = o["requestKey"];
         const decision = o["decision"];
+        const sessionId = o["sessionId"];
         if (typeof requestKey !== "string") return;
         if (
           decision !== "accept" &&
@@ -2893,14 +2894,23 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        for (const rt of runtimeBySessionId.values()) {
+        const resolveInRuntime = (rt: SessionRuntime): boolean => {
           const resolver = rt.approvalResolvers.get(requestKey);
-          if (!resolver) continue;
+          if (!resolver) return false;
           rt.approvalResolvers.delete(requestKey);
           rt.pendingApprovals.delete(requestKey);
           chatView?.refresh();
           resolver(decision);
-          break;
+          return true;
+        };
+
+        if (typeof sessionId === "string" && sessionId) {
+          const rt = runtimeBySessionId.get(sessionId);
+          if (rt && resolveInRuntime(rt)) return;
+        }
+
+        for (const rt of runtimeBySessionId.values()) {
+          if (resolveInRuntime(rt)) return;
         }
       },
     ),
@@ -3225,7 +3235,7 @@ async function sendUserText(session: Session, text: string): Promise<void> {
 async function pickBackendIdForNewSession(
   _folder: vscode.WorkspaceFolder,
 ): Promise<BackendId | null> {
-  const backendChoices: BackendId[] = ["codez", "codex", "opencode"];
+  const backendChoices: BackendId[] = ["codex", "opencode"];
   const picked = await vscode.window.showQuickPick(
     backendChoices.map((backendId) => ({
       label: backendId,
@@ -3250,6 +3260,8 @@ async function sendUserInput(
   const rt = ensureRuntime(session.id);
   rt.sending = true;
   rt.pendingInterrupt = false;
+  rt.lastActivityAtMs = Date.now();
+  rt.stalledTurnNoticeAtMs = null;
   const backendImages: BackendImageInput[] = [];
   const trimmed = text.trim();
   if (trimmed) {
@@ -3565,6 +3577,7 @@ function registerActionCard(
   state: ActionCardState,
 ): void {
   const rt = ensureRuntime(sessionId);
+  rt.lastActivityAtMs = Date.now();
   rt.actionCards.set(cardId, state);
 }
 
@@ -3653,7 +3666,15 @@ async function handleRequestUserInputInChat(
   if (!chatView) {
     throw new Error("Chat view is not ready for request_user_input");
   }
-  const requestKey = requestKeyFromId(req.id);
+  const requestKey = requestKeyFromSessionAndId(session.id, req.id);
+  if (activeSessionId !== session.id) {
+    setActiveSession(session.id);
+    chatView.toast(
+      "info",
+      "Input required. Switched to the requesting session.",
+    );
+    void showCodexViewContainer();
+  }
   const questions = req.params.questions.map((q) => ({
     id: q.id,
     header: q.header,
@@ -3744,7 +3765,7 @@ async function handleSlashCommand(
   }
 
   if (cmd === "new") {
-    await vscode.commands.executeCommand("codez.newSession", {
+    await vscode.commands.executeCommand("codex.newSession", {
       workspaceFolderUri: session.workspaceFolderUri,
     });
     return true;
@@ -3761,7 +3782,7 @@ async function handleSlashCommand(
       schedulePersistRuntime(session.id);
       return true;
     }
-    await vscode.commands.executeCommand("codez.showStatus");
+    await vscode.commands.executeCommand("codex.showStatus");
     return true;
   }
   if (cmd === "mcp") {
@@ -4150,12 +4171,12 @@ async function handleSlashCommand(
       return true;
     }
 
-    if (session.backendId !== "codez") {
+    if (session.backendId !== "codex") {
       upsertBlock(session.id, {
         id: newLocalId("compactUnsupported"),
         type: "info",
-        title: "Compact (codez only)",
-        text: "/compact is supported for codez sessions only.",
+        title: "Compact (codex only)",
+        text: "/compact is supported for codex sessions only.",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
@@ -4226,11 +4247,11 @@ async function handleSlashCommand(
     return true;
   }
   if (cmd === "resume") {
-    await vscode.commands.executeCommand("codez.resumeFromHistory");
+    await vscode.commands.executeCommand("codex.resumeFromHistory");
     return true;
   }
   if (cmd === "diff") {
-    await vscode.commands.executeCommand("codez.openLatestDiff", {
+    await vscode.commands.executeCommand("codex.openLatestDiff", {
       sessionId: session.id,
     });
     return true;
@@ -4244,7 +4265,7 @@ async function handleSlashCommand(
       chatView?.refresh();
       return true;
     }
-    await vscode.commands.executeCommand("codez.renameSession", {
+    await vscode.commands.executeCommand("codex.renameSession", {
       sessionId: session.id,
     });
     return true;
@@ -4256,50 +4277,43 @@ async function handleSlashCommand(
     return true;
   }
   if (cmd === "agents") {
-    await vscode.commands.executeCommand("codez.showAgents", {
+    await vscode.commands.executeCommand("codex.showAgents", {
       sessionId: session.id,
     });
     return true;
   }
   if (cmd === "account") {
-    const validateAccountName = (name: string): string | null => {
-      const trimmedName = name.trim();
-      if (!trimmedName) return "Missing account name.";
-      if (trimmedName.length > 64)
-        return "Account name is too long (max 64 chars).";
-      if (!/^[A-Za-z0-9_-]+$/.test(trimmedName))
-        return "Invalid account name. Use only [A-Za-z0-9_-].";
-      return null;
-    };
-
     if (!backendManager) throw new Error("backendManager is not initialized");
 
     const args = arg.split(/\s+/).filter(Boolean);
     const sub = args[0] ?? "";
-    const nameArg = args[1] ?? "";
-    const hasExtra = args.length > 2;
 
-    const usage =
-      "Usage: /account [<name>] | /account create <name> | /account logout";
+    const usage = [
+      "Usage:",
+      "  /account",
+      "  /account logout",
+      "  /account profiles",
+      "  /account save <profile>",
+      "  /account switch <profile>",
+    ].join("\n");
 
     if (!arg) {
-      const accounts = await backendManager.listAccounts(session);
-      const active = accounts.activeAccount ?? "(none) (legacy auth)";
+      const accountInfo = await backendManager.readAccount(session);
+      const account = accountInfo.account;
+      const active = (() => {
+        if (!account) return "(none) (legacy auth)";
+        if (account.type === "chatgpt") {
+          return account.email ? `chatgpt (${account.email})` : "chatgpt";
+        }
+        if (account.type === "apiKey") return "apiKey";
+        return "unknown";
+      })();
+      const profiles = await listAuthProfilesFromDisk();
+      const profileLabel = profiles.activeAccount ?? "(none)";
       const lines = [
         `Active: ${active}`,
-        "",
-        "Accounts:",
-        ...(accounts.accounts ?? []).map((a) => {
-          const meta =
-            a.kind === "chatgpt"
-              ? a.email
-                ? `chatgpt (${a.email})`
-                : "chatgpt"
-              : a.kind === "apiKey"
-                ? "apiKey"
-                : "";
-          return meta ? `- ${a.name} — ${meta}` : `- ${a.name}`;
-        }),
+        `OpenAI auth required: ${accountInfo.requiresOpenaiAuth ? "yes" : "no"}`,
+        `Active profile: ${profileLabel}`,
         "",
         usage,
       ].filter(Boolean);
@@ -4314,51 +4328,8 @@ async function handleSlashCommand(
       return true;
     }
 
-    if (sub === "create") {
-      if (hasExtra) {
-        upsertBlock(session.id, {
-          id: newLocalId("accountError"),
-          type: "error",
-          title: "Slash command error",
-          text: usage,
-        });
-        chatView?.refresh();
-        schedulePersistRuntime(session.id);
-        return true;
-      }
-      const err = validateAccountName(nameArg);
-      if (err) {
-        upsertBlock(session.id, {
-          id: newLocalId("accountError"),
-          type: "error",
-          title: "Slash command error",
-          text: `${err}\n${usage}`,
-        });
-        chatView?.refresh();
-        schedulePersistRuntime(session.id);
-        return true;
-      }
-
-      const res = await backendManager.switchAccount(session, {
-        name: nameArg.trim(),
-        createIfMissing: true,
-      });
-      const migrated = Boolean((res as any).migratedLegacy);
-      upsertBlock(session.id, {
-        id: newLocalId("accountCreate"),
-        type: "info",
-        title: "Account",
-        text: migrated
-          ? `Created and switched to ${res.activeAccount} (migrated legacy auth).`
-          : `Created and switched to ${res.activeAccount}.`,
-      });
-      chatView?.refresh();
-      schedulePersistRuntime(session.id);
-      return true;
-    }
-
     if (sub === "logout") {
-      if (hasExtra) {
+      if (args.length !== 1) {
         upsertBlock(session.id, {
           id: newLocalId("accountError"),
           type: "error",
@@ -4381,42 +4352,83 @@ async function handleSlashCommand(
       return true;
     }
 
-    if (hasExtra) {
+    if (sub === "profiles") {
+      if (args.length !== 1) {
+        upsertBlock(session.id, {
+          id: newLocalId("accountError"),
+          type: "error",
+          title: "Slash command error",
+          text: usage,
+        });
+        chatView?.refresh();
+        schedulePersistRuntime(session.id);
+        return true;
+      }
+
+      const profiles = await listAuthProfilesFromDisk();
+      const rows = profiles.accounts.map((p) => {
+        const marker = p.name === profiles.activeAccount ? "*" : " ";
+        const meta =
+          p.kind === "chatgpt"
+            ? p.email
+              ? ` chatgpt (${p.email})`
+              : " chatgpt"
+            : p.kind === "apiKey"
+              ? " apiKey"
+              : "";
+        return `${marker} ${p.name}${meta}`;
+      });
       upsertBlock(session.id, {
-        id: newLocalId("accountError"),
-        type: "error",
-        title: "Slash command error",
-        text: usage,
+        id: newLocalId("accountProfiles"),
+        type: "system",
+        title: "Auth profiles",
+        text:
+          rows.length > 0
+            ? rows.join("\n")
+            : "(none)\nCreate one with: /account save <profile>",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
       return true;
     }
 
-    const err = validateAccountName(sub);
-    if (err) {
+    if (sub === "save" || sub === "switch") {
+      if (args.length !== 2) {
+        upsertBlock(session.id, {
+          id: newLocalId("accountError"),
+          type: "error",
+          title: "Slash command error",
+          text: usage,
+        });
+        chatView?.refresh();
+        schedulePersistRuntime(session.id);
+        return true;
+      }
+
+      const profile = args[1] ?? "";
+      await switchAuthProfile(session, {
+        name: profile,
+        createIfMissing: sub === "save",
+      });
       upsertBlock(session.id, {
-        id: newLocalId("accountError"),
-        type: "error",
-        title: "Slash command error",
-        text: `${err}\n${usage}`,
+        id: newLocalId("accountSwitch"),
+        type: "info",
+        title: "Auth profile",
+        text:
+          sub === "save"
+            ? `Saved current auth as profile '${profile}'.`
+            : `Switched to auth profile '${profile}' and restarted backend.`,
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
       return true;
     }
-    const res = await backendManager.switchAccount(session, {
-      name: sub.trim(),
-      createIfMissing: false,
-    });
-    const migrated = Boolean((res as any).migratedLegacy);
+
     upsertBlock(session.id, {
-      id: newLocalId("accountSwitch"),
-      type: "info",
-      title: "Account",
-      text: migrated
-        ? `Switched to ${res.activeAccount} (migrated legacy auth).`
-        : `Switched to ${res.activeAccount}.`,
+      id: newLocalId("accountError"),
+      type: "error",
+      title: "Slash command error",
+      text: usage,
     });
     chatView?.refresh();
     schedulePersistRuntime(session.id);
@@ -4430,7 +4442,7 @@ async function handleSlashCommand(
         return "- /prompts:" + p.name + hint;
       })
       .join("\n");
-    const mineSelected = session.backendId === "codez";
+    const mineSelected = session.backendId === "codex";
     upsertBlock(session.id, {
       id: newLocalId("help"),
       type: "system",
@@ -4439,7 +4451,7 @@ async function handleSlashCommand(
         "Slash commands:",
         mineSelected
           ? "- /compact: Compact context"
-          : "- /compact: (codez sessions only)",
+          : "- /compact: (codex sessions only)",
         "- /new: New session",
         "- /init: Create AGENTS.md",
         "- /resume: Resume from history",
@@ -4455,7 +4467,7 @@ async function handleSlashCommand(
         "- /skills [--reload]: Browse skills",
         mineSelected
           ? "- /agents: Browse agents"
-          : "- /agents: Browse agents (codez sessions only)",
+          : "- /agents: Browse agents (codex sessions only)",
         "- /account: Account management",
         "- /help: Show help",
         customList ? "\nCustom prompts:" : null,
@@ -4765,7 +4777,11 @@ async function showSkillsActionCard(
   }> = [];
 
   actions.set("skills:refresh", { kind: "refresh" });
-  actionButtons.push({ id: "skills:refresh", label: "Refresh", style: "primary" });
+  actionButtons.push({
+    id: "skills:refresh",
+    label: "Refresh",
+    style: "primary",
+  });
 
   for (const s of skills) {
     const id = `skill:insert:${s.name}`;
@@ -5167,8 +5183,8 @@ function looksOpaqueCommandToken(command: string): boolean {
   return true;
 }
 
-async function showCodezViewContainer(): Promise<void> {
-  await vscode.commands.executeCommand("workbench.view.extension.codez");
+async function showCodexViewContainer(): Promise<void> {
+  await vscode.commands.executeCommand("workbench.view.extension.codex");
 }
 
 function hasConversationBlocks(rt: SessionRuntime): boolean {
@@ -5192,6 +5208,11 @@ function hasConversationBlocks(rt: SessionRuntime): boolean {
   });
 }
 
+function shouldSkipResumeForSessionOpen(session: Session): boolean {
+  const rt = ensureRuntime(session.id);
+  return hasConversationBlocks(rt);
+}
+
 function hasUserBlockWithoutTurnId(rt: SessionRuntime): boolean {
   for (const b of rt.blocks) {
     if (b.type !== "user") continue;
@@ -5211,7 +5232,7 @@ function setActiveSession(
   ensureRuntime(sessionId);
   const s = sessions ? sessions.getById(sessionId) : null;
   if (s?.backendId === "opencode" && !hasSessionModelState(sessionId)) {
-    // NOTE: opencode sessions must not inherit codex/codez defaults from ~/.codex/config.toml.
+    // NOTE: opencode sessions must not inherit codex defaults from ~/.codex/config.toml.
     // Use "default (opencode config)" unless the user explicitly selects a model.
     setSessionModelState(sessionId, {
       model: null,
@@ -5591,8 +5612,289 @@ function resolveCodexHome(): string {
   return path.join(os.homedir(), ".codex");
 }
 
+function authFileFsPath(): string {
+  return path.join(resolveCodexHome(), AUTH_FILE_BASENAME);
+}
+
+function authProfilesDirFsPath(): string {
+  return path.join(resolveCodexHome(), AUTH_PROFILES_DIRNAME);
+}
+
+function authProfileFsPath(name: string): string {
+  return path.join(authProfilesDirFsPath(), `${name}.json`);
+}
+
+function authProfilesActiveFileFsPath(): string {
+  return path.join(authProfilesDirFsPath(), AUTH_PROFILES_ACTIVE_FILENAME);
+}
+
+function validateAuthProfileName(name: string): string | null {
+  if (!name) return "Profile name cannot be empty.";
+  if (!AUTH_PROFILE_NAME_RE.test(name)) {
+    return "Profile name must match [A-Za-z0-9_-] and be 1..64 chars.";
+  }
+  return null;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureAuthProfilesDir(): Promise<void> {
+  await fs.mkdir(authProfilesDirFsPath(), { recursive: true });
+}
+
+async function readActiveAuthProfileName(): Promise<string | null> {
+  const p = authProfilesActiveFileFsPath();
+  try {
+    const raw = await fs.readFile(p, "utf8");
+    const name = raw.trim();
+    if (!name) return null;
+    return validateAuthProfileName(name) === null ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeActiveAuthProfileName(name: string): Promise<void> {
+  const err = validateAuthProfileName(name);
+  if (err) throw new Error(err);
+  await ensureAuthProfilesDir();
+  await writeFileAtomic(authProfilesActiveFileFsPath(), `${name}\n`);
+}
+
+async function writeFileAtomic(
+  filePath: string,
+  content: string | Uint8Array,
+): Promise<void> {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tmpPath = path.join(
+    dir,
+    `.tmp-${path.basename(filePath)}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  );
+  try {
+    await fs.writeFile(tmpPath, content, { mode: 0o600 });
+    await fs.rename(tmpPath, filePath);
+  } finally {
+    await fs.unlink(tmpPath).catch(() => undefined);
+  }
+}
+
+async function copyFileAtomic(srcPath: string, dstPath: string): Promise<void> {
+  const bytes = await fs.readFile(srcPath);
+  await writeFileAtomic(dstPath, bytes);
+}
+
+function parseJwtPayload(rawJwt: string): Record<string, unknown> | null {
+  const parts = rawJwt.split(".");
+  if (parts.length < 2) return null;
+  const payload = (parts[1] || "").trim();
+  if (!payload) return null;
+
+  try {
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const text = Buffer.from(padded, "base64").toString("utf8");
+    const parsed = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractEmailFromJwt(rawJwt: string): string | undefined {
+  const payload = parseJwtPayload(rawJwt);
+  if (!payload) return undefined;
+
+  const email = payload["email"];
+  if (typeof email === "string" && email.trim()) return email.trim();
+
+  const profile = payload["https://api.openai.com/profile"];
+  if (typeof profile === "object" && profile !== null) {
+    const profileEmail = (profile as Record<string, unknown>)["email"];
+    if (typeof profileEmail === "string" && profileEmail.trim()) {
+      return profileEmail.trim();
+    }
+  }
+  return undefined;
+}
+
+function summarizeAuthProfile(raw: string): Omit<AuthProfileEntry, "name"> {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return {};
+    const obj = parsed as Record<string, unknown>;
+
+    const authModeRaw =
+      typeof obj["auth_mode"] === "string"
+        ? String(obj["auth_mode"]).toLowerCase()
+        : "";
+
+    let kind: AuthProfileEntry["kind"] | undefined;
+    if (authModeRaw === "apikey" || typeof obj["OPENAI_API_KEY"] === "string") {
+      kind = "apiKey";
+    }
+
+    const tokens =
+      typeof obj["tokens"] === "object" && obj["tokens"] !== null
+        ? (obj["tokens"] as Record<string, unknown>)
+        : null;
+    const idToken =
+      tokens && typeof tokens["id_token"] === "string"
+        ? String(tokens["id_token"])
+        : "";
+
+    if (
+      authModeRaw === "chatgpt" ||
+      authModeRaw === "chatgptauthtokens" ||
+      tokens
+    ) {
+      kind = "chatgpt";
+    }
+
+    const email = idToken ? extractEmailFromJwt(idToken) : undefined;
+    if (!kind && !email) return {};
+    return {
+      ...(kind ? { kind } : {}),
+      ...(email ? { email } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function listAuthProfilesFromDisk(): Promise<AuthProfileListResult> {
+  await ensureAuthProfilesDir();
+  const dir = authProfilesDirFsPath();
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+
+  const accounts: AuthProfileEntry[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!entry.name.endsWith(".json")) continue;
+
+    const name = entry.name.slice(0, -".json".length);
+    if (validateAuthProfileName(name) !== null) continue;
+
+    const filePath = path.join(dir, entry.name);
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      accounts.push({ name, ...summarizeAuthProfile(raw) });
+    } catch (err) {
+      outputChannel?.appendLine(
+        `[auth] Failed to read profile: ${filePath} err=${String(err)}`,
+      );
+    }
+  }
+
+  accounts.sort((a, b) => a.name.localeCompare(b.name));
+
+  const activeProfile = await readActiveAuthProfileName();
+  const hasCurrentAuth = await fileExists(authFileFsPath());
+  const activeAccount =
+    hasCurrentAuth &&
+    activeProfile &&
+    accounts.some((a) => a.name === activeProfile)
+      ? activeProfile
+      : null;
+
+  return { activeAccount, accounts };
+}
+
+function hasAnyRunningSession(): boolean {
+  return [...runtimeBySessionId.values()].some(
+    (r) =>
+      r.sending ||
+      r.activeTurnId !== null ||
+      r.streamingAssistantItemIds.size > 0 ||
+      r.pendingApprovals.size > 0,
+  );
+}
+
+async function switchAuthProfile(
+  session: Session,
+  opts: { name: string; createIfMissing: boolean },
+): Promise<AuthProfileSwitchResult> {
+  if (session.backendId !== "codex") {
+    throw new Error(
+      "Auth profile switching is supported for codex sessions only.",
+    );
+  }
+
+  const name = opts.name.trim();
+  const nameErr = validateAuthProfileName(name);
+  if (nameErr) throw new Error(nameErr);
+
+  if (hasAnyRunningSession()) {
+    throw new Error("Cannot switch auth profile while a session is running.");
+  }
+
+  await ensureAuthProfilesDir();
+
+  const currentAuthPath = authFileFsPath();
+  const targetProfilePath = authProfileFsPath(name);
+  const targetExists = await fileExists(targetProfilePath);
+  const hasCurrentAuth = await fileExists(currentAuthPath);
+
+  if (opts.createIfMissing) {
+    if (targetExists) throw new Error(`Profile already exists: ${name}`);
+    if (!hasCurrentAuth) {
+      throw new Error(
+        `No active auth found at ${currentAuthPath}. Log in first, then save profile.`,
+      );
+    }
+
+    await copyFileAtomic(currentAuthPath, targetProfilePath);
+    await writeActiveAuthProfileName(name);
+    const listed = await listAuthProfilesFromDisk();
+    return { ...listed, created: true, restarted: false };
+  }
+
+  if (!targetExists) throw new Error(`Profile not found: ${name}`);
+
+  const previouslyActive = await readActiveAuthProfileName();
+  if (previouslyActive && previouslyActive !== name && hasCurrentAuth) {
+    const prevErr = validateAuthProfileName(previouslyActive);
+    if (!prevErr) {
+      await copyFileAtomic(
+        currentAuthPath,
+        authProfileFsPath(previouslyActive),
+      );
+    }
+  }
+
+  await copyFileAtomic(targetProfilePath, currentAuthPath);
+  await writeActiveAuthProfileName(name);
+
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  const folder = resolveWorkspaceFolderForSession(session);
+  if (!folder) {
+    throw new Error("WorkspaceFolder not found for session.");
+  }
+
+  outputChannel?.appendLine(
+    `[auth] Switching profile to '${name}' and restarting backend key=${session.backendKey}`,
+  );
+
+  backendManager.stopForBackendInstance(
+    folder,
+    session.backendId,
+    session.backendKey,
+  );
+  await backendManager.startForBackendId(folder, session.backendId);
+
+  const listed = await listAuthProfilesFromDisk();
+  return { ...listed, created: false, restarted: true };
+}
 function isMineSelectedForBackendKey(backendKey: string): boolean {
-  return parseBackendInstanceKey(backendKey).backendId === "codez";
+  return parseBackendInstanceKey(backendKey).backendId === "codex";
 }
 
 function workspaceFolderUriForCwd(cwd: string | null): string | null {
@@ -5616,7 +5918,7 @@ function backendKeyForCwdAndBackendId(
   return makeBackendInstanceKey(workspaceFolderUri, backendId);
 }
 
-// Agents are read from disk only when running codez.
+// Agents are read from disk only when running codex.
 
 function parsePromptFrontmatter(content: string): {
   description: string | null;
@@ -5663,7 +5965,9 @@ function parsePromptFrontmatter(content: string): {
 }
 
 async function loadCustomPromptsFromDisk(): Promise<CustomPromptSummary[]> {
-  const session = activeSessionId ? sessions?.getById(activeSessionId) ?? null : null;
+  const session = activeSessionId
+    ? (sessions?.getById(activeSessionId) ?? null)
+    : null;
   return await loadCustomPromptsFromDiskForSession(session);
 }
 
@@ -5747,7 +6051,9 @@ async function resolveRepoPromptsDirForSession(
       ? vscode.workspace.workspaceFolders?.[0]?.uri.toString()
       : null);
   if (!folderUri) return null;
-  const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.parse(folderUri));
+  const folder = vscode.workspace.getWorkspaceFolder(
+    vscode.Uri.parse(folderUri),
+  );
   if (!folder) return null;
 
   const gitRoot = await findGitRoot(folder.uri.fsPath);
@@ -5781,10 +6087,11 @@ async function findGitRoot(start: string): Promise<string | null> {
 function ensureCustomPromptWatchers(session: Session | null): void {
   if (!extensionContext) return;
 
-  const folder =
-    session?.workspaceFolderUri
-      ? vscode.workspace.getWorkspaceFolder(vscode.Uri.parse(session.workspaceFolderUri))
-      : null;
+  const folder = session?.workspaceFolderUri
+    ? vscode.workspace.getWorkspaceFolder(
+        vscode.Uri.parse(session.workspaceFolderUri),
+      )
+    : null;
   const folderFsPath = folder?.uri.fsPath ?? null;
   const userDir = path.join(resolveCodexHome(), "prompts");
 
@@ -5844,6 +6151,8 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     pendingInterrupt: false,
     lastTurnStartedAtMs: null,
     lastTurnCompletedAtMs: null,
+    lastActivityAtMs: null,
+    stalledTurnNoticeAtMs: null,
     v2NotificationsSeen: false,
     blockIndexById: new Map(),
     legacyPatchTargetByCallId: new Map(),
@@ -5860,16 +6169,25 @@ function ensureRuntime(sessionId: string): SessionRuntime {
   return rt;
 }
 
+function shouldLockInput(rt: SessionRuntime): boolean {
+  return (
+    rt.activeTurnId !== null ||
+    rt.streamingAssistantItemIds.size > 0 ||
+    rt.pendingAssistantDeltas.size > 0 ||
+    rt.pendingApprovals.size > 0
+  );
+}
+
 function getModelOptionsForSession(session: Session | null): Model[] | null {
   if (!session || !backendManager) return null;
   return backendManager.getCachedModels(session);
 }
 
 function getUiDefaultModelState(session: Session | null): ModelState {
-  // For codez, repo-local `.codex/config.toml` may override (or completely replace) CODEX_HOME config.
+  // For codex, repo-local `.codex/config.toml` may override (or completely replace) CODEX_HOME config.
   // Prefer the backend's effective config when available, so the UI's "default (...)" label matches
   // what the backend will actually use.
-  if (session && session.backendId === "codez") {
+  if (session && session.backendId === "codex") {
     const cfg = configByBackendKey.get(session.backendKey)?.config ?? null;
     if (cfg) {
       return {
@@ -6091,6 +6409,7 @@ function buildChatState(): ChatViewState {
         : "Default",
     approvals: [...rt.pendingApprovals.entries()].map(([requestKey, v]) => ({
       requestKey,
+      sessionId: v.sessionId,
       title: v.title,
       detail: v.detail,
       canAcceptForSession: v.canAcceptForSession,
@@ -6116,6 +6435,7 @@ function applyServerNotification(
   n: AnyServerNotification,
 ): void {
   const rt = ensureRuntime(sessionId);
+  rt.lastActivityAtMs = Date.now();
   if (!n.method.startsWith("codex/event/")) {
     if (!rt.v2NotificationsSeen) purgeLegacyToolBlocks(rt);
     rt.v2NotificationsSeen = true;
@@ -6129,26 +6449,100 @@ function applyServerNotification(
       return;
     case "error": {
       const p = (n as any).params as {
-        error?: { message?: unknown; additionalDetails?: unknown };
+        error?: {
+          message?: unknown;
+          codexErrorInfo?: unknown;
+          additionalDetails?: unknown;
+        };
         willRetry?: unknown;
-        threadId?: unknown;
         turnId?: unknown;
       };
-      const message = String(p?.error?.message ?? "").trim();
-      const additionalDetailsRaw = p?.error?.additionalDetails;
+      const err = p?.error ?? {};
+      const rawMessage =
+        typeof err?.message === "string"
+          ? err.message
+          : String(err?.message ?? "");
+      const message = rawMessage.trim();
+      const additionalDetailsRaw = err?.additionalDetails;
       const additionalDetails =
         typeof additionalDetailsRaw === "string"
           ? String(additionalDetailsRaw).trim()
           : "";
       const willRetry = Boolean(p?.willRetry ?? false);
       const turnId = String(p?.turnId ?? "").trim();
+      const rawInfo = err?.codexErrorInfo ?? null;
+      const infoKey =
+        typeof rawInfo === "string"
+          ? rawInfo
+          : rawInfo && typeof rawInfo === "object"
+            ? (Object.keys(rawInfo as Record<string, unknown>)[0] ?? null)
+            : null;
+      const infoValue =
+        infoKey && rawInfo && typeof rawInfo === "object"
+          ? (rawInfo as Record<string, unknown>)[infoKey]
+          : null;
+      const httpStatusCode =
+        infoValue && typeof infoValue === "object"
+          ? ((infoValue as any).httpStatusCode ??
+            (infoValue as any).http_status_code)
+          : null;
+
+      let title = willRetry ? "Error (will retry)" : "Error";
+      if (infoKey === "rateLimited" || infoKey === "rate_limited") {
+        title =
+          typeof httpStatusCode === "number"
+            ? `Rate limited (HTTP ${httpStatusCode})`
+            : "Rate limited";
+      } else if (
+        infoKey === "usageLimitExceeded" ||
+        infoKey === "usage_limit_exceeded"
+      ) {
+        title = "Usage limit exceeded";
+      } else if (
+        infoKey === "contextWindowExceeded" ||
+        infoKey === "context_window_exceeded"
+      ) {
+        title = "Context window exceeded";
+      }
+
+      const lines: string[] = [];
+      if (message) lines.push(message);
+      if (additionalDetails) {
+        if (lines.length > 0) lines.push("");
+        lines.push(additionalDetails);
+      }
+      if (willRetry) {
+        if (lines.length > 0) lines.push("");
+        lines.push("Will retry automatically.");
+      }
 
       upsertBlock(sessionId, {
         id: `turn-error:${turnId || newLocalId("error")}`,
         type: "error",
-        title: willRetry ? "Error (will retry)" : "Error",
-        text: additionalDetails ? `${message}\n\n${additionalDetails}` : message,
+        title,
+        text: lines.join("\n").trim(),
       });
+      if (!willRetry) {
+        rt.sending = false;
+        rt.stalledTurnNoticeAtMs = null;
+        rt.lastTurnCompletedAtMs = Date.now();
+        rt.activeTurnId = null;
+        rt.pendingLocalUserBlockId = nextPendingLocalUserBlockIdOnTurnCompleted();
+        rt.pendingInterrupt = false;
+        const streamingIds = [...rt.streamingAssistantItemIds];
+        rt.streamingAssistantItemIds.clear();
+        flushPendingAssistantDeltas(sessionId, rt);
+        for (const id of streamingIds) {
+          const idx = rt.blockIndexById.get(id);
+          if (idx === undefined) continue;
+          const b = rt.blocks[idx];
+          if (b && b.type === "assistant") {
+            (b as any).streaming = false;
+            chatView?.postBlockUpsert(sessionId, b);
+          }
+        }
+        void flushQueuedUserInput(sessionId);
+      }
       chatView?.refresh();
       return;
     }
@@ -6185,7 +6579,7 @@ function applyServerNotification(
       upsertBlock(sessionId, divider);
       // Auto-compaction can happen mid-turn (the backend continues working).
       // In that case, do not unlock the input.
-      if (rt.activeTurnId === null) rt.sending = false;
+      if (rt.activeTurnId === null) rt.sending = shouldLockInput(rt);
       rt.compactInFlight = false;
       rt.pendingCompactBlockId = null;
 
@@ -6202,6 +6596,7 @@ function applyServerNotification(
     }
     case "turn/started":
       rt.sending = true;
+      rt.stalledTurnNoticeAtMs = null;
       rt.lastTurnStartedAtMs = Date.now();
       rt.lastTurnCompletedAtMs = null;
       rt.activeTurnId = String((n as any).params?.turn?.id ?? "") || null;
@@ -6254,17 +6649,22 @@ function applyServerNotification(
       chatView?.refresh();
       return;
     case "turn/completed":
-      rt.sending = false;
+      rt.stalledTurnNoticeAtMs = null;
       rt.lastTurnCompletedAtMs = Date.now();
       rt.activeTurnId = null;
       rt.pendingLocalUserBlockId = nextPendingLocalUserBlockIdOnTurnCompleted();
       rt.pendingInterrupt = false;
+      let turnStatus = "";
       {
         const turn = (n as any).params?.turn as
-          | { id?: unknown; status?: unknown; error?: { message?: unknown; additionalDetails?: unknown } | null }
+          | {
+              id?: unknown;
+              status?: unknown;
+              error?: { message?: unknown; additionalDetails?: unknown } | null;
+            }
           | undefined;
-        const status = String(turn?.status ?? "");
-        if (status === "Failed") {
+        turnStatus = String(turn?.status ?? "").trim().toLowerCase();
+        if (turnStatus === "failed") {
           const turnId = String(turn?.id ?? "").trim();
           const message = String(turn?.error?.message ?? "").trim();
           const additionalDetailsRaw = turn?.error?.additionalDetails;
@@ -6284,13 +6684,13 @@ function applyServerNotification(
           }
         }
       }
-      // IMPORTANT: clear the streaming set before flushing pending deltas so the webview sees
-      // `streaming=false` for the final append. Otherwise, if messages are delivered out of order
-      // (append after upsert), the webview can get stuck in the <pre> fast-path and skip Markdown
-      // rendering even after the turn completes.
       const streamingIds = [...rt.streamingAssistantItemIds];
-      rt.streamingAssistantItemIds.clear();
-      flushPendingAssistantDeltas(sessionId, rt);
+      if (turnStatus === "failed" || turnStatus === "interrupted") {
+        rt.streamingAssistantItemIds.clear();
+      }
+      // Force this flush to render as non-streaming. We still keep item ids for any late
+      // `item/completed` events so input stays locked until lifecycle closure.
+      flushPendingAssistantDeltas(sessionId, rt, { forceStreamingFalse: true });
       for (const id of streamingIds) {
         const idx = rt.blockIndexById.get(id);
         if (idx === undefined) continue;
@@ -6313,8 +6713,9 @@ function applyServerNotification(
           clearUiHistoryForCompact(sessionId, rt, null);
         }
       }
+      rt.sending = shouldLockInput(rt);
       chatView?.refresh();
-      void flushQueuedUserInput(sessionId);
+      if (!rt.sending) void flushQueuedUserInput(sessionId);
       return;
     case "thread/tokenUsage/updated":
       rt.tokenUsage = (n as any).params.tokenUsage as ThreadTokenUsage;
@@ -6354,6 +6755,7 @@ function applyServerNotification(
         if (!existed) block.text += delta;
       }
       rt.streamingAssistantItemIds.add(id);
+      rt.sending = shouldLockInput(rt);
       markUnreadSession(sessionId);
       if (!existed) {
         sessionPanels?.appendAssistantDelta(sessionId, delta);
@@ -6633,83 +7035,6 @@ function applyServerNotification(
       chatView?.refresh();
       return;
     }
-    case "error": {
-      const p = (n as any).params as {
-        error?: {
-          message?: unknown;
-          codexErrorInfo?: unknown;
-          additionalDetails?: unknown;
-        };
-        willRetry?: unknown;
-      };
-      const err = p?.error ?? {};
-      const rawMessage =
-        typeof err?.message === "string"
-          ? err.message
-          : String(err?.message ?? "");
-      const message = rawMessage.trim();
-
-      const additionalDetails =
-        typeof err?.additionalDetails === "string"
-          ? err.additionalDetails.trim()
-          : "";
-
-      const rawInfo = err?.codexErrorInfo ?? null;
-      const infoKey =
-        typeof rawInfo === "string"
-          ? rawInfo
-          : rawInfo && typeof rawInfo === "object"
-            ? (Object.keys(rawInfo as Record<string, unknown>)[0] ?? null)
-            : null;
-      const infoValue =
-        infoKey && rawInfo && typeof rawInfo === "object"
-          ? (rawInfo as Record<string, unknown>)[infoKey]
-          : null;
-      const httpStatusCode =
-        infoValue && typeof infoValue === "object"
-          ? ((infoValue as any).httpStatusCode ??
-            (infoValue as any).http_status_code)
-          : null;
-
-      const willRetry = !!p?.willRetry;
-
-      let title = "Error";
-      if (infoKey === "rateLimited" || infoKey === "rate_limited") {
-        title =
-          typeof httpStatusCode === "number"
-            ? `Rate limited (HTTP ${httpStatusCode})`
-            : "Rate limited";
-      } else if (
-        infoKey === "usageLimitExceeded" ||
-        infoKey === "usage_limit_exceeded"
-      ) {
-        title = "Usage limit exceeded";
-      } else if (
-        infoKey === "contextWindowExceeded" ||
-        infoKey === "context_window_exceeded"
-      ) {
-        title = "Context window exceeded";
-      }
-
-      const lines: string[] = [];
-      if (message) lines.push(message);
-      if (additionalDetails) {
-        if (lines.length > 0) lines.push("");
-        lines.push(additionalDetails);
-      }
-      if (willRetry) {
-        if (lines.length > 0) lines.push("");
-        lines.push("Will retry automatically.");
-      }
-      upsertBlock(sessionId, {
-        id: newLocalId("error"),
-        type: "error",
-        title,
-        text: lines.join("\n").trim(),
-      });
-      chatView?.refresh();
-      return;
-    }
     case "item/started":
     case "item/completed": {
       const item = (n as any).params.item as ThreadItem;
@@ -6930,7 +7255,10 @@ function applyItemLifecycle(
           break;
         }
         case "wait": {
-          title = item.status === "inProgress" ? "Waiting for agents" : "Wait complete";
+          title =
+            item.status === "inProgress"
+              ? "Waiting for agents"
+              : "Wait complete";
           if (receiverThreadIds.length > 0) {
             detailLines.push(`receivers: ${receiverThreadIds.join(", ")}`);
           }
@@ -6944,7 +7272,8 @@ function applyItemLifecycle(
           break;
         }
         case "resumeAgent": {
-          title = item.status === "inProgress" ? "Resuming agent" : "Agent resumed";
+          title =
+            item.status === "inProgress" ? "Resuming agent" : "Agent resumed";
           if (receiverThreadIds.length > 0) {
             detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
           }
@@ -7108,11 +7437,11 @@ function applyItemLifecycle(
       if (completed) rt.streamingAssistantItemIds.delete(id);
       else rt.streamingAssistantItemIds.add(id);
 
-      // If we previously re-locked the input due to late deltas, unlock once all assistant
-      // messages have completed and there is no active turn.
-      if (completed && rt.activeTurnId === null && rt.streamingAssistantItemIds.size === 0) {
-        rt.sending = false;
+      const wasSending = rt.sending;
+      rt.sending = shouldLockInput(rt);
+      if (wasSending && !rt.sending) {
         rt.lastTurnCompletedAtMs = Date.now();
+        void flushQueuedUserInput(sessionId);
       }
       chatView?.postBlockUpsert(sessionId, block);
       break;
@@ -7685,6 +8014,7 @@ function scheduleAssistantDeltaFlush(
 function flushPendingAssistantDeltas(
   sessionId: string,
   rt: SessionRuntime,
+  opts: { forceStreamingFalse?: boolean } = {},
 ): void {
   if (rt.pendingAssistantDeltaFlushTimer) {
     clearTimeout(rt.pendingAssistantDeltaFlushTimer);
@@ -7709,8 +8039,9 @@ function flushPendingAssistantDeltas(
     // Do not force `streaming=true` here. This function can run after a turn is
     // completed (timer flush), and re-enabling streaming would keep the webview
     // in the <pre> fast-path and skip Markdown rendering for the final message.
-    const isStreaming =
-      rt.streamingAssistantItemIds.has(id) || rt.activeTurnId !== null;
+    const isStreaming = opts.forceStreamingFalse
+      ? false
+      : rt.streamingAssistantItemIds.has(id) || rt.activeTurnId !== null;
     (b as any).streaming = isStreaming;
     sessionPanels?.appendAssistantDelta(sessionId, delta);
     chatView?.postBlockAppend(sessionId, id, "assistantText", delta, {
@@ -7808,7 +8139,7 @@ function shouldClearUiHistoryOnCompact(sessionId: string): boolean {
   if (!session) return false;
   try {
     const wk = vscode.Uri.parse(session.workspaceFolderUri);
-    const cfg = vscode.workspace.getConfiguration("codez", wk);
+    const cfg = vscode.workspace.getConfiguration("codex", wk);
     return cfg.get<boolean>("ui.clearHistoryOnCompact") ?? false;
   } catch {
     return false;
@@ -7821,7 +8152,7 @@ function keepUiHistoryPairsOnCompact(sessionId: string): number {
   if (!session) return 10;
   try {
     const wk = vscode.Uri.parse(session.workspaceFolderUri);
-    const cfg = vscode.workspace.getConfiguration("codez", wk);
+    const cfg = vscode.workspace.getConfiguration("codex", wk);
     const raw = cfg.get<number>("ui.clearHistoryOnCompactKeepPairs") ?? 10;
     if (!Number.isFinite(raw)) return 10;
     return Math.max(0, Math.trunc(raw));
@@ -7884,8 +8215,12 @@ function ensureParts(parts: string[], index: number): void {
   while (parts.length <= index) parts.push("");
 }
 
-function requestKeyFromId(id: string | number): string {
-  return typeof id === "number" ? `n:${id}` : `s:${id}`;
+function requestKeyFromSessionAndId(
+  sessionId: string,
+  id: string | number,
+): string {
+  const base = typeof id === "number" ? `n:${id}` : `s:${id}`;
+  return `${sessionId}:${base}`;
 }
 
 function formatK(n: number): string {
@@ -8111,6 +8446,87 @@ async function upsertImageViewBlock(
   schedulePersistRuntime(sessionId);
 }
 
+function checkForStaleSendingStates(): void {
+  if (!sessions) return;
+
+  const now = Date.now();
+  for (const session of sessions.listAll()) {
+    const rt = ensureRuntime(session.id);
+    if (!rt.sending) {
+      rt.stalledTurnNoticeAtMs = null;
+      continue;
+    }
+
+    const lastActivityMs = rt.lastActivityAtMs ?? rt.lastTurnStartedAtMs;
+    if (lastActivityMs === null) continue;
+
+    const idleMs = Math.max(0, now - lastActivityMs);
+    const hasRunningSignals =
+      rt.activeTurnId !== null || rt.streamingAssistantItemIds.size > 0;
+    const hasApprovalWait = rt.pendingApprovals.size > 0;
+    if (!hasRunningSignals && !hasApprovalWait) {
+      if (idleMs < STALE_RUNNING_WARNING_MS) {
+        rt.stalledTurnNoticeAtMs = null;
+        continue;
+      }
+
+      const lastNoticeAt = rt.stalledTurnNoticeAtMs;
+      if (
+        lastNoticeAt !== null &&
+        now - lastNoticeAt < STALE_RUNNING_WARNING_MS
+      ) {
+        continue;
+      }
+
+      rt.stalledTurnNoticeAtMs = now;
+      outputChannel?.appendLine(
+        `[watchdog] Possible stale UI lock state: sessionId=${session.id} idleMs=${idleMs} (sending=true, no running signals, auto-reset disabled)`,
+      );
+      upsertBlock(session.id, {
+        id: newLocalId("watchdogWarning"),
+        type: "info",
+        title: "Input may be locked by stale state",
+        text:
+          `No backend activity was observed for ${Math.round(idleMs / 1000)}s while no active turn/tool stream signals were present.\n` +
+          "Auto-unlock is disabled to avoid dropping long-running turns. Use Stop to interrupt, or Reload session if this does not recover.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      continue;
+    }
+
+    if (!hasRunningSignals) {
+      rt.stalledTurnNoticeAtMs = null;
+      continue;
+    }
+
+    if (idleMs < STALE_RUNNING_WARNING_MS) continue;
+
+    const lastNoticeAt = rt.stalledTurnNoticeAtMs;
+    if (
+      lastNoticeAt !== null &&
+      now - lastNoticeAt < STALE_RUNNING_WARNING_MS
+    ) {
+      continue;
+    }
+
+    rt.stalledTurnNoticeAtMs = now;
+    outputChannel?.appendLine(
+      `[watchdog] Possible stalled running turn: sessionId=${session.id} turnId=${rt.activeTurnId ?? "null"} idleMs=${idleMs}`,
+    );
+    upsertBlock(session.id, {
+      id: newLocalId("watchdogWarning"),
+      type: "info",
+      title: "Turn may be stalled",
+      text:
+        `No backend activity was observed for ${Math.round(idleMs / 1000)}s while a turn was still marked running.\n` +
+        "Use Stop to interrupt, or Reload session if it does not recover.",
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  }
+}
+
 function computeWorkedSeconds(rt: SessionRuntime): number | null {
   const started = rt.lastTurnStartedAtMs;
   if (started === null) return null;
@@ -8302,14 +8718,18 @@ function applyGlobalNotification(
         const mins = p.windowDurationMins ?? null;
         const label = mins ? rateLimitShortLabelFromMinutes(mins) : "primary";
         parts.push(`${label}:${formatPercent2(p.usedPercent)}%`);
-        const reset = p.resetsAt ? formatResetsAtTooltip(p.resetsAt) : "unknown";
+        const reset = p.resetsAt
+          ? formatResetsAtTooltip(p.resetsAt)
+          : "unknown";
         tooltipLines.push(`${label} reset: ${reset}`);
       }
       if (s) {
         const mins = s.windowDurationMins ?? null;
         const label = mins ? rateLimitShortLabelFromMinutes(mins) : "secondary";
         parts.push(`${label}:${formatPercent2(s.usedPercent)}%`);
-        const reset = s.resetsAt ? formatResetsAtTooltip(s.resetsAt) : "unknown";
+        const reset = s.resetsAt
+          ? formatResetsAtTooltip(s.resetsAt)
+          : "unknown";
         tooltipLines.push(`${label} reset: ${reset}`);
       }
       globalRateLimitStatusText = parts.length > 0 ? parts.join(" ") : null;
@@ -8534,11 +8954,7 @@ function updateThreadStartedBlocks(): void {
         if (idx <= 0) return null;
         const backendId = rest.slice(0, idx);
         const cwd = rest.slice(idx + ":cwd:".length);
-        if (
-          backendId !== "codex" &&
-          backendId !== "codez" &&
-          backendId !== "opencode"
-        ) {
+        if (backendId !== "codex" && backendId !== "opencode") {
           return null;
         }
         if (!cwd) return null;
@@ -8999,6 +9415,7 @@ function hydrateRuntimeFromThread(
   opts?: { force?: boolean },
 ): void {
   const rt = ensureRuntime(sessionId);
+  rt.lastActivityAtMs = Date.now();
 
   const hasConversationBlocks = rt.blocks.some((b) => {
     switch (b.type) {
@@ -9146,10 +9563,10 @@ function updatePendingApprovalsFromItem(
   }
 }
 
-const SESSIONS_V1_KEY = "codez.sessions.v1";
-const SESSIONS_V2_KEY = "codez.sessions.v2";
+const SESSIONS_V1_KEY = "codex.sessions.v1";
+const SESSIONS_V2_KEY = "codex.sessions.v2";
 const SESSIONS_V1_MIGRATION_PROMPTED_KEY =
-  "codez.sessions.v1.migrationPrompted.v1";
+  "codex.sessions.v1.migrationPrompted.v1";
 type PersistedSessionV1 = Pick<
   Session,
   | "id"
@@ -9231,15 +9648,18 @@ function loadSessions(
     if (
       typeof id !== "string" ||
       typeof backendKey !== "string" ||
-      (backendId !== "codex" &&
-        backendId !== "codez" &&
-        backendId !== "opencode") ||
+      (backendId !== "codex" && backendId !== "opencode") ||
       typeof workspaceFolderUri !== "string" ||
       typeof title !== "string" ||
       typeof threadId !== "string"
     ) {
       continue;
     }
+    const normalizedBackendId: BackendId = backendId;
+    const normalizedBackendKey = makeBackendInstanceKey(
+      workspaceFolderUri,
+      normalizedBackendId,
+    );
 
     const personalityVal: Personality | null =
       personality === "friendly" || personality === "pragmatic"
@@ -9251,10 +9671,10 @@ function loadSessions(
         ? collaborationModePresetName.trim()
         : null;
 
-    store.add(backendKey, {
+    store.add(normalizedBackendKey, {
       id,
-      backendKey,
-      backendId,
+      backendKey: normalizedBackendKey,
+      backendId: normalizedBackendId,
       workspaceFolderUri,
       title,
       customTitle: typeof customTitle === "boolean" ? customTitle : false,

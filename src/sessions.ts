@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { Personality } from "./generated/Personality";
 import type { CollaborationModeMask } from "./generated/CollaborationModeMask";
 
-export type BackendId = "codex" | "codez" | "opencode";
+export type BackendId = "codex" | "opencode";
 
 export type Session = {
   id: string;

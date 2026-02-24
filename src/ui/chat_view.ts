@@ -215,6 +215,7 @@ export type ChatViewState = {
   collaborationModeLabel?: string | null;
   approvals: Array<{
     requestKey: string;
+    sessionId: string;
     title: string;
     detail: string;
     canAcceptForSession: boolean;
@@ -279,7 +280,7 @@ function asNullableString(v: unknown): string | null {
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = "codez.chatView";
+  public static readonly viewType = "codex.chatView";
 
   private view: vscode.WebviewView | null = null;
   private viewReadyPromise: Promise<void>;
@@ -403,14 +404,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       session: Session,
       args: { requestID: string; reply: "once" | "always" | "reject" },
     ) => Promise<void>,
-    private readonly onAccountList: (
-      session: Session,
-    ) => Promise<{ activeAccount?: string; accounts: Array<unknown> }>,
     private readonly onAccountRead: (session: Session) => Promise<unknown>,
-    private readonly onAccountSwitch: (
-      session: Session,
-      params: { name: string; createIfMissing: boolean },
-    ) => Promise<unknown>,
     private readonly onAccountLogout: (session: Session) => Promise<unknown>,
     private readonly onAccountLoginChatgptStart: (
       session: Session,
@@ -576,17 +570,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this.autoReloadOnVisibleInFlight) return;
       if (!shouldAutoReloadOnChatTabVisible(this.getState())) return;
       this.autoReloadOnVisibleInFlight = true;
-      void vscode.commands
-        .executeCommand("codez.reloadSession")
-        .then(
-          () => {
-            this.autoReloadOnVisibleInFlight = false;
-          },
-          (err: unknown) => {
-            this.autoReloadOnVisibleInFlight = false;
-            this.onUiError(`Auto reload failed: ${String(err)}`);
-          },
-        );
+      void vscode.commands.executeCommand("codex.reloadSession").then(
+        () => {
+          this.autoReloadOnVisibleInFlight = false;
+        },
+        (err: unknown) => {
+          this.autoReloadOnVisibleInFlight = false;
+          this.onUiError(`Auto reload failed: ${String(err)}`);
+        },
+      );
     });
     this.resolveViewReady?.();
     this.resolveViewReady = null;
@@ -858,19 +850,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (type === "stop") {
-      await vscode.commands.executeCommand("codez.interruptTurn");
+      await vscode.commands.executeCommand("codex.interruptTurn");
       return;
     }
 
     if (type === "reloadSession") {
-      await vscode.commands.executeCommand("codez.reloadSession");
+      await vscode.commands.executeCommand("codex.reloadSession");
       return;
     }
 
     if (type === "selectSession") {
       const sessionId = anyMsg["sessionId"];
       if (typeof sessionId !== "string") return;
-      await vscode.commands.executeCommand("codez.selectSession", {
+      await vscode.commands.executeCommand("codex.selectSession", {
         sessionId,
       });
       return;
@@ -889,7 +881,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       if (position !== "before" && position !== "after" && position !== "end")
         return;
-      await vscode.commands.executeCommand("codez._internal.moveWorkspaceTab", {
+      await vscode.commands.executeCommand("codex._internal.moveWorkspaceTab", {
         workspaceFolderUri,
         targetWorkspaceFolderUri,
         position,
@@ -909,7 +901,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       if (position !== "before" && position !== "after" && position !== "end")
         return;
-      await vscode.commands.executeCommand("codez._internal.moveSessionTab", {
+      await vscode.commands.executeCommand("codex._internal.moveSessionTab", {
         workspaceFolderUri,
         sessionId,
         targetSessionId,
@@ -922,7 +914,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const sessionId = anyMsg["sessionId"];
       if (typeof sessionId !== "string") return;
       await vscode.commands.executeCommand(
-        "codez._internal.loadHistoryForSession",
+        "codex._internal.loadHistoryForSession",
         {
           sessionId,
         },
@@ -933,7 +925,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (type === "renameSession") {
       const sessionId = anyMsg["sessionId"];
       if (typeof sessionId !== "string") return;
-      await vscode.commands.executeCommand("codez.renameSession", {
+      await vscode.commands.executeCommand("codex.renameSession", {
         sessionId,
       });
       return;
@@ -942,7 +934,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (type === "sessionMenu") {
       const sessionId = anyMsg["sessionId"];
       if (typeof sessionId !== "string") return;
-      await vscode.commands.executeCommand("codez.sessionMenu", {
+      await vscode.commands.executeCommand("codex.sessionMenu", {
         sessionId,
       });
       return;
@@ -952,36 +944,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const st = this.getState();
       const active = st.activeSession;
       if (active) {
-        await vscode.commands.executeCommand("codez.newSession", {
+        await vscode.commands.executeCommand("codex.newSession", {
           workspaceFolderUri: active.workspaceFolderUri,
         });
       } else {
-        await vscode.commands.executeCommand("codez.newSession");
+        await vscode.commands.executeCommand("codex.newSession");
       }
       return;
     }
 
     if (type === "newSessionPickFolder") {
-      await vscode.commands.executeCommand("codez.newSession", {
+      await vscode.commands.executeCommand("codex.newSession", {
         forcePickFolder: true,
       });
       return;
     }
 
     if (type === "resumeFromHistory") {
-      await vscode.commands.executeCommand("codez.resumeFromHistory");
+      await vscode.commands.executeCommand("codex.resumeFromHistory");
       return;
     }
 
     if (type === "showStatus") {
-      await vscode.commands.executeCommand("codez.showStatus");
+      await vscode.commands.executeCommand("codex.showStatus");
       return;
     }
 
     if (type === "cycleCollaborationMode") {
       const sessionId = anyMsg["sessionId"];
       if (typeof sessionId !== "string" || !sessionId) return;
-      await vscode.commands.executeCommand("codez.cycleCollaborationMode", {
+      await vscode.commands.executeCommand("codex.cycleCollaborationMode", {
         sessionId,
       });
       return;
@@ -1038,9 +1030,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const accounts =
             sessionBackendId === "opencode"
               ? null
-              : sessionBackendId === "codez"
-                ? await this.onAccountList(active)
-                : null;
+              : await vscode.commands.executeCommand(
+                  "codex._internal.accountProfileList",
+                  { sessionId: active.id },
+                );
           await respondOk({
             hasActiveSession: true,
             capabilities: st.capabilities ?? null,
@@ -1060,7 +1053,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (op === "reopenSessionInBackend") {
           const backendId = anyMsg["backendId"];
           const sessionId = anyMsg["sessionId"];
-          if (typeof backendId !== "string" || !isCodexFamilyBackend(backendId)) {
+          if (
+            typeof backendId !== "string" ||
+            !isCodexFamilyBackend(backendId)
+          ) {
             await respondErr("Invalid backendId.");
             return;
           }
@@ -1072,7 +1068,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await respondErr("Session is not active.");
             return;
           }
-          await vscode.commands.executeCommand("codez.reopenSessionInBackend", {
+          await vscode.commands.executeCommand("codex.reopenSessionInBackend", {
             sessionId: active.id,
             backendId,
           });
@@ -1184,35 +1180,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         if (op === "accountSwitch") {
-          if (sessionBackendId !== "codez") {
+          if (sessionBackendId !== "codex") {
             await respondOk({
               unsupported: true,
               message:
-                "Account creation/switching is supported for codez sessions only. Open a codez session, or reopen this thread in codez.",
+                "Auth profile switching is supported for codex sessions only.",
             });
             return;
           }
 
           const name = anyMsg["name"];
-          const createIfMissing = anyMsg["createIfMissing"];
+          const createIfMissing = anyMsg["createIfMissing"] === true;
           if (typeof name !== "string" || !name.trim()) {
-            await respondErr("Missing account name.");
+            await respondErr("Missing profile name.");
             return;
           }
-          const create =
-            typeof createIfMissing === "boolean" ? createIfMissing : false;
-          const res = await this.onAccountSwitch(active, {
-            name: name.trim(),
-            createIfMissing: create,
-          });
-          const migratedLegacy =
-            res && typeof (res as any).migratedLegacy === "boolean"
-              ? Boolean((res as any).migratedLegacy)
-              : null;
-          await respondOk({
-            activeAccount: name.trim(),
-            migratedLegacy,
-          });
+
+          const res = await vscode.commands.executeCommand(
+            "codex._internal.accountProfileSwitch",
+            {
+              sessionId: active.id,
+              name: name.trim(),
+              createIfMissing,
+            },
+          );
+          await respondOk(res ?? {});
           return;
         }
 
@@ -1249,7 +1241,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (type === "pickWorkspaceColor") {
       const workspaceFolderUri = anyMsg["workspaceFolderUri"];
       if (typeof workspaceFolderUri !== "string" || !workspaceFolderUri) return;
-      await vscode.commands.executeCommand("codez.pickWorkspaceColor", {
+      await vscode.commands.executeCommand("codex.pickWorkspaceColor", {
         workspaceFolderUri,
       });
       return;
@@ -1483,11 +1475,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (type === "approve") {
       const requestKey = anyMsg["requestKey"];
       const decision = anyMsg["decision"];
+      const sessionId = anyMsg["sessionId"];
       if (typeof requestKey !== "string") return;
       if (typeof decision !== "string") return;
-      await vscode.commands.executeCommand("codez.respondApproval", {
+      if (sessionId !== undefined && typeof sessionId !== "string") return;
+      await vscode.commands.executeCommand("codex.respondApproval", {
         requestKey,
         decision,
+        ...(typeof sessionId === "string" ? { sessionId } : {}),
       });
       return;
     }
@@ -1540,7 +1535,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         paths = await this.onFileSearch(sessionId, norm, cancellationToken);
       } catch (err) {
-        console.error("[codez] file search failed:", err);
+        console.error("[codex-ui] file search failed:", err);
         paths = [];
       }
 
@@ -1574,7 +1569,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         agents = await this.onListAgents(sessionId);
       } catch (err) {
-        console.error("[codez] agents list failed:", err);
+        console.error("[codex-ui] agents list failed:", err);
         agents = [];
       }
 
@@ -1602,7 +1597,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         skills = await this.onListSkills(sessionId);
       } catch (err) {
-        console.error("[codez] skills list failed:", err);
+        console.error("[codex-ui] skills list failed:", err);
         skills = [];
       }
 
@@ -1621,7 +1616,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         typeof message === "string"
           ? message + (typeof stack === "string" && stack ? "\n" + stack : "")
           : JSON.stringify(anyMsg, null, 2);
-      console.error("[codez] webview error:", details);
+      console.error("[codex-ui] webview error:", details);
       return;
     }
   }
@@ -2012,7 +2007,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <div class="actions">
           <button id="new">New</button>
           <button id="resume">Resume</button>
-          <button id="reload" title="Reload session (codez only)" disabled>Reload</button>
+          <button id="reload" title="Reload session (codex only)" disabled>Reload</button>
           <button id="settings" class="iconBtn settingsBtn" aria-label="Settings" title="Settings"></button>
         </div>
       </div>

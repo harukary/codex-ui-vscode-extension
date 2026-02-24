@@ -542,7 +542,12 @@ export class OpencodeHttpClient {
         let buf = "";
         for (;;) {
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) {
+            if (!controller.signal.aborted) {
+              onError(new Error("SSE stream closed unexpectedly"));
+            }
+            return;
+          }
           buf += decoder.decode(value, { stream: true });
           for (;;) {
             const next = takeNextSseEvent(buf);

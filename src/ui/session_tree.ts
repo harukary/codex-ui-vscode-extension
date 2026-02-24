@@ -39,7 +39,7 @@ export class SessionTreeDataProvider
         const idx = this.getWorkspaceColorIndex(element.workspaceFolderUri);
         item.iconPath = iconForColorIndex(this.extensionUri, idx);
       }
-      item.contextValue = "codez.folder";
+      item.contextValue = "codex.folder";
       return item;
     }
 
@@ -55,9 +55,9 @@ export class SessionTreeDataProvider
     item.iconPath = iconForColorIndex(this.extensionUri, idx);
     // Put backend + thread id in the same line to avoid an extra backend group row.
     item.description = `${element.session.backendId} ${element.session.threadId}`;
-    item.contextValue = "codez.session";
+    item.contextValue = "codex.session";
     item.command = {
-      command: "codez.openSession",
+      command: "codex.openSession",
       title: "Open Session",
       arguments: [{ sessionId: element.session.id }],
     };

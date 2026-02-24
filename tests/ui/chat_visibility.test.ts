@@ -19,11 +19,11 @@ function makeState(overrides: Partial<ChatViewState>): ChatViewState {
 }
 
 describe("chat_visibility", () => {
-  it("returns true only when active codez session has no loaded blocks", () => {
+  it("returns true only when active codex session has no loaded blocks", () => {
     const state = makeState({
       activeSession: {
         id: "s1",
-        backendId: "codez",
+        backendId: "codex",
         backendKey: "k1",
         workspaceFolderUri: "file:///repo",
         title: "t1",
@@ -34,7 +34,7 @@ describe("chat_visibility", () => {
     expect(shouldAutoReloadOnChatTabVisible(state)).toBe(true);
   });
 
-  it("returns false for codex/opencode sessions", () => {
+  it("returns false for opencode sessions", () => {
     const codexState = makeState({
       activeSession: {
         id: "s1",
@@ -55,14 +55,14 @@ describe("chat_visibility", () => {
         threadId: "th2",
       },
     });
-    expect(shouldAutoReloadOnChatTabVisible(codexState)).toBe(false);
+    expect(shouldAutoReloadOnChatTabVisible(codexState)).toBe(true);
     expect(shouldAutoReloadOnChatTabVisible(opencodeState)).toBe(false);
   });
 
   it("returns false when sending/reloading/loaded", () => {
     const activeSession = {
       id: "s1",
-      backendId: "codez" as const,
+      backendId: "codex" as const,
       backendKey: "k1",
       workspaceFolderUri: "file:///repo",
       title: "t1",

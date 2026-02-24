@@ -40,10 +40,7 @@ import type { GetAccountResponse } from "../generated/v2/GetAccountResponse";
 import type { GetAccountRateLimitsResponse } from "../generated/v2/GetAccountRateLimitsResponse";
 import type { LoginAccountParams } from "../generated/v2/LoginAccountParams";
 import type { LoginAccountResponse } from "../generated/v2/LoginAccountResponse";
-import type { ListAccountsResponse } from "../generated/v2/ListAccountsResponse";
 import type { LogoutAccountResponse } from "../generated/v2/LogoutAccountResponse";
-import type { SwitchAccountParams } from "../generated/v2/SwitchAccountParams";
-import type { SwitchAccountResponse } from "../generated/v2/SwitchAccountResponse";
 import type { SkillsListEntry } from "../generated/v2/SkillsListEntry";
 import type { RemoteSkillSummary } from "../generated/v2/RemoteSkillSummary";
 import type { SkillsRemoteReadResponse } from "../generated/v2/SkillsRemoteReadResponse";
@@ -69,6 +66,7 @@ import {
   resolveCliCommands,
 } from "./command_resolution";
 import { buildOpencodeServeArgs } from "./opencode_command";
+import { computeRollbackNumTurnsForTargetTurn } from "./thread_rollback";
 
 type ModelSettings = {
   model: string | null;
@@ -329,7 +327,7 @@ export class BackendManager implements vscode.Disposable {
       return;
     }
 
-    const cfg = vscode.workspace.getConfiguration("codez", folder.uri);
+    const cfg = vscode.workspace.getConfiguration("codex", folder.uri);
     if (backendId === "opencode") {
       const command = cfg.get<string>("opencode.command") ?? "opencode";
       const args = buildOpencodeServeArgs(cfg.get<string[]>("opencode.args"));
@@ -378,6 +376,36 @@ export class BackendManager implements vscode.Disposable {
             this.output.appendLine(
               `[opencode] event stream error: ${String(err)}`,
             );
+            const current = this.opencode.get(backendKey);
+            if (!current) return;
+            const sessions = this.sessions.list(backendKey);
+            for (const session of sessions) {
+              this.emitNotification(backendKey, session, {
+                method: "error",
+                params: {
+                  error: { message: `OpenCode event stream error: ${String(err)}` },
+                  willRetry: false,
+                },
+              });
+              const activeTurnId =
+                current.activeTurnIdBySession.get(session.threadId) ?? null;
+              if (activeTurnId) {
+                this.emitNotification(backendKey, session, {
+                  method: "turn/completed",
+                  params: {
+                    threadId: session.threadId,
+                    turn: { id: activeTurnId, status: "failed" },
+                  },
+                });
+                this.setActiveTurnState(session.threadId, null);
+                current.activeTurnIdBySession.delete(session.threadId);
+              }
+            }
+            this.disposeOpencodeBackend(backendKey, {
+              reason: "stop",
+              code: null,
+              signal: null,
+            });
           },
         );
 
@@ -500,14 +528,12 @@ export class BackendManager implements vscode.Disposable {
 
     const commands = resolveCliCommands({
       codexCommand: cfg.get<string>("cli.commands.codex"),
-      codezCommand: cfg.get<string>("cli.commands.codez"),
       upstreamCommand: cfg.get<string>("cli.commands.upstream"),
-      mineCommand: cfg.get<string>("cli.commands.mine"),
     });
     const args = cfg.get<string[]>("backend.args");
     const logRpcPayloads = cfg.get<boolean>("debug.logRpcPayloads") ?? false;
 
-    if (!args) throw new Error("Missing configuration: codez.backend.args");
+    if (!args) throw new Error("Missing configuration: codex.backend.args");
 
     const command = resolveBackendStartCommand(backendId, commands);
 
@@ -758,10 +784,14 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
 
-    return await proc.configRead({
-      includeLayers: true,
-      cwd: folder.uri.fsPath,
-    });
+    return await this.withTimeout(
+      "config/read",
+      proc.configRead({
+        includeLayers: true,
+        cwd: folder.uri.fsPath,
+      }),
+      10_000,
+    );
   }
 
   public async writeConfigValueForSession(
@@ -979,10 +1009,14 @@ export class BackendManager implements vscode.Disposable {
     const out: Model[] = [];
     let cursor: string | null = null;
     for (let i = 0; i < 10; i += 1) {
-      const res: ModelListResponse = await proc.listModels({
-        cursor,
-        limit: 200,
-      });
+      const res: ModelListResponse = await this.withTimeout(
+        "model/list",
+        proc.listModels({
+          cursor,
+          limit: 200,
+        }),
+        10_000,
+      );
       out.push(...(res.data ?? []));
       cursor = res.nextCursor;
       if (!cursor) break;
@@ -1081,7 +1115,11 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
 
-    const res = await proc.collaborationModeList({});
+    const res = await this.withTimeout(
+      "collaborationMode/list",
+      proc.collaborationModeList({}),
+      10_000,
+    );
     return res.data ?? [];
   }
 
@@ -1168,7 +1206,7 @@ export class BackendManager implements vscode.Disposable {
       // Clear per-thread caches so the UI can rehydrate from the refreshed thread state.
       this.itemsByThreadId.delete(session.threadId);
       this.latestDiffByThreadId.delete(session.threadId);
-      this.streamState.set(session.threadId, { activeTurnId: null });
+      this.setActiveTurnState(session.threadId, null);
 
       const thread = await this.buildThreadFromOpencodeSession(
         session.threadId,
@@ -1191,7 +1229,7 @@ export class BackendManager implements vscode.Disposable {
     // Clear per-thread caches so the UI can rehydrate from the refreshed thread state.
     this.itemsByThreadId.delete(session.threadId);
     this.latestDiffByThreadId.delete(session.threadId);
-    this.streamState.set(session.threadId, { activeTurnId: null });
+    this.setActiveTurnState(session.threadId, null);
 
     const params: ThreadResumeParams = {
       threadId: session.threadId,
@@ -1287,47 +1325,6 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
     return await proc.accountLoginStart(params);
-  }
-
-  public async listAccounts(session: Session): Promise<ListAccountsResponse> {
-    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
-    if (!folder) {
-      throw new Error(
-        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
-      );
-    }
-    await this.startForBackendId(folder, session.backendId);
-    if (this.opencode.get(session.backendKey)) {
-      throw new Error(
-        "Accounts are not supported when running opencode backend.",
-      );
-    }
-    const proc = this.processes.get(session.backendKey);
-    if (!proc)
-      throw new Error("Backend is not running for this workspace folder");
-    return await proc.accountList();
-  }
-
-  public async switchAccount(
-    session: Session,
-    params: SwitchAccountParams,
-  ): Promise<SwitchAccountResponse> {
-    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
-    if (!folder) {
-      throw new Error(
-        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
-      );
-    }
-    await this.startForBackendId(folder, session.backendId);
-    if (this.opencode.get(session.backendKey)) {
-      throw new Error(
-        "Accounts are not supported when running opencode backend.",
-      );
-    }
-    const proc = this.processes.get(session.backendKey);
-    if (!proc)
-      throw new Error("Backend is not running for this workspace folder");
-    return await proc.accountSwitch(params);
   }
 
   public async logoutAccount(session: Session): Promise<LogoutAccountResponse> {
@@ -1537,7 +1534,7 @@ export class BackendManager implements vscode.Disposable {
       }),
       10_000,
     );
-    this.streamState.set(session.threadId, { activeTurnId: steer.turnId });
+    this.setActiveTurnState(session.threadId, steer.turnId);
   }
 
   public async sendMessageWithModelAndImages(
@@ -1568,7 +1565,7 @@ export class BackendManager implements vscode.Disposable {
 
       const turnId = randomUUID();
       oc.activeTurnIdBySession.set(session.threadId, turnId);
-      this.streamState.set(session.threadId, { activeTurnId: turnId });
+      this.setActiveTurnState(session.threadId, turnId);
       this.emitNotification(session.backendKey, session, {
         method: "turn/started",
         params: { threadId: session.threadId, turn: { id: turnId } },
@@ -1685,7 +1682,7 @@ export class BackendManager implements vscode.Disposable {
             turn: { id: turnId, status: "failed" },
           },
         });
-        this.streamState.set(session.threadId, { activeTurnId: null });
+        this.setActiveTurnState(session.threadId, null);
         oc.activeTurnIdBySession.delete(session.threadId);
         throw err;
       }
@@ -1743,7 +1740,7 @@ export class BackendManager implements vscode.Disposable {
       proc.turnStart(params),
       10_000,
     );
-    this.streamState.set(session.threadId, { activeTurnId: turn.turn.id });
+    this.setActiveTurnState(session.threadId, turn.turn.id);
   }
 
   public async replyOpencodePermission(args: {
@@ -1793,7 +1790,7 @@ export class BackendManager implements vscode.Disposable {
           turn: { id: active, status: "interrupted" },
         },
       });
-      this.streamState.set(session.threadId, { activeTurnId: null });
+      this.setActiveTurnState(session.threadId, null);
       oc.activeTurnIdBySession.delete(session.threadId);
       return;
     }
@@ -1826,7 +1823,7 @@ export class BackendManager implements vscode.Disposable {
       // Clear per-thread caches so the UI can rehydrate from the updated thread state.
       this.itemsByThreadId.delete(session.threadId);
       this.latestDiffByThreadId.delete(session.threadId);
-      this.streamState.set(session.threadId, { activeTurnId: null });
+      this.setActiveTurnState(session.threadId, null);
 
       const threadBefore = await this.buildThreadFromOpencodeSession(
         session.threadId,
@@ -1873,15 +1870,41 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
 
+    const hasNumTurns = typeof args.numTurns === "number";
+    const hasTurnId =
+      typeof args.turnId === "string" && args.turnId.trim().length > 0;
+    if (hasNumTurns === hasTurnId) {
+      throw new Error("Provide either numTurns or turnId for rollback.");
+    }
+
+    let numTurns: number;
+    if (hasNumTurns) {
+      const candidate = Math.trunc(args.numTurns as number);
+      if (!Number.isFinite(candidate) || candidate < 1) {
+        throw new Error(`Invalid numTurns: ${String(args.numTurns)}`);
+      }
+      numTurns = candidate;
+    } else {
+      const targetTurnId = String(args.turnId).trim();
+      const read = await proc.threadRead({
+        threadId: session.threadId,
+        includeTurns: true,
+      });
+      const turns = Array.isArray(read.thread.turns) ? read.thread.turns : [];
+      if (turns.length === 0) {
+        throw new Error("No turns to rewind.");
+      }
+      numTurns = computeRollbackNumTurnsForTargetTurn(turns, targetTurnId);
+    }
+
     // Clear per-thread caches so the UI can rehydrate from the updated thread state.
     this.itemsByThreadId.delete(session.threadId);
     this.latestDiffByThreadId.delete(session.threadId);
-    this.streamState.set(session.threadId, { activeTurnId: null });
+    this.setActiveTurnState(session.threadId, null);
 
     return await proc.threadRollback({
       threadId: session.threadId,
-      turnId: args.turnId ?? null,
-      numTurns: args.numTurns ?? null,
+      numTurns,
     });
   }
 
@@ -2251,7 +2274,7 @@ export class BackendManager implements vscode.Disposable {
         if (!activeTurnIdBySession.get(sessionID)) {
           const turnId = randomUUID();
           activeTurnIdBySession.set(sessionID, turnId);
-          this.streamState.set(sessionID, { activeTurnId: turnId });
+          this.setActiveTurnState(sessionID, turnId);
           this.emitNotification(backendKey, session, {
             method: "turn/started",
             params: { threadId: sessionID, turn: { id: turnId } },
@@ -2307,7 +2330,7 @@ export class BackendManager implements vscode.Disposable {
             },
           });
         }
-        this.streamState.set(sessionID, { activeTurnId: null });
+        this.setActiveTurnState(sessionID, null);
         activeTurnIdBySession.delete(sessionID);
       }
       return;
@@ -2357,7 +2380,7 @@ export class BackendManager implements vscode.Disposable {
                 },
               });
             }
-            this.streamState.set(sessionID, { activeTurnId: null });
+            this.setActiveTurnState(sessionID, null);
             activeTurnIdBySession.delete(sessionID);
           }
         }
@@ -3160,6 +3183,10 @@ export class BackendManager implements vscode.Disposable {
     }
   }
 
+  private setActiveTurnState(threadId: string, turnId: string | null): void {
+    this.streamState.set(threadId, { activeTurnId: turnId });
+  }
+
   private onServerNotification(
     backendKey: string,
     n: AnyServerNotification,
@@ -3187,11 +3214,11 @@ export class BackendManager implements vscode.Disposable {
       this.output.appendLine(
         `[turn] completed: status=${p.turn.status} turnId=${p.turn.id}`,
       );
-      this.streamState.set(p.threadId, { activeTurnId: null });
+      this.setActiveTurnState(p.threadId, null);
 
-      const session = this.sessions.getByThreadId(backendKey, p.threadId);
-      if (session) {
-        this.onTurnCompleted?.(session, p.turn.status, p.turn.id);
+      const completedSession = this.sessions.getByThreadId(backendKey, p.threadId);
+      if (completedSession) {
+        this.onTurnCompleted?.(completedSession, p.turn.status, p.turn.id);
       }
       return;
     }
@@ -3466,33 +3493,36 @@ export class BackendManager implements vscode.Disposable {
     }
     if (this.opencodeServerInFlight) return await this.opencodeServerInFlight;
 
-    const start = withInFlightReset((async () => {
-      const proc = await OpencodeServerProcess.spawn({
-        command: args.command,
-        args: args.args,
-        cwd: args.folder.uri.fsPath,
-        output: this.output,
-      });
-      const server = { proc, command: args.command, args: [...args.args] };
+    const start = withInFlightReset(
+      (async () => {
+        const proc = await OpencodeServerProcess.spawn({
+          command: args.command,
+          args: args.args,
+          cwd: args.folder.uri.fsPath,
+          output: this.output,
+        });
+        const server = { proc, command: args.command, args: [...args.args] };
 
-      proc.onDidExit(({ code, signal }) => {
-        // Shared opencode server died unexpectedly. Tear down every per-workspace SSE stream.
-        const backendKeys = [...this.opencode.keys()];
-        for (const backendKey of backendKeys) {
-          this.disposeOpencodeBackend(backendKey, {
-            reason: "exit",
-            code,
-            signal,
-          });
-        }
-        this.disposeOpencodeServerIfRunning();
-      });
+        proc.onDidExit(({ code, signal }) => {
+          // Shared opencode server died unexpectedly. Tear down every per-workspace SSE stream.
+          const backendKeys = [...this.opencode.keys()];
+          for (const backendKey of backendKeys) {
+            this.disposeOpencodeBackend(backendKey, {
+              reason: "exit",
+              code,
+              signal,
+            });
+          }
+          this.disposeOpencodeServerIfRunning();
+        });
 
-      this.opencodeServer = server;
-      return server;
-    })(), () => {
-      this.opencodeServerInFlight = null;
-    });
+        this.opencodeServer = server;
+        return server;
+      })(),
+      () => {
+        this.opencodeServerInFlight = null;
+      },
+    );
 
     this.opencodeServerInFlight = start;
     return await start;

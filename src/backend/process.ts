@@ -35,6 +35,8 @@ import type { ThreadUnarchiveParams } from "../generated/v2/ThreadUnarchiveParam
 import type { ThreadUnarchiveResponse } from "../generated/v2/ThreadUnarchiveResponse";
 import type { ThreadRollbackParams } from "../generated/v2/ThreadRollbackParams";
 import type { ThreadRollbackResponse } from "../generated/v2/ThreadRollbackResponse";
+import type { ThreadReadParams } from "../generated/v2/ThreadReadParams";
+import type { ThreadReadResponse } from "../generated/v2/ThreadReadResponse";
 import type { ThreadListParams } from "../generated/v2/ThreadListParams";
 import type { ThreadListResponse } from "../generated/v2/ThreadListResponse";
 import type { AppsListParams } from "../generated/v2/AppsListParams";
@@ -48,10 +50,7 @@ import type { GetAccountRateLimitsResponse } from "../generated/v2/GetAccountRat
 import type { GetAccountResponse } from "../generated/v2/GetAccountResponse";
 import type { LoginAccountParams } from "../generated/v2/LoginAccountParams";
 import type { LoginAccountResponse } from "../generated/v2/LoginAccountResponse";
-import type { ListAccountsResponse } from "../generated/v2/ListAccountsResponse";
 import type { LogoutAccountResponse } from "../generated/v2/LogoutAccountResponse";
-import type { SwitchAccountParams } from "../generated/v2/SwitchAccountParams";
-import type { SwitchAccountResponse } from "../generated/v2/SwitchAccountResponse";
 import type { CommandExecutionApprovalDecision } from "../generated/v2/CommandExecutionApprovalDecision";
 import type { FileChangeApprovalDecision } from "../generated/v2/FileChangeApprovalDecision";
 import type { CommandExecutionRequestApprovalResponse } from "../generated/v2/CommandExecutionRequestApprovalResponse";
@@ -131,7 +130,7 @@ export class BackendProcess implements vscode.Disposable {
       env: process.env,
     });
 
-    const cfg = vscode.workspace.getConfiguration("codez");
+    const cfg = vscode.workspace.getConfiguration("codex");
     const approvalsDefaultDecision =
       cfg.get<"prompt" | "decline" | "cancel">("approvals.defaultDecision") ??
       "prompt";
@@ -237,6 +236,13 @@ export class BackendProcess implements vscode.Disposable {
     });
   }
 
+  public async threadRead(params: ThreadReadParams): Promise<ThreadReadResponse> {
+    return this.rpc.request<ThreadReadResponse>({
+      method: "thread/read",
+      params,
+    });
+  }
+
   public async threadList(
     params: Partial<ThreadListParams> | undefined = undefined,
   ): Promise<ThreadListResponse> {
@@ -293,12 +299,10 @@ export class BackendProcess implements vscode.Disposable {
   }
 
   public async turnSteer(params: TurnSteerParams): Promise<TurnSteerResponse> {
-    return this.rpc.request<TurnSteerResponse>(
-      {
-        method: "turn/steer",
-        params,
-      } as any,
-    );
+    return this.rpc.request<TurnSteerResponse>({
+      method: "turn/steer",
+      params,
+    } as any);
   }
 
   public async turnInterrupt(
@@ -385,23 +389,6 @@ export class BackendProcess implements vscode.Disposable {
       params,
     });
   }
-
-  public async accountList(): Promise<ListAccountsResponse> {
-    return this.rpc.request<ListAccountsResponse>({
-      method: "account/list",
-      params: undefined,
-    });
-  }
-
-  public async accountSwitch(
-    params: SwitchAccountParams,
-  ): Promise<SwitchAccountResponse> {
-    return this.rpc.request<SwitchAccountResponse>({
-      method: "account/switch",
-      params,
-    });
-  }
-
   public async accountLogout(): Promise<LogoutAccountResponse> {
     return this.rpc.request<LogoutAccountResponse>({
       method: "account/logout",
@@ -432,7 +419,7 @@ export class BackendProcess implements vscode.Disposable {
   private async initializeHandshake(): Promise<void> {
     const params: InitializeParams = {
       clientInfo: {
-        name: "codez-vscode",
+        name: "codex-ui-vscode",
         title: "Codex UI VS Code Extension",
         version: "0.0.1",
       },

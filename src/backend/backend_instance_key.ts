@@ -36,13 +36,9 @@ export function parseBackendInstanceKey(key: string): {
       "Invalid backend instance key: workspaceFolderUri must be a non-empty string",
     );
   }
-  if (
-    backendId !== "codex" &&
-    backendId !== "codez" &&
-    backendId !== "opencode"
-  ) {
+  if (backendId !== "codex" && backendId !== "opencode") {
     throw new Error(
-      "Invalid backend instance key: backendId must be codex|codez|opencode",
+      "Invalid backend instance key: backendId must be codex|opencode",
     );
   }
   return { workspaceFolderUri, backendId };

@@ -19,12 +19,12 @@ describe("package.json keybindings", () => {
     const pkg = JSON.parse(raw) as PackageJson;
     const keybindings = pkg.contributes?.keybindings ?? [];
     const modeSwitch = keybindings.find(
-      (entry) => entry.command === "codez.cycleCollaborationMode",
+      (entry) => entry.command === "codex.cycleCollaborationMode",
     );
     expect(modeSwitch).toEqual({
-      command: "codez.cycleCollaborationMode",
+      command: "codex.cycleCollaborationMode",
       key: "shift+tab",
-      when: "view == codez.chatView",
+      when: "view == codex.chatView",
     });
     expect(modeSwitch?.key?.toLowerCase()).not.toContain("ctrl+shift");
   });

@@ -16,9 +16,9 @@ export function decideLoadHistoryPostHydrationAction(args: {
 }
 
 export function shouldForceLoadHistoryForRewind(args: {
-  backendId: "codex" | "codez" | "opencode";
+  backendId: "codex" | "opencode";
   hasUserBlockWithoutTurnId: boolean;
 }): boolean {
   if (!args.hasUserBlockWithoutTurnId) return false;
-  return args.backendId === "codez" || args.backendId === "opencode";
+  return args.backendId === "codex" || args.backendId === "opencode";
 }

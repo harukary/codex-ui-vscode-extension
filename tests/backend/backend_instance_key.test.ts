@@ -7,10 +7,10 @@ import {
 
 describe("backend_instance_key", () => {
   it("round-trips workspace uri and backend id", () => {
-    const key = makeBackendInstanceKey("file:///repo", "codez");
+    const key = makeBackendInstanceKey("file:///repo", "codex");
     expect(parseBackendInstanceKey(key)).toEqual({
       workspaceFolderUri: "file:///repo",
-      backendId: "codez",
+      backendId: "codex",
     });
   });
 
@@ -19,10 +19,6 @@ describe("backend_instance_key", () => {
       parseBackendInstanceKey(makeBackendInstanceKey("file:///r1", "codex"))
         .backendId,
     ).toBe("codex");
-    expect(
-      parseBackendInstanceKey(makeBackendInstanceKey("file:///r2", "codez"))
-        .backendId,
-    ).toBe("codez");
     expect(
       parseBackendInstanceKey(makeBackendInstanceKey("file:///r3", "opencode"))
         .backendId,
@@ -37,6 +33,6 @@ describe("backend_instance_key", () => {
       .toThrow("expected [workspaceFolderUri, backendId]");
     expect(() =>
       parseBackendInstanceKey(JSON.stringify(["file:///repo", "other"])),
-    ).toThrow("backendId must be codex|codez|opencode");
+    ).toThrow("backendId must be codex|opencode");
   });
 });

@@ -21,7 +21,7 @@ type Session = {
   title: string;
   customTitle?: boolean;
   workspaceFolderUri: string;
-  backendId?: "codex" | "codez" | "opencode";
+  backendId?: "codex" | "opencode";
 };
 type ModelState = {
   model: string | null;
@@ -231,6 +231,7 @@ type ChatViewState = {
   collaborationModeLabel?: string | null;
   approvals: Array<{
     requestKey: string;
+    sessionId: string;
     title: string;
     detail: string;
     canAcceptForSession: boolean;
@@ -1375,7 +1376,7 @@ function main(): void {
   let settingsBusy = false;
   let settingsLastActiveSessionId: string | null = null;
   // Active session backend (tab-scoped).
-  let settingsSessionBackendId: "codex" | "codez" | "opencode" | null = null;
+  let settingsSessionBackendId: "codex" | "opencode" | null = null;
   let settingsActiveAccount: string | null = null;
   let settingsSelectedAccount: string | null = null;
   let settingsAuthAccount: { type: string; [key: string]: unknown } | null =
@@ -1505,8 +1506,8 @@ function main(): void {
       help.className = "settingsHelp";
       help.textContent =
         settingsSessionBackendId === "opencode"
-          ? "opencode history is not compatible with codex/codez, so this session cannot be carried over to codex/codez."
-          : "codex and codez share a compatible history format, so you can reopen this thread in either codex or codez (but not in opencode).";
+          ? "opencode history is not compatible with codex, so this session cannot be carried over to codex."
+          : "codex history is not compatible with opencode, so this session cannot be carried over to opencode.";
       sectionSession.appendChild(help);
 
       const actions = document.createElement("div");
@@ -1515,44 +1516,6 @@ function main(): void {
       left.className = "settingsBtnGroup";
       const right = document.createElement("div");
       right.className = "settingsBtnGroup";
-
-      if (settingsSessionBackendId === "codex") {
-        const btn = document.createElement("button");
-        btn.className = "settingsBtn";
-        btn.textContent = "Open in codez";
-        btn.disabled = settingsBusy;
-        btn.addEventListener("click", async () => {
-          if (!state.activeSession) return;
-          settingsBusy = true;
-          renderSettings();
-          const res = await settingsRequest("reopenSessionInBackend", {
-            sessionId: state.activeSession.id,
-            backendId: "codez",
-          });
-          settingsBusy = false;
-          if (!res.ok) showToast("error", res.error);
-          renderSettings();
-        });
-        left.appendChild(btn);
-      } else if (settingsSessionBackendId === "codez") {
-        const btn = document.createElement("button");
-        btn.className = "settingsBtn";
-        btn.textContent = "Open in codex";
-        btn.disabled = settingsBusy;
-        btn.addEventListener("click", async () => {
-          if (!state.activeSession) return;
-          settingsBusy = true;
-          renderSettings();
-          const res = await settingsRequest("reopenSessionInBackend", {
-            sessionId: state.activeSession.id,
-            backendId: "codex",
-          });
-          settingsBusy = false;
-          if (!res.ok) showToast("error", res.error);
-          renderSettings();
-        });
-        left.appendChild(btn);
-      }
 
       const newBtn = document.createElement("button");
       newBtn.className = "settingsBtn primary";
@@ -1584,7 +1547,7 @@ function main(): void {
       const acctRow = document.createElement("div");
       acctRow.className = "settingsRow";
       const activeText = document.createElement("div");
-      const accountsSwitchSupported = settingsSessionBackendId === "codez";
+      const accountsSwitchSupported = settingsSessionBackendId === "codex";
       if (accountsSwitchSupported) {
         activeText.textContent = settingsActiveAccount
           ? `Active: ${settingsActiveAccount}`
@@ -1613,7 +1576,7 @@ function main(): void {
         const msg = document.createElement("div");
         msg.className = "settingsHelp";
         msg.textContent =
-          "Account creation/switching is supported for codez sessions only.";
+          "Auth profile switching is available on codex sessions only.";
         sectionAcct.appendChild(msg);
       }
 
@@ -1697,21 +1660,15 @@ function main(): void {
               const msg =
                 typeof (res.data as any).message === "string"
                   ? String((res.data as any).message)
-                  : "Account creation/switching is supported when codez is selected.";
+                  : "Auth profile switching is available on codex sessions only.";
               showToast("info", msg, 4000);
               renderSettings();
               return;
             }
 
-            const migratedLegacy =
-              res.data &&
-              typeof (res.data as any).migratedLegacy === "boolean" &&
-              Boolean((res.data as any).migratedLegacy);
             showToast(
               "success",
-              migratedLegacy
-                ? `Switched to ${settingsSelectedAccount} (migrated legacy auth).`
-                : `Switched to ${settingsSelectedAccount}.`,
+              `Switched to auth profile '${settingsSelectedAccount}'.`,
             );
             await loadSettings();
           } else {
@@ -1750,7 +1707,7 @@ function main(): void {
         createRow.className = "settingsRow";
         const createInput = document.createElement("input");
         createInput.className = "settingsInput grow";
-        createInput.placeholder = "new-account-name";
+        createInput.placeholder = "new-profile-name";
         createInput.addEventListener("input", () => {
           const v = createInput.value;
           const err = validateAccountName(v);
@@ -1758,7 +1715,7 @@ function main(): void {
         });
         const createBtn = document.createElement("button");
         createBtn.className = "settingsBtn primary";
-        createBtn.textContent = "Create & Switch";
+        createBtn.textContent = "Save Profile";
         createBtn.disabled = settingsBusy;
         createBtn.addEventListener("click", async () => {
           const name = createInput.value.trim();
@@ -1783,22 +1740,13 @@ function main(): void {
               const msg =
                 typeof (res.data as any).message === "string"
                   ? String((res.data as any).message)
-                  : "Account creation/switching is supported when codez is selected.";
-                showToast("info", msg, 4000);
-                renderSettings();
-                return;
-              }
+                  : "Auth profile switching is available on codex sessions only.";
+              showToast("info", msg, 4000);
+              renderSettings();
+              return;
+            }
 
-            const migratedLegacy =
-              res.data &&
-              typeof (res.data as any).migratedLegacy === "boolean" &&
-              Boolean((res.data as any).migratedLegacy);
-            showToast(
-              "success",
-              migratedLegacy
-                ? `Created and switched to ${name} (migrated legacy auth).`
-                : `Created and switched to ${name}.`,
-            );
+            showToast("success", `Saved current auth as profile '${name}'.`);
             await loadSettings();
           } else {
             showToast("error", res.error);
@@ -1813,7 +1761,7 @@ function main(): void {
       const help = document.createElement("div");
       help.className = "settingsHelp";
       help.textContent =
-        "Account names: [A-Za-z0-9_-], 1..64 chars\nLogout logs out the active account only.";
+        "Profile names: [A-Za-z0-9_-], 1..64 chars\nSave Profile snapshots current auth. Logout logs out active auth only.";
       sectionAcct.appendChild(help);
 
       const sectionLogin = document.createElement("div");
@@ -1827,8 +1775,8 @@ function main(): void {
       loginRow.className = "settingsRow";
       const loginInfo = document.createElement("div");
       loginInfo.textContent = settingsActiveAccount
-        ? `Active account: ${settingsActiveAccount}`
-        : "Active account: (none) (legacy auth)";
+        ? `Active profile: ${settingsActiveAccount}`
+        : "Active profile: (none)";
       loginRow.appendChild(loginInfo);
       sectionLogin.appendChild(loginRow);
 
@@ -2216,7 +2164,6 @@ function main(): void {
     const data = res.data as any;
     settingsSessionBackendId =
       data?.sessionBackendId === "codex" ||
-      data?.sessionBackendId === "codez" ||
       data?.sessionBackendId === "opencode"
         ? data.sessionBackendId
         : (state.activeSession?.backendId ?? null);
@@ -2387,8 +2334,7 @@ function main(): void {
       imgEl.removeAttribute("src");
       imgEl.style.cursor = "pointer";
       const caption = (imageRef.caption || "").trim();
-      captionEl.textContent =
-        caption || "Image is offloaded (click to load)";
+      captionEl.textContent = caption || "Image is offloaded (click to load)";
       captionEl.style.display = "";
       imgEl.addEventListener(
         "click",
@@ -2537,7 +2483,7 @@ function main(): void {
     {
       insert: "/agents ",
       label: "/agents",
-      detail: "Browse agents (codez)",
+      detail: "Browse agents (codex)",
       kind: "slash",
     },
     { insert: "/help ", label: "/help", detail: "Show help", kind: "slash" },
@@ -2546,7 +2492,7 @@ function main(): void {
   function buildSlashSuggestions(): SuggestItem[] {
     const agents = state.capabilities?.agents ?? false;
     const base =
-      state.activeSession?.backendId === "codez"
+      state.activeSession?.backendId === "codex"
         ? baseSlashSuggestions
         : ([] as const);
     const ui = agents
@@ -3985,9 +3931,7 @@ function main(): void {
     }
     if (diffBtn) diffBtn.disabled = !s.hasLatestDiff;
     const canSteer =
-      Boolean(s.activeSession) &&
-      s.sending &&
-      (backendId === "codez" || backendId === "codex");
+      Boolean(s.activeSession) && s.sending && backendId === "codex";
     sendBtn.disabled = !s.activeSession;
     sendBtn.dataset.mode = s.sending ? "stop" : "send";
     sendBtn.setAttribute("aria-label", s.sending ? "Stop" : "Send");
@@ -3996,22 +3940,27 @@ function main(): void {
     steerSendBtn.disabled = !canSteer;
     steerSendBtn.title = canSteer
       ? "Send to the current running turn"
-      : "Steer is available for codez/codex running turns only";
+      : "Steer is available for codex running turns only";
     queueSendBtn.disabled = !s.activeSession || !s.sending;
     if (statusBtn) statusBtn.disabled = !s.activeSession || s.sending;
     resumeBtn.disabled = s.sending;
     attachBtn.disabled = !s.activeSession || !allowsImageInputs(s);
     reloadBtn.disabled =
-      !s.activeSession || s.sending || s.reloading || backendId !== "codez";
+      !s.activeSession || s.sending || s.reloading || backendId !== "codex";
     reloadBtn.title =
-      backendId === "codez"
+      backendId === "codex"
         ? "Reload session (re-read config.toml, agents, etc.)"
-        : "Reload session (codez sessions only)";
+        : "Reload session (codex sessions only)";
     settingsBtn.disabled = false;
     settingsBtn.title = backendId
       ? `Settings (session backend: ${backendId})`
       : "Settings";
-    if (backendId !== "codez" && backendId !== "opencode" && rewindTarget !== null) setEditMode(null);
+    if (
+      backendId !== "codex" &&
+      backendId !== "opencode" &&
+      rewindTarget !== null
+    )
+      setEditMode(null);
     // Keep input enabled so the user can draft messages even before selecting a session,
     // Sending is still guarded by sendBtn.disabled and sendCurrentInput().
     inputEl.disabled = false;
@@ -4092,7 +4041,8 @@ function main(): void {
       .join("\n");
 
     const sig = `${overridesSig}\n${nextTabsSig}`;
-    const isDraggingTabs = draggingWorkspaceUri !== null || draggingSession !== null;
+    const isDraggingTabs =
+      draggingWorkspaceUri !== null || draggingSession !== null;
 
     if (isDraggingTabs) {
       // If we rebuild the tab DOM while a drag is in progress, Chromium cancels the drag operation.
@@ -4417,6 +4367,7 @@ function main(): void {
           btnAccept.addEventListener("click", () =>
             vscode.postMessage({
               type: "approve",
+              sessionId: ap.sessionId,
               requestKey: ap.requestKey,
               decision: "accept",
             }),
@@ -4429,6 +4380,7 @@ function main(): void {
             btnAcceptSession.addEventListener("click", () =>
               vscode.postMessage({
                 type: "approve",
+                sessionId: ap.sessionId,
                 requestKey: ap.requestKey,
                 decision: "acceptForSession",
               }),
@@ -4441,6 +4393,7 @@ function main(): void {
           btnDecline.addEventListener("click", () => {
             vscode.postMessage({
               type: "approve",
+              sessionId: ap.sessionId,
               requestKey: ap.requestKey,
               decision: "decline",
             });
@@ -4453,6 +4406,7 @@ function main(): void {
           btnCancel.addEventListener("click", () => {
             vscode.postMessage({
               type: "approve",
+              sessionId: ap.sessionId,
               requestKey: ap.requestKey,
               decision: "cancel",
             });
@@ -4828,8 +4782,10 @@ function main(): void {
           const turnId =
             typeof block.turnId === "string" ? block.turnId.trim() : "";
           const canEdit =
-            (backendId === "codez" || backendId === "opencode") && Boolean(turnId);
-          const isSteerInSameTurn = Boolean(turnId) && turnId === lastUserTurnId;
+            (backendId === "codex" || backendId === "opencode") &&
+            Boolean(turnId);
+          const isSteerInSameTurn =
+            Boolean(turnId) && turnId === lastUserTurnId;
           if (isSteerInSameTurn) {
             // keep current index
           } else {
@@ -4885,7 +4841,7 @@ function main(): void {
           editBtn.disabled = Boolean(state.sending);
           editBtn.title = canEdit
             ? "Edit this turn (rewind)"
-            : "Edit (codez/opencode sessions only)";
+            : "Edit (codex/opencode sessions only)";
           editBtn.addEventListener("click", () => {
             if (state.sending) return;
             if (!canEdit) {
@@ -5537,11 +5493,11 @@ function main(): void {
     presetText?: string,
   ): void {
     const backendId = state.activeSession?.backendId ?? null;
-    const canEdit = backendId === "codez" || backendId === "opencode";
+    const canEdit = backendId === "codex" || backendId === "opencode";
     if (next !== null && !canEdit) {
       showToast(
         "info",
-        "Edit/Rewind is supported for codez/opencode sessions only.",
+        "Edit/Rewind is supported for codex/opencode sessions only.",
       );
       return;
     }
@@ -5591,7 +5547,7 @@ function main(): void {
   function dispatchCurrentInput(mode: "send" | "queue" | "steer"): void {
     if (!state.activeSession) return;
     const backendId = state.activeSession.backendId;
-    const canEdit = backendId === "codez" || backendId === "opencode";
+    const canEdit = backendId === "codex" || backendId === "opencode";
     const text = inputEl.value;
     const trimmed = text.trim();
     if (!trimmed && pendingImages.length === 0) return;
@@ -5609,9 +5565,9 @@ function main(): void {
           : "queueSend"
         : mode === "steer"
           ? "steer"
-        : pendingImages.length > 0
-          ? "sendWithImages"
-          : "send";
+          : pendingImages.length > 0
+            ? "sendWithImages"
+            : "send";
     const rewindPayload =
       mode === "steer"
         ? null
@@ -5799,8 +5755,8 @@ function main(): void {
     true,
   );
 
-    attachBtn.addEventListener("click", () => {
-      if (!allowsImageInputs(state)) {
+  attachBtn.addEventListener("click", () => {
+    if (!allowsImageInputs(state)) {
       showToast("info", "The selected model does not support image inputs.");
       return;
     }
@@ -5838,8 +5794,8 @@ function main(): void {
       ? undefined
       : (() => {
           const backendId = state.activeSession?.backendId ?? null;
-          if (backendId !== "codez") {
-            showToast("info", "Reload is supported for codez sessions only.");
+          if (backendId !== "codex") {
+            showToast("info", "Reload is supported for codex sessions only.");
             return;
           }
           vscode.postMessage({ type: "reloadSession" });
@@ -6279,17 +6235,12 @@ function main(): void {
       const block = anyMsg.block as ChatBlock;
       const insertBeforeRaw = (anyMsg as any).insertBeforeBlockId;
       const insertBeforeBlockId =
-        typeof insertBeforeRaw === "string"
-          ? insertBeforeRaw
-          : null;
+        typeof insertBeforeRaw === "string" ? insertBeforeRaw : null;
       if (!block || typeof (block as any).id !== "string") return;
       const blocks = state.blocks || [];
       const idx = blocks.findIndex((b) => b && b.id === (block as any).id);
       if (idx >= 0) blocks[idx] = block;
-      else if (
-        insertBeforeBlockId &&
-        insertBeforeBlockId !== block.id
-      ) {
+      else if (insertBeforeBlockId && insertBeforeBlockId !== block.id) {
         const beforeIdx = blocks.findIndex(
           (b) => b && b.id === insertBeforeBlockId,
         );
