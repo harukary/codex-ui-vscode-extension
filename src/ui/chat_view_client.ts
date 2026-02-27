@@ -235,6 +235,23 @@ type ChatViewState = {
     title: string;
     detail: string;
     canAcceptForSession: boolean;
+    actions?: Array<{
+      id: string;
+      label: string;
+      decision:
+        | "accept"
+        | "acceptForSession"
+        | "decline"
+        | "cancel"
+        | {
+            applyNetworkPolicyAmendment: {
+              network_policy_amendment: {
+                host: string;
+                action: "allow" | "deny";
+              };
+            };
+          };
+    }>;
   }>;
   approvalSessionIds?: string[];
   customPrompts?: Array<{
@@ -4342,6 +4359,7 @@ function main(): void {
               ap.canAcceptForSession ? "s" : "",
               ap.title,
               ap.detail,
+              JSON.stringify(ap.actions || []),
             ].join("\t"),
           )
           .join("\n")
@@ -4413,6 +4431,24 @@ function main(): void {
             vscode.postMessage({ type: "stop" });
           });
           actions.appendChild(btnCancel);
+
+          for (const extra of ap.actions || []) {
+            const label =
+              typeof extra.label === "string" && extra.label.trim()
+                ? extra.label
+                : "Apply";
+            const btnExtra = document.createElement("button");
+            btnExtra.textContent = label;
+            btnExtra.addEventListener("click", () => {
+              vscode.postMessage({
+                type: "approve",
+                sessionId: ap.sessionId,
+                requestKey: ap.requestKey,
+                decision: extra.decision,
+              });
+            });
+            actions.appendChild(btnExtra);
+          }
 
           card.appendChild(actions);
           approvalsEl.appendChild(card);
@@ -6646,7 +6682,7 @@ function main(): void {
       "u",
     );
     if (explicitFileRefRe.test(decoded)) {
-      const normalized = decoded.replace(/^\/+/, "");
+      const normalized = decoded;
       const cwd = (a.closest("[data-cwd]") as HTMLElement | null)?.getAttribute(
         "data-cwd",
       );
@@ -6663,15 +6699,13 @@ function main(): void {
     const scheme = schemeMatch ? schemeMatch[1]?.toLowerCase() : null;
     if (scheme) {
       if (scheme === "file") {
-        const without = decoded.replace(/^file:(\/\/)?/, "");
-        const normalized = without.replace(/^\/+/, "");
         const cwd = (
           a.closest("[data-cwd]") as HTMLElement | null
         )?.getAttribute("data-cwd");
         e.preventDefault();
         vscode.postMessage({
           type: "openFile",
-          path: normalized,
+          uri: decoded,
           cwd: cwd || null,
         });
         return;
@@ -6682,8 +6716,9 @@ function main(): void {
       return;
     }
 
-    // Treat "/path" as workspace-root relative (GitHub-style links).
-    const normalized = decoded.replace(/^\/+/, "");
+    // Keep the raw decoded path.
+    // The extension host resolves relative paths and also supports absolute ones.
+    const normalized = decoded;
     const cwd = (a.closest("[data-cwd]") as HTMLElement | null)?.getAttribute(
       "data-cwd",
     );

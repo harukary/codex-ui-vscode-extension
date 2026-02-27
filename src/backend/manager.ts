@@ -1,7 +1,12 @@
 import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { BackendProcess, type BackendExitInfo } from "./process";
+import {
+  BackendProcess,
+  type BackendExitInfo,
+  type ExperimentalFeatureEntry,
+  type ExperimentalFeatureListResponse,
+} from "./process";
 import { OpencodeServerProcess } from "./opencode_process";
 import {
   OpencodeHttpClient,
@@ -49,6 +54,7 @@ import type { ConfigReadResponse } from "../generated/v2/ConfigReadResponse";
 import type { ConfigValueWriteParams } from "../generated/v2/ConfigValueWriteParams";
 import type { ConfigWriteResponse } from "../generated/v2/ConfigWriteResponse";
 import type { Thread } from "../generated/v2/Thread";
+import type { ThreadSetNameResponse } from "../generated/v2/ThreadSetNameResponse";
 import type { ThreadSourceKind } from "../generated/v2/ThreadSourceKind";
 import type { Turn } from "../generated/v2/Turn";
 import type { AppInfo } from "../generated/v2/AppInfo";
@@ -75,6 +81,15 @@ type ModelSettings = {
   agent?: string | null;
   personality?: Personality | null;
   collaborationMode?: CollaborationMode | null;
+};
+
+type NetworkPolicyApprovalDecision = {
+  applyNetworkPolicyAmendment: {
+    network_policy_amendment: {
+      host: string;
+      action: "allow" | "deny";
+    };
+  };
 };
 
 function imageMimeFromPath(filePath: string): string | null {
@@ -651,13 +666,19 @@ export class BackendManager implements vscode.Disposable {
       experimentalRawEvents: false,
     };
     const res = await proc.threadStart(params);
+    const rawName = (res.thread as unknown as Record<string, unknown>)["name"];
+    const threadName =
+      typeof rawName === "string" ? rawName.trim() : "";
+    const threadPreview = String(res.thread.preview ?? "").trim();
+    const initialTitle = threadName || threadPreview || folder.name;
 
     const session: Session = {
       id: randomUUID(),
       backendKey,
       backendId,
       workspaceFolderUri: folder.uri.toString(),
-      title: folder.name,
+      title: initialTitle,
+      customTitle: threadName.length > 0,
       threadId: res.thread.id,
       personality: modelSettings?.personality ?? null,
       collaborationModePresetName: null,
@@ -973,6 +994,8 @@ export class BackendManager implements vscode.Disposable {
       sortKey?: "created_at" | "updated_at" | null;
       sourceKinds?: ThreadSourceKind[] | null;
       archived?: boolean | null;
+      cwd?: string | null;
+      searchTerm?: string | null;
     },
   ): Promise<{ data: Thread[]; nextCursor: string | null }> {
     const backendKey = makeBackendInstanceKey(folder.uri.toString(), backendId);
@@ -980,13 +1003,20 @@ export class BackendManager implements vscode.Disposable {
     const oc = this.opencode.get(backendKey);
     if (oc) {
       const sessions = await oc.client.listSessions();
+      const wantedCwd = String(opts?.cwd ?? folder.uri.fsPath).trim();
+      const searchTerm = String(opts?.searchTerm ?? "").trim();
       const threads = sessions
-        .filter(
-          (s) =>
-            typeof s?.directory === "string" &&
-            s.directory === folder.uri.fsPath,
-        )
-        .map((s) => this.threadFromOpencodeSession(s));
+        .filter((s) => {
+          if (typeof s?.directory !== "string") return false;
+          if (wantedCwd && s.directory !== wantedCwd) return false;
+          return true;
+        })
+        .map((s) => this.threadFromOpencodeSession(s))
+        .filter((t) => {
+          if (!searchTerm) return true;
+          const preview = String(t.preview ?? "");
+          return preview.includes(searchTerm);
+        });
       // NOTE: no pagination cursor support for now; return everything.
       return { data: threads, nextCursor: null };
     }
@@ -994,15 +1024,52 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
 
-    const res = await proc.threadList({
+    const listParams: any = {
       cursor: opts?.cursor ?? null,
       limit: opts?.limit ?? null,
       sortKey: opts?.sortKey ?? null,
       modelProviders: opts?.modelProviders ?? null,
       sourceKinds: opts?.sourceKinds ?? null,
       archived: opts?.archived ?? null,
-    });
+      cwd: opts?.cwd ?? null,
+      searchTerm: opts?.searchTerm ?? null,
+    };
+    const res = await proc.threadList(listParams);
     return { data: res.data ?? [], nextCursor: res.nextCursor ?? null };
+  }
+
+  public async listExperimentalFeaturesForSession(
+    session: Session,
+  ): Promise<ExperimentalFeatureEntry[]> {
+    if (session.backendId === "opencode") return [];
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    const out: ExperimentalFeatureEntry[] = [];
+    let cursor: string | null = null;
+    for (let i = 0; i < 10; i += 1) {
+      const res: ExperimentalFeatureListResponse = await this.withTimeout(
+        "experimentalFeature/list",
+        proc.experimentalFeatureList({
+          cursor,
+          limit: 200,
+        }),
+        10_000,
+      );
+      out.push(...(res.data ?? []));
+      cursor = res.nextCursor ?? null;
+      if (!cursor) break;
+    }
+    return out;
   }
 
   private async fetchAllModels(proc: BackendProcess): Promise<Model[]> {
@@ -1187,6 +1254,47 @@ export class BackendManager implements vscode.Disposable {
       personality: null,
     };
     return await proc.threadResume(params);
+  }
+
+  public async setThreadNameForSession(
+    session: Session,
+    name: string,
+  ): Promise<Thread> {
+    if (session.backendId === "opencode") {
+      throw new Error("thread/name/set is not supported on opencode backend");
+    }
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Thread name cannot be empty.");
+
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    const _setNameRes: ThreadSetNameResponse = await this.withTimeout(
+      "thread/name/set",
+      proc.threadSetName({
+        threadId: session.threadId,
+        name: trimmed,
+      }),
+      10_000,
+    );
+    const read = await this.withTimeout(
+      "thread/read",
+      proc.threadRead({
+        threadId: session.threadId,
+        includeTurns: false,
+      }),
+      10_000,
+    );
+    return read.thread;
   }
 
   public async reloadSession(
@@ -3353,6 +3461,17 @@ export class BackendManager implements vscode.Disposable {
         : null) ??
       (typeof o["thread_id"] === "string" ? (o["thread_id"] as string) : null);
 
+    const resolveSession = (id: string): Session | null => {
+      const direct = this.sessions.getByThreadId(backendKey, id);
+      if (direct) return direct;
+      const fallback = this.sessions.getByThreadIdAcrossBackends(id);
+      if (!fallback) return null;
+      this.output.appendLine(
+        `[session] Fallback thread resolution by threadId only: threadId=${id} expectedBackendKey=${backendKey} resolvedBackendKey=${fallback.backendKey}`,
+      );
+      return fallback;
+    };
+
     if (!threadId && typeof o["msg"] === "object" && o["msg"] !== null) {
       const msg = o["msg"] as Record<string, unknown>;
       const msgThreadId =
@@ -3362,12 +3481,11 @@ export class BackendManager implements vscode.Disposable {
         (typeof msg["threadId"] === "string"
           ? (msg["threadId"] as string)
           : null);
-      if (msgThreadId)
-        return this.sessions.getByThreadId(backendKey, msgThreadId);
+      if (msgThreadId) return resolveSession(msgThreadId);
     }
 
     if (typeof threadId !== "string") return null;
-    return this.sessions.getByThreadId(backendKey, threadId);
+    return resolveSession(threadId);
   }
 
   public dispose(): void {
@@ -3909,6 +4027,7 @@ type V2ApprovalRequest = Extract<
 
 type V2ApprovalDecision =
   | CommandExecutionApprovalDecision
+  | NetworkPolicyApprovalDecision
   | FileChangeApprovalDecision;
 
 type V2ToolRequestUserInputRequest = Extract<

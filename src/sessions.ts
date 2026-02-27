@@ -62,6 +62,16 @@ export class SessionStore {
     );
   }
 
+  public getByThreadIdAcrossBackends(threadId: string): Session | null {
+    let match: Session | null = null;
+    for (const session of this.sessionsById.values()) {
+      if (session.threadId !== threadId) continue;
+      if (match && match.backendKey !== session.backendKey) return null;
+      match = session;
+    }
+    return match;
+  }
+
   public add(backendKey: string, session: Session): void {
     const list = this.sessionsByBackendKey.get(backendKey) ?? [];
     this.sessionsByBackendKey.set(backendKey, [...list, session]);

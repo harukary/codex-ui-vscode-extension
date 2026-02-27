@@ -31,6 +31,8 @@ import type { ConfigValueWriteParams } from "../generated/v2/ConfigValueWritePar
 import type { ConfigWriteResponse } from "../generated/v2/ConfigWriteResponse";
 import type { ThreadArchiveParams } from "../generated/v2/ThreadArchiveParams";
 import type { ThreadArchiveResponse } from "../generated/v2/ThreadArchiveResponse";
+import type { ThreadSetNameParams } from "../generated/v2/ThreadSetNameParams";
+import type { ThreadSetNameResponse } from "../generated/v2/ThreadSetNameResponse";
 import type { ThreadUnarchiveParams } from "../generated/v2/ThreadUnarchiveParams";
 import type { ThreadUnarchiveResponse } from "../generated/v2/ThreadUnarchiveResponse";
 import type { ThreadRollbackParams } from "../generated/v2/ThreadRollbackParams";
@@ -53,7 +55,6 @@ import type { LoginAccountResponse } from "../generated/v2/LoginAccountResponse"
 import type { LogoutAccountResponse } from "../generated/v2/LogoutAccountResponse";
 import type { CommandExecutionApprovalDecision } from "../generated/v2/CommandExecutionApprovalDecision";
 import type { FileChangeApprovalDecision } from "../generated/v2/FileChangeApprovalDecision";
-import type { CommandExecutionRequestApprovalResponse } from "../generated/v2/CommandExecutionRequestApprovalResponse";
 import type { FileChangeRequestApprovalResponse } from "../generated/v2/FileChangeRequestApprovalResponse";
 import type { ToolRequestUserInputResponse } from "../generated/v2/ToolRequestUserInputResponse";
 import type { FuzzyFileSearchParams } from "../generated/FuzzyFileSearchParams";
@@ -73,6 +74,34 @@ type TurnSteerParams = {
 
 type TurnSteerResponse = {
   turnId: string;
+};
+
+export type ExperimentalFeatureEntry = {
+  key: string;
+  stage?: string | null;
+  enabled?: boolean | null;
+  defaultEnabled?: boolean | null;
+  displayName?: string | null;
+  description?: string | null;
+};
+
+export type ExperimentalFeatureListResponse = {
+  data?: ExperimentalFeatureEntry[] | null;
+  nextCursor?: string | null;
+};
+
+type ExperimentalFeatureListParams = {
+  cursor?: string | null;
+  limit?: number | null;
+};
+
+type NetworkPolicyApprovalDecision = {
+  applyNetworkPolicyAmendment: {
+    network_policy_amendment: {
+      host: string;
+      action: "allow" | "deny";
+    };
+  };
 };
 
 type SpawnOptions = {
@@ -209,6 +238,15 @@ export class BackendProcess implements vscode.Disposable {
     });
   }
 
+  public async threadSetName(
+    params: ThreadSetNameParams,
+  ): Promise<ThreadSetNameResponse> {
+    return this.rpc.request<ThreadSetNameResponse>({
+      method: "thread/name/set",
+      params,
+    });
+  }
+
   public async threadUnarchive(
     params: ThreadUnarchiveParams,
   ): Promise<ThreadUnarchiveResponse> {
@@ -257,7 +295,30 @@ export class BackendProcess implements vscode.Disposable {
         archived: params?.archived ?? null,
       },
     };
+    // NOTE:
+    // Our generated protocol may lag behind newer app-server fields.
+    // Forward known optional fields when present.
+    const extra = request.params as Record<string, unknown>;
+    const anyParams = (params ?? {}) as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(anyParams, "cwd")) {
+      extra["cwd"] = anyParams["cwd"] ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(anyParams, "searchTerm")) {
+      extra["searchTerm"] = anyParams["searchTerm"] ?? null;
+    }
     return this.rpc.request<ThreadListResponse>(request);
+  }
+
+  public async experimentalFeatureList(
+    params: Partial<ExperimentalFeatureListParams> | undefined = undefined,
+  ): Promise<ExperimentalFeatureListResponse> {
+    return this.rpc.request<ExperimentalFeatureListResponse>({
+      method: "experimentalFeature/list",
+      params: {
+        cursor: params?.cursor ?? null,
+        limit: params?.limit ?? null,
+      },
+    } as any);
   }
 
   public async appsList(
@@ -545,8 +606,8 @@ export class BackendProcess implements vscode.Disposable {
     decision: V2ApprovalDecision,
   ): void {
     if (req.method === "item/commandExecution/requestApproval") {
-      const result: CommandExecutionRequestApprovalResponse = {
-        decision: decision as CommandExecutionApprovalDecision,
+      const result: { decision: unknown } = {
+        decision,
       };
       this.rpc.respond(req.id, result);
       return;
@@ -590,6 +651,7 @@ type V2ApprovalRequest = Extract<
 
 type V2ApprovalDecision =
   | CommandExecutionApprovalDecision
+  | NetworkPolicyApprovalDecision
   | FileChangeApprovalDecision;
 
 type V2ToolRequestUserInputRequest = Extract<

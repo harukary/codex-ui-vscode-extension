@@ -433,6 +433,7 @@ const HIDDEN_TAB_SESSIONS_KEY = "codex.hiddenTabSessions.v1";
 const TAB_ORDER_KEY = "codex.tabOrder.v1";
 const WORKSPACE_COLOR_OVERRIDES_KEY = "codex.workspaceColorOverrides.v1";
 const LEGACY_RUNTIMES_KEY = "codex.sessionRuntime.v1";
+const RESUME_PICKER_STATE_KEY = "codex.resumePickerState.v1";
 const hiddenTabSessionIds = new Set<string>();
 const unreadSessionIds = new Set<string>();
 const WORKSPACE_COLOR_PALETTE = [
@@ -453,6 +454,12 @@ let workspaceColorOverrides: Record<string, number> = {};
 type TabOrderState = {
   workspaceOrder: string[];
   sessionOrderByWorkspace: Record<string, string[]>;
+};
+
+type ResumePickerState = {
+  archivedOnly: boolean;
+  sortKey: "created_at" | "updated_at";
+  includeAllSources: boolean;
 };
 let tabOrder: TabOrderState = {
   workspaceOrder: [],
@@ -478,10 +485,38 @@ type CustomPromptSummary = {
   source: "disk" | "server";
 };
 
+type NetworkPolicyApprovalDecision = {
+  applyNetworkPolicyAmendment: {
+    network_policy_amendment: {
+      host: string;
+      action: "allow" | "deny";
+    };
+  };
+};
+
+type UiApprovalDecision =
+  | "accept"
+  | "acceptForSession"
+  | "decline"
+  | "cancel"
+  | NetworkPolicyApprovalDecision;
+
+type ApprovalAction = {
+  id: string;
+  label: string;
+  decision: UiApprovalDecision;
+};
+
+type ThreadStatusLite = {
+  type: string;
+  activeFlags?: string[];
+};
+
 type SessionRuntime = {
   blocks: ChatBlock[];
   latestDiff: string | null;
   statusText: string | null;
+  threadStatus: ThreadStatusLite | null;
   uiHydrationBlockedText: string | null;
   tokenUsage: ThreadTokenUsage | null;
   sending: boolean;
@@ -516,11 +551,12 @@ type SessionRuntime = {
       command: string | null;
       cwd: string | null;
       grantRoot: string | null;
+      actions: ApprovalAction[];
     }
   >;
   approvalResolvers: Map<
     string,
-    (decision: "accept" | "acceptForSession" | "decline" | "cancel") => void
+    (decision: UiApprovalDecision) => void
   >;
   pendingAppMentions: Array<{ name: string; path: string }>;
   pendingUserInputQueue: QueuedUserInput[];
@@ -616,6 +652,7 @@ export function activate(context: vscode.ExtensionContext): void {
   backendManager.onApprovalRequest = async (session, req) => {
     const requestKey = requestKeyFromSessionAndId(session.id, req.id);
     const rt = ensureRuntime(session.id);
+    const reqParams = req.params as Record<string, unknown>;
 
     const item =
       backendManager?.getItem(session.threadId, req.params.itemId) ?? null;
@@ -639,6 +676,31 @@ export function activate(context: vscode.ExtensionContext): void {
         ? (req.params.grantRoot ?? null)
         : null;
 
+    const actions: ApprovalAction[] = [];
+    if (req.method === "item/commandExecution/requestApproval") {
+      const proposed = Array.isArray(reqParams["proposedNetworkPolicyAmendments"])
+        ? (reqParams["proposedNetworkPolicyAmendments"] as unknown[])
+        : [];
+      for (const cand of proposed) {
+        if (typeof cand !== "object" || cand === null) continue;
+        const c = cand as Record<string, unknown>;
+        const host = typeof c["host"] === "string" ? c["host"].trim() : "";
+        const actionRaw =
+          typeof c["action"] === "string" ? c["action"].trim() : "";
+        const action = actionRaw === "allow" || actionRaw === "deny" ? actionRaw : "";
+        if (!host || !action) continue;
+        actions.push({
+          id: `network:${action}:${host}`,
+          label: `Apply network policy (${action} ${host})`,
+          decision: {
+            applyNetworkPolicyAmendment: {
+              network_policy_amendment: { host, action },
+            },
+          },
+        });
+      }
+    }
+
     rt.pendingApprovals.set(requestKey, {
       title,
       detail,
@@ -650,6 +712,7 @@ export function activate(context: vscode.ExtensionContext): void {
       command: fallbackCommand,
       cwd: fallbackCwd,
       grantRoot: fallbackGrantRoot,
+      actions,
     });
     if (activeSessionId !== session.id) {
       setActiveSession(session.id);
@@ -694,6 +757,9 @@ export function activate(context: vscode.ExtensionContext): void {
     sessions,
     (workspaceFolderUri) => colorIndexForWorkspaceFolderUri(workspaceFolderUri),
     () => listAllSessionsOrdered(sessions!),
+    (sessionId) => ({
+      threadStatusText: sessionThreadStatusText(sessionId),
+    }),
   );
   context.subscriptions.push(sessionTree);
   context.subscriptions.push(
@@ -1182,6 +1248,7 @@ export function activate(context: vscode.ExtensionContext): void {
         rt.blocks = [];
         rt.latestDiff = null;
         rt.statusText = null;
+        rt.threadStatus = null;
         rt.lastTurnStartedAtMs = null;
         rt.lastTurnCompletedAtMs = null;
         rt.sending = false;
@@ -1466,6 +1533,8 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
       if (!extensionContext) throw new Error("extensionContext is not set");
+      const bm = backendManager;
+      const ctx = extensionContext;
 
       const folder = await pickWorkspaceFolder();
       if (!folder) return;
@@ -1474,186 +1543,343 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!backendId) return;
       const wantedCwd = normalizeFsPathForCompare(folder.uri.fsPath);
 
-      let archived: boolean | null = null;
-      let sortKey: "created_at" | "updated_at" | null = null;
-      let sourceKinds: ThreadSourceKind[] | null = null;
+      const allSourceKinds: ThreadSourceKind[] = [
+        "cli",
+        "vscode",
+        "exec",
+        "appServer",
+        "subAgent",
+        "subAgentReview",
+        "subAgentCompact",
+        "subAgentThreadSpawn",
+        "subAgentOther",
+        "unknown",
+      ];
+      const savedResumePickerState =
+        backendId === "opencode"
+          ? null
+          : loadResumePickerState(ctx.workspaceState);
+      let archived: boolean | null =
+        backendId === "opencode"
+          ? null
+          : savedResumePickerState?.archivedOnly === true
+            ? true
+            : null;
+      let sortKey: "created_at" | "updated_at" | null =
+        savedResumePickerState?.sortKey === "created_at"
+          ? "created_at"
+          : "updated_at";
+      let sourceKinds: ThreadSourceKind[] | null =
+        backendId === "opencode"
+          ? null
+          : savedResumePickerState?.includeAllSources === true
+            ? allSourceKinds
+            : null;
 
-      if (backendId !== "opencode") {
-        const archivedPicked = await vscode.window.showQuickPick(
-          [
-            {
-              label: "Active",
-              description: "Not archived",
-              archived: null as boolean | null,
-            },
-            {
-              label: "Archived",
-              description: "Archived only",
-              archived: true as const,
-            },
-          ],
-          { title: "History: Archived filter" },
-        );
-        if (!archivedPicked) return;
-        archived = archivedPicked.archived;
+      type ResumeControlKind = "archived" | "sort" | "source";
+      type ResumeControlItem = vscode.QuickPickItem & {
+        entryType: "control";
+        control: ResumeControlKind;
+      };
+      type ResumeThreadItem = vscode.QuickPickItem & {
+        entryType: "thread";
+        thread: Thread;
+      };
+      type ResumeLoadMoreItem = vscode.QuickPickItem & {
+        entryType: "more";
+      };
+      type ResumePickItem = ResumeControlItem | ResumeThreadItem | ResumeLoadMoreItem;
 
-        const sortPicked = await vscode.window.showQuickPick(
-          [
-            {
-              label: "Updated",
-              description: "Sort by updated_at",
-              sortKey: "updated_at" as const,
-            },
-            {
-              label: "Created",
-              description: "Sort by created_at",
-              sortKey: "created_at" as const,
-            },
-          ],
-          { title: "History: Sort" },
-        );
-        if (!sortPicked) return;
-        sortKey = sortPicked.sortKey;
+      const archivedButton: vscode.QuickInputButton = {
+        iconPath: new vscode.ThemeIcon("archive"),
+        tooltip: "Archived filter",
+      };
+      const sortButton: vscode.QuickInputButton = {
+        iconPath: new vscode.ThemeIcon("arrow-swap"),
+        tooltip: "Sort by created/updated",
+      };
+      const sourceButton: vscode.QuickInputButton = {
+        iconPath: new vscode.ThemeIcon("list-filter"),
+        tooltip: "Source filter",
+      };
 
-        const allSourceKinds: ThreadSourceKind[] = [
-          "cli",
-          "vscode",
-          "exec",
-          "appServer",
-          "subAgent",
-          "subAgentReview",
-          "subAgentCompact",
-          "subAgentThreadSpawn",
-          "subAgentOther",
-          "unknown",
-        ];
-        const sourcePicked = await vscode.window.showQuickPick(
-          [
-            {
-              label: "Interactive only",
-              description: "CLI / VSCode threads (default server behavior)",
-              sourceKinds: null as ThreadSourceKind[] | null,
-            },
-            {
-              label: "All sources",
-              description: "Include exec / app-server / sub-agents, etc.",
-              sourceKinds: allSourceKinds,
-            },
-          ],
-          { title: "History: Source filter" },
-        );
-        if (!sourcePicked) return;
-        sourceKinds = sourcePicked.sourceKinds;
-      }
+      const pickedThread = await new Promise<Thread | null>((resolve) => {
+        const qp = vscode.window.createQuickPick<ResumePickItem>();
+        let searchTerm = "";
+        let nextCursor: string | null = null;
+        let inFlight = 0;
+        let debounce: NodeJS.Timeout | null = null;
+        let pageThreads: Thread[] = [];
+        let activeThreadIds: string[] = [];
+        let finalized = false;
 
-      let cursor: string | null = null;
-      const collected: Thread[] = [];
-
-      for (;;) {
-        let res: { data: Thread[]; nextCursor: string | null };
-        try {
-          res = await backendManager.listThreadsForWorkspaceFolderAndBackendId(
-            folder,
-            backendId,
-            {
-              cursor,
-              limit: 50,
-              modelProviders: null,
-              sortKey,
-              sourceKinds,
-              archived,
-            },
-          );
-        } catch (err) {
-          output.appendLine(`[resume] Failed to list threads: ${String(err)}`);
-          void vscode.window.showErrorMessage("Failed to list history.");
-          return;
-        }
-
-        const filtered = res.data.filter(
-          (t) => normalizeFsPathForCompare(t.cwd) === wantedCwd,
-        );
-        collected.push(...filtered);
-
-        const items = collected.map((t) => ({
-          label: `${formatThreadWhen(sortKey === "created_at" ? t.createdAt : t.updatedAt)}  ${formatThreadLabel(t.preview)}`,
-          thread: t,
-          kind: "thread" as const,
-        }));
-
-        const hasMore = Boolean(res.nextCursor);
-        const picked = await vscode.window.showQuickPick(
-          [
-            ...items,
-            ...(hasMore
-              ? [
-                  {
-                    label: "Load more…",
-                    description: "",
-                    detail: "",
-                    kind: "more" as const,
-                    nextCursor: res.nextCursor,
-                  },
-                ]
-              : []),
-          ] as any,
-          {
-            title: "Codex UI: Pick a thread to resume",
-            matchOnDescription: true,
-            matchOnDetail: true,
-          },
-        );
-
-        if (!picked) return;
-        if ((picked as any).kind === "more") {
-          cursor = (picked as any).nextCursor ?? null;
-          if (!cursor) return;
-          continue;
-        }
-
-        const thread = (picked as any).thread as Thread;
-        if (backendId !== "opencode" && archived === true) {
-          try {
-            await backendManager.unarchiveThreadForWorkspaceFolderAndBackendId(
-              folder,
-              backendId,
-              thread.id,
-            );
-          } catch (err) {
-            output.appendLine(
-              `[resume] Failed to unarchive threadId=${thread.id}: ${String(err)}`,
-            );
-            void vscode.window.showErrorMessage(
-              "Failed to unarchive the selected thread.",
-            );
-            return;
+        const finish = (thread: Thread | null): void => {
+          if (finalized) return;
+          finalized = true;
+          if (debounce) {
+            clearTimeout(debounce);
+            debounce = null;
           }
-        }
-        const session: Session = {
-          id: crypto.randomUUID(),
-          backendId,
-          backendKey: makeBackendInstanceKey(folder.uri.toString(), backendId),
-          workspaceFolderUri: folder.uri.toString(),
-          title: normalizeSessionTitle(thread.preview || "Resumed"),
-          threadId: thread.id,
-          personality: null,
-          collaborationModePresetName: null,
+          qp.hide();
+          qp.dispose();
+          resolve(thread);
         };
 
-        sessions.add(session.backendKey, session);
-        saveSessions(extensionContext, sessions);
-        ensureRuntime(session.id);
-        sessionTree?.refresh();
+        const savePickerState = (): void => {
+          if (backendId === "opencode") return;
+          void ctx.workspaceState.update(RESUME_PICKER_STATE_KEY, {
+            archivedOnly: archived === true,
+            sortKey: sortKey === "created_at" ? "created_at" : "updated_at",
+            includeAllSources: Array.isArray(sourceKinds),
+          } satisfies ResumePickerState);
+        };
 
-        // Don't override the recorded thread model on resume. Users can still
-        // change the model via the UI for subsequent turns.
-        const resumed = await backendManager.resumeSession(session);
-        void ensureModelsFetched(session);
-        hydrateRuntimeFromThread(session.id, resumed.thread);
-        setActiveSession(session.id);
-        await showCodexViewContainer();
-        return;
+        const controlItems = (): ResumeControlItem[] => {
+          if (backendId === "opencode") return [];
+          return [
+            {
+              entryType: "control",
+              control: "archived",
+              alwaysShow: true,
+              label: `$(archive) Archived: ${archived === true ? "Only archived" : "Active only"}`,
+              description: "Enterで切替",
+            },
+            {
+              entryType: "control",
+              control: "sort",
+              alwaysShow: true,
+              label: `$(arrow-swap) Sort: ${sortKey === "created_at" ? "Created" : "Updated"}`,
+              description: "Enterまたはボタンで切替",
+            },
+            {
+              entryType: "control",
+              control: "source",
+              alwaysShow: true,
+              label: `$(list-filter) Source: ${Array.isArray(sourceKinds) ? "All" : "Interactive only"}`,
+              description: "Enterで切替",
+            },
+          ];
+        };
+
+        const refreshItems = (): void => {
+          const threadItems: ResumeThreadItem[] = pageThreads.map((t) => {
+            const status = parseThreadStatusLite(
+              (t as unknown as Record<string, unknown>)["status"],
+            );
+            return {
+              entryType: "thread",
+              thread: t,
+              label: `${formatThreadWhen(sortKey === "created_at" ? t.createdAt : t.updatedAt)}  ${formatThreadLabel(t.preview)}`,
+              description: formatThreadStatusText(status) ?? "",
+            };
+          });
+          activeThreadIds = threadItems.map((item) => item.thread.id);
+
+          const moreItem: ResumeLoadMoreItem[] = nextCursor
+            ? [
+                {
+                  entryType: "more",
+                  alwaysShow: true,
+                  label: "Load more…",
+                  description: "下まで移動すると自動読込",
+                },
+              ]
+            : [];
+
+          const items: ResumePickItem[] = [
+            ...controlItems(),
+            ...threadItems,
+            ...moreItem,
+          ];
+          qp.items = items;
+        };
+
+        const fetchThreads = async (opts: {
+          reset: boolean;
+          debounced?: boolean;
+        }): Promise<void> => {
+          const seq = ++inFlight;
+          qp.busy = true;
+          qp.enabled = false;
+
+          if (opts.reset) {
+            nextCursor = null;
+            pageThreads = [];
+          }
+
+          try {
+            const res = await bm.listThreadsForWorkspaceFolderAndBackendId(
+              folder,
+              backendId,
+              {
+                cursor: opts.reset ? null : nextCursor,
+                limit: 50,
+                modelProviders: null,
+                sortKey,
+                sourceKinds,
+                archived,
+                cwd: wantedCwd,
+                searchTerm: searchTerm.length > 0 ? searchTerm : null,
+              },
+            );
+            if (seq !== inFlight || finalized) return;
+            nextCursor = res.nextCursor ?? null;
+            const accepted = res.data.filter(
+              (t) => normalizeFsPathForCompare(t.cwd) === wantedCwd,
+            );
+            if (opts.reset) {
+              pageThreads = accepted;
+            } else {
+              const known = new Set(pageThreads.map((t) => t.id));
+              for (const t of accepted) {
+                if (known.has(t.id)) continue;
+                known.add(t.id);
+                pageThreads.push(t);
+              }
+            }
+            refreshItems();
+          } catch (err) {
+            if (seq !== inFlight || finalized) return;
+            output.appendLine(`[resume] Failed to list threads: ${String(err)}`);
+            void vscode.window.showErrorMessage("Failed to list history.");
+            finish(null);
+          } finally {
+            if (seq !== inFlight || finalized) return;
+            qp.busy = false;
+            qp.enabled = true;
+          }
+        };
+
+        const triggerRefresh = (opts?: { debounced?: boolean }): void => {
+          if (debounce) {
+            clearTimeout(debounce);
+            debounce = null;
+          }
+          if (opts?.debounced) {
+            debounce = setTimeout(() => {
+              debounce = null;
+              void fetchThreads({ reset: true, debounced: true });
+            }, 150);
+            return;
+          }
+          void fetchThreads({ reset: true });
+        };
+
+        qp.title = "Codex UI: Resume";
+        qp.placeholder = "Type to search title";
+        qp.matchOnDescription = true;
+        qp.matchOnDetail = true;
+        qp.ignoreFocusOut = true;
+        qp.buttons =
+          backendId === "opencode"
+            ? []
+            : [archivedButton, sortButton, sourceButton];
+        qp.onDidHide(() => finish(null));
+        qp.onDidChangeValue((value) => {
+          searchTerm = value.trim();
+          triggerRefresh({ debounced: true });
+        });
+        qp.onDidTriggerButton((button) => {
+          if (backendId === "opencode") return;
+          if (button === archivedButton) {
+            archived = archived === true ? null : true;
+            savePickerState();
+            triggerRefresh();
+            return;
+          }
+          if (button === sortButton) {
+            sortKey = sortKey === "created_at" ? "updated_at" : "created_at";
+            savePickerState();
+            triggerRefresh();
+            return;
+          }
+          if (button === sourceButton) {
+            sourceKinds = Array.isArray(sourceKinds) ? null : allSourceKinds;
+            savePickerState();
+            triggerRefresh();
+          }
+        });
+        qp.onDidChangeActive((items) => {
+          const first = items[0];
+          if (!first) return;
+          if (first.entryType === "more" && nextCursor && !qp.busy) {
+            void fetchThreads({ reset: false });
+            return;
+          }
+          if (first.entryType !== "thread" || !nextCursor || qp.busy) return;
+          const idx = activeThreadIds.indexOf(first.thread.id);
+          if (idx < 0) return;
+          const remaining = activeThreadIds.length - idx - 1;
+          if (remaining <= 4) {
+            void fetchThreads({ reset: false });
+          }
+        });
+        qp.onDidAccept(() => {
+          const picked = qp.selectedItems[0];
+          if (!picked) return;
+          if (picked.entryType === "more") {
+            if (nextCursor && !qp.busy) void fetchThreads({ reset: false });
+            return;
+          }
+          if (picked.entryType === "control") {
+            if (picked.control === "archived") {
+              archived = archived === true ? null : true;
+            } else if (picked.control === "sort") {
+              sortKey = sortKey === "created_at" ? "updated_at" : "created_at";
+            } else if (picked.control === "source") {
+              sourceKinds = Array.isArray(sourceKinds) ? null : allSourceKinds;
+            }
+            savePickerState();
+            triggerRefresh();
+            return;
+          }
+          finish(picked.thread);
+        });
+        qp.show();
+        void fetchThreads({ reset: true });
+      });
+      if (!pickedThread) return;
+
+      if (backendId !== "opencode" && archived === true) {
+        try {
+          await backendManager.unarchiveThreadForWorkspaceFolderAndBackendId(
+            folder,
+            backendId,
+            pickedThread.id,
+          );
+        } catch (err) {
+          output.appendLine(
+            `[resume] Failed to unarchive threadId=${pickedThread.id}: ${String(err)}`,
+          );
+          void vscode.window.showErrorMessage(
+            "Failed to unarchive the selected thread.",
+          );
+          return;
+        }
       }
+      const session: Session = {
+        id: crypto.randomUUID(),
+        backendId,
+        backendKey: makeBackendInstanceKey(folder.uri.toString(), backendId),
+        workspaceFolderUri: folder.uri.toString(),
+        ...resolveSessionTitleFromThread(pickedThread, "Resumed"),
+        threadId: pickedThread.id,
+        personality: null,
+        collaborationModePresetName: null,
+      };
+
+      sessions.add(session.backendKey, session);
+      saveSessions(extensionContext, sessions);
+      ensureRuntime(session.id);
+      sessionTree?.refresh();
+
+      // Don't override the recorded thread model on resume. Users can still
+      // change the model via the UI for subsequent turns.
+      const resumed = await backendManager.resumeSession(session);
+      void ensureModelsFetched(session);
+      hydrateRuntimeFromThread(session.id, resumed.thread);
+      setActiveSession(session.id);
+      await showCodexViewContainer();
     }),
   );
 
@@ -2847,6 +3073,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "codex.renameSession",
       async (args?: unknown) => {
+        if (!backendManager) throw new Error("backendManager is not initialized");
         if (!sessions) throw new Error("sessions is not initialized");
 
         const session = args ? parseSessionArg(args, sessions) : null;
@@ -2858,15 +3085,53 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        const next = await vscode.window.showInputBox({
-          title: "Codex UI: Rename session",
-          value: active.title,
-          prompt: "Change the title shown in the chat tabs and Sessions list.",
-          validateInput: (v) => (v.trim() ? null : "Title cannot be empty."),
-        });
+        const requestedTitle =
+          typeof args === "object" &&
+          args !== null &&
+          typeof (args as Record<string, unknown>)["title"] === "string"
+            ? String((args as Record<string, unknown>)["title"]).trim()
+            : null;
+        const next =
+          requestedTitle && requestedTitle.length > 0
+            ? requestedTitle
+            : await vscode.window.showInputBox({
+                title: "Codex UI: Rename session",
+                value: active.title,
+                prompt:
+                  active.backendId === "codex"
+                    ? "Set the thread name via app-server (thread/name/set)."
+                    : "Change the title shown in the chat tabs and Sessions list.",
+                validateInput: (v) =>
+                  v.trim() ? null : "Title cannot be empty.",
+              });
         if (next === undefined) return;
+        const nextTrimmed = next.trim();
+        if (!nextTrimmed) return;
 
-        const renamed = sessions.rename(active.id, next.trim());
+        if (active.backendId === "codex") {
+          try {
+            const thread = await backendManager.setThreadNameForSession(
+              active,
+              nextTrimmed,
+            );
+            const resolved = resolveSessionTitleFromThread(thread, nextTrimmed);
+            active.title = resolved.title;
+            active.customTitle = resolved.customTitle;
+            sessionPanels?.updateTitle(active.id, active.title);
+            saveSessions(context, sessions);
+            sessionTree?.refresh();
+            chatView?.refresh();
+          } catch (err) {
+            const msg = formatUnknownError(err);
+            outputChannel?.appendLine(`[rename] thread/name/set failed: ${msg}`);
+            void vscode.window.showErrorMessage(
+              `Failed to rename thread via app-server: ${msg}`,
+            );
+          }
+          return;
+        }
+
+        const renamed = sessions.rename(active.id, nextTrimmed);
         if (renamed) sessionPanels?.updateTitle(renamed.id, renamed.title);
         saveSessions(context, sessions);
         sessionTree?.refresh();
@@ -2885,12 +3150,16 @@ export function activate(context: vscode.ExtensionContext): void {
         const decision = o["decision"];
         const sessionId = o["sessionId"];
         if (typeof requestKey !== "string") return;
-        if (
-          decision !== "accept" &&
-          decision !== "acceptForSession" &&
-          decision !== "decline" &&
-          decision !== "cancel"
-        ) {
+        const isSimpleDecision =
+          decision === "accept" ||
+          decision === "acceptForSession" ||
+          decision === "decline" ||
+          decision === "cancel";
+        const isNetworkDecision =
+          typeof decision === "object" &&
+          decision !== null &&
+          "applyNetworkPolicyAmendment" in (decision as Record<string, unknown>);
+        if (!isSimpleDecision && !isNetworkDecision) {
           return;
         }
 
@@ -2900,7 +3169,7 @@ export function activate(context: vscode.ExtensionContext): void {
           rt.approvalResolvers.delete(requestKey);
           rt.pendingApprovals.delete(requestKey);
           chatView?.refresh();
-          resolver(decision);
+          resolver(decision as UiApprovalDecision);
           return true;
         };
 
@@ -3937,34 +4206,104 @@ async function handleSlashCommand(
 
     if (!backendManager) throw new Error("backendManager is not initialized");
     const config = await backendManager.readConfigForSession(session);
-    const features =
+    const featuresConfig =
       (((config.config as unknown as Record<string, unknown>)["features"] ??
         {}) as Record<string, unknown>) || {};
-    const specs = [
-      {
-        key: "shell_snapshot",
-        label: "Shell snapshot",
-        description: "Speed up execution by reducing login shell restarts",
-      },
-      {
-        key: "collab",
-        label: "Sub-agents",
-        description: "Enable sub-agent runs",
-      },
-      {
-        key: "apps",
-        label: "Apps",
-        description: "Use Apps (Connectors) via $ mentions",
-      },
-    ] as const;
 
-    const items = specs.map((spec) => ({
-      label: spec.label,
-      description: spec.description,
-      detail: `features.${spec.key}`,
-      picked: Boolean(features[spec.key]),
-      key: spec.key,
-    }));
+    let remoteFeatures: Array<{
+      key: string;
+      stage?: string | null;
+      enabled?: boolean | null;
+      defaultEnabled?: boolean | null;
+      displayName?: string | null;
+      description?: string | null;
+    }> = [];
+    try {
+      remoteFeatures = await backendManager.listExperimentalFeaturesForSession(
+        session,
+      );
+    } catch (err) {
+      outputChannel?.appendLine(
+        `[experimental] experimentalFeature/list failed, using fallback: ${String(err)}`,
+      );
+      remoteFeatures = [];
+    }
+    if (remoteFeatures.length === 0) {
+      // Fallback for older app-server builds without experimentalFeature/list.
+      remoteFeatures = [
+        {
+          key: "shell_snapshot",
+          displayName: "Shell snapshot",
+          description:
+            "Speed up execution by reducing login shell restarts",
+          enabled: Boolean(featuresConfig["shell_snapshot"]),
+          defaultEnabled: false,
+          stage: "unknown",
+        },
+        {
+          key: "collab",
+          displayName: "Sub-agents",
+          description: "Enable sub-agent runs",
+          enabled: Boolean(featuresConfig["collab"]),
+          defaultEnabled: false,
+          stage: "unknown",
+        },
+        {
+          key: "apps",
+          displayName: "Apps",
+          description: "Use Apps (Connectors) via $ mentions",
+          enabled: Boolean(featuresConfig["apps"]),
+          defaultEnabled: false,
+          stage: "unknown",
+        },
+      ];
+    }
+
+    const items: Array<vscode.QuickPickItem & { key: string; picked: boolean }> =
+      remoteFeatures
+        .map((f) => {
+      const key = String(f.key ?? "").trim();
+      const current = Boolean(
+        typeof f.enabled === "boolean"
+          ? f.enabled
+          : (featuresConfig as Record<string, unknown>)[key],
+      );
+      const stage =
+        typeof f.stage === "string" && f.stage.trim() ? f.stage.trim() : "";
+      const defaultEnabled = Boolean(f.defaultEnabled);
+      return {
+        label:
+          typeof f.displayName === "string" && f.displayName.trim()
+            ? f.displayName.trim()
+            : key,
+        description:
+          typeof f.description === "string" && f.description.trim()
+            ? f.description.trim()
+            : undefined,
+        detail: [
+          `features.${key}`,
+          stage ? `stage=${stage}` : "",
+          `default=${defaultEnabled ? "on" : "off"}`,
+        ]
+          .filter(Boolean)
+          .join(" · "),
+        picked: current,
+        key,
+      };
+    })
+        .filter((item) => item.key.length > 0);
+
+    if (items.length === 0) {
+      upsertBlock(session.id, {
+        id: newLocalId("experimentalEmpty"),
+        type: "info",
+        title: "Experimental features",
+        text: "No experimental features available.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
 
     const picked = await vscode.window.showQuickPick(items, {
       title: "Experimental features",
@@ -3979,12 +4318,14 @@ async function handleSlashCommand(
     const preferredPath =
       await resolvePreferredConfigWritePathForSession(session);
     let changed = 0;
-    for (const spec of specs) {
-      const enabled = selected.has(spec.key);
-      const current = Boolean(features[spec.key]);
+    for (const item of items) {
+      const enabled = selected.has(item.key);
+      const current = Boolean(
+        (featuresConfig as Record<string, unknown>)[item.key],
+      );
       if (enabled === current) continue;
       await backendManager.writeConfigValueForSession(session, {
-        keyPath: `features.${spec.key}`,
+        keyPath: `features.${item.key}`,
         value: enabled,
         mergeStrategy: "upsert",
         filePath: preferredPath,
@@ -4258,11 +4599,10 @@ async function handleSlashCommand(
   }
   if (cmd === "rename") {
     if (arg) {
-      if (!sessions) throw new Error("sessions is not initialized");
-      sessions.rename(session.id, arg);
-      saveSessions(context, sessions);
-      sessionTree?.refresh();
-      chatView?.refresh();
+      await vscode.commands.executeCommand("codex.renameSession", {
+        sessionId: session.id,
+        title: arg,
+      });
       return true;
     }
     await vscode.commands.executeCommand("codex.renameSession", {
@@ -5005,6 +5345,54 @@ function formatThreadLabel(preview: string): string {
   return v.length > 0 ? v : "(no preview)";
 }
 
+function threadNameFromThread(thread: Thread): string | null {
+  const raw = (thread as unknown as Record<string, unknown>)["name"];
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function resolveSessionTitleFromThread(
+  thread: Thread,
+  fallback: string,
+): { title: string; customTitle: boolean } {
+  const name = threadNameFromThread(thread);
+  if (name) return { title: normalizeSessionTitle(name), customTitle: true };
+  const preview = String(thread.preview ?? "").trim();
+  if (preview) return { title: normalizeSessionTitle(preview), customTitle: false };
+  return { title: normalizeSessionTitle(fallback), customTitle: false };
+}
+
+function parseThreadStatusLite(raw: unknown): ThreadStatusLite | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const typeRaw = o["type"];
+  if (typeof typeRaw !== "string" || !typeRaw.trim()) return null;
+  const flags = Array.isArray(o["activeFlags"])
+    ? (o["activeFlags"] as unknown[])
+        .map((v) => (typeof v === "string" ? v.trim() : ""))
+        .filter((v) => v.length > 0)
+    : [];
+  return { type: typeRaw.trim(), activeFlags: flags };
+}
+
+function formatThreadStatusText(status: ThreadStatusLite | null): string | null {
+  if (!status) return null;
+  const t = status.type.trim();
+  if (!t) return null;
+  if (t !== "active") return `thread=${t}`;
+  const flags = (status.activeFlags ?? []).filter(Boolean);
+  return flags.length > 0
+    ? `thread=active (${flags.join(", ")})`
+    : "thread=active";
+}
+
+function sessionThreadStatusText(sessionId: string): string | null {
+  const rt = runtimeBySessionId.get(sessionId);
+  if (!rt) return null;
+  return formatThreadStatusText(rt.threadStatus);
+}
+
 function formatThreadWhen(createdAtSec: number): string {
   const ms = Math.max(0, createdAtSec) * 1000;
   const d = new Date(ms);
@@ -5310,6 +5698,18 @@ function loadTabOrder(context: vscode.ExtensionContext): TabOrderState {
   }
 
   return { workspaceOrder, sessionOrderByWorkspace };
+}
+
+function loadResumePickerState(
+  memento: vscode.Memento,
+): ResumePickerState | null {
+  const raw = memento.get<unknown>(RESUME_PICKER_STATE_KEY);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  const archivedOnly = o["archivedOnly"] === true;
+  const includeAllSources = o["includeAllSources"] === true;
+  const sortKey = o["sortKey"] === "created_at" ? "created_at" : "updated_at";
+  return { archivedOnly, sortKey, includeAllSources };
 }
 
 function saveTabOrder(context: vscode.ExtensionContext): void {
@@ -6136,6 +6536,7 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     blocks: [],
     latestDiff: null,
     statusText: null,
+    threadStatus: null,
     uiHydrationBlockedText: null,
     tokenUsage: null,
     sending: false,
@@ -6355,9 +6756,11 @@ function buildChatState(): ChatViewState {
 
   const rt = ensureRuntime(activeRaw.id);
   const baseStatusText = rt.statusText ?? null;
+  const threadStatusText = formatThreadStatusText(rt.threadStatus);
   const core: string[] = [];
   const hydrationBlockedText = rt.uiHydrationBlockedText ?? null;
   if (hydrationBlockedText) core.push("history not loaded");
+  if (threadStatusText) core.push(threadStatusText);
   if (baseStatusText) core.push(baseStatusText);
   if (globalRateLimitStatusText) core.push(globalRateLimitStatusText);
   const suffix: string[] = [];
@@ -6413,6 +6816,7 @@ function buildChatState(): ChatViewState {
       title: v.title,
       detail: v.detail,
       canAcceptForSession: v.canAcceptForSession,
+      actions: v.actions,
     })),
     approvalSessionIds,
     customPrompts: promptSummaries,
@@ -6445,8 +6849,23 @@ function applyServerNotification(
     case "rawResponseItem/completed":
       // Internal-only (Codex Cloud). Avoid flooding "Other events (debug)".
       return;
-    case "thread/started":
+    case "thread/started": {
+      const status = parseThreadStatusLite((n as any).params?.thread?.status);
+      if (status) {
+        rt.threadStatus = status;
+        sessionTree?.refresh();
+      }
       return;
+    }
+    case "thread/status/changed": {
+      const status = parseThreadStatusLite((n as any).params?.status);
+      if (status) {
+        rt.threadStatus = status;
+        sessionTree?.refresh();
+        chatView?.refresh();
+      }
+      return;
+    }
     case "error": {
       const p = (n as any).params as {
         error?: {
@@ -9416,6 +9835,23 @@ function hydrateRuntimeFromThread(
 ): void {
   const rt = ensureRuntime(sessionId);
   rt.lastActivityAtMs = Date.now();
+  rt.threadStatus = parseThreadStatusLite((thread as unknown as any)?.status);
+  if (sessions && extensionContext) {
+    const session = sessions.getById(sessionId);
+    if (session && session.backendId === "codex") {
+      const resolved = resolveSessionTitleFromThread(thread, session.title);
+      if (
+        session.title !== resolved.title ||
+        Boolean(session.customTitle) !== resolved.customTitle
+      ) {
+        session.title = resolved.title;
+        session.customTitle = resolved.customTitle;
+        saveSessions(extensionContext, sessions);
+        sessionTree?.refresh();
+        sessionPanels?.updateTitle(session.id, session.title);
+      }
+    }
+  }
 
   const hasConversationBlocks = rt.blocks.some((b) => {
     switch (b.type) {
@@ -9485,6 +9921,7 @@ function hydrateRuntimeFromThread(
   if (activeSessionId === sessionId) {
     chatView?.syncBlocksForActiveSession();
   }
+  sessionTree?.refresh();
 }
 
 function formatApprovalDetail(
@@ -9533,6 +9970,52 @@ function formatApprovalDetail(
     if (method === "item/fileChange/requestApproval") {
       const paramsGrantRoot = anyParams["grantRoot"];
       if (typeof paramsGrantRoot === "string") grantRoot = paramsGrantRoot;
+    }
+    if (method === "item/commandExecution/requestApproval") {
+      const networkCtx =
+        typeof anyParams["networkApprovalContext"] === "object" &&
+        anyParams["networkApprovalContext"] !== null
+          ? (anyParams["networkApprovalContext"] as Record<string, unknown>)
+          : null;
+      if (networkCtx) {
+        const host =
+          typeof networkCtx["host"] === "string"
+            ? networkCtx["host"].trim()
+            : "";
+        const protocol =
+          typeof networkCtx["protocol"] === "string"
+            ? networkCtx["protocol"].trim()
+            : "";
+        if (host || protocol) {
+          lines.push(`network: ${protocol || "?"}://${host || "?"}`);
+        }
+      }
+      const extraPerms = anyParams["additionalPermissions"];
+      if (extraPerms && typeof extraPerms === "object") {
+        lines.push("additionalPermissions: requested");
+      }
+      const proposedNetwork = Array.isArray(
+        anyParams["proposedNetworkPolicyAmendments"],
+      )
+        ? (anyParams["proposedNetworkPolicyAmendments"] as unknown[])
+        : [];
+      if (proposedNetwork.length > 0) {
+        const normalized = proposedNetwork
+          .map((v) => {
+            if (typeof v !== "object" || v === null) return "";
+            const vv = v as Record<string, unknown>;
+            const host =
+              typeof vv["host"] === "string" ? vv["host"].trim() : "";
+            const action =
+              typeof vv["action"] === "string" ? vv["action"].trim() : "";
+            if (!host || !action) return "";
+            return `${action} ${host}`;
+          })
+          .filter(Boolean);
+        if (normalized.length > 0) {
+          lines.push(`proposedNetworkPolicy: ${normalized.join(", ")}`);
+        }
+      }
     }
   }
 

@@ -19,6 +19,9 @@ export class SessionTreeDataProvider
       workspaceFolderUri: string,
     ) => number,
     private readonly listAllSessions: () => Session[],
+    private readonly getSessionMeta?: (
+      sessionId: string,
+    ) => { threadStatusText?: string | null } | null,
   ) {}
 
   public dispose(): void {
@@ -54,7 +57,15 @@ export class SessionTreeDataProvider
     const idx = this.getWorkspaceColorIndex(element.session.workspaceFolderUri);
     item.iconPath = iconForColorIndex(this.extensionUri, idx);
     // Put backend + thread id in the same line to avoid an extra backend group row.
-    item.description = `${element.session.backendId} ${element.session.threadId}`;
+    const baseDescription = `${element.session.backendId} ${element.session.threadId}`;
+    const meta = this.getSessionMeta?.(element.session.id) ?? null;
+    const statusText =
+      meta && typeof meta.threadStatusText === "string"
+        ? meta.threadStatusText.trim()
+        : "";
+    item.description = statusText
+      ? `${baseDescription} · ${statusText}`
+      : baseDescription;
     item.contextValue = "codex.session";
     item.command = {
       command: "codex.openSession",
