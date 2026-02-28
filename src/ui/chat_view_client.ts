@@ -345,6 +345,8 @@ function main(): void {
   const inputEl = mustGet<HTMLTextAreaElement>("input");
   const imageInput = mustGet<HTMLInputElement>("imageInput");
   const attachBtn = mustGet<HTMLButtonElement>("attach");
+  const pttBtn = mustGet<HTMLButtonElement>("ptt");
+  const pttStateEl = mustGet<HTMLSpanElement>("pttState");
   const attachmentsEl = mustGet("attachments");
   const runtimeActionRowEl = mustGet("runtimeActionRow");
   const steerSendBtn = mustGet<HTMLButtonElement>("steerSend");
@@ -3962,6 +3964,7 @@ function main(): void {
     if (statusBtn) statusBtn.disabled = !s.activeSession || s.sending;
     resumeBtn.disabled = s.sending;
     attachBtn.disabled = !s.activeSession || !allowsImageInputs(s);
+    setRealtimePttButtonState();
     reloadBtn.disabled =
       !s.activeSession || s.sending || s.reloading || backendId !== "codex";
     reloadBtn.title =
@@ -4315,6 +4318,11 @@ function main(): void {
 
     const nextSessionId = s.activeSession ? s.activeSession.id : null;
     if (domSessionId !== nextSessionId) {
+      if (realtimePttRecording || realtimePttRequested) {
+        requestRealtimePttStop();
+        realtimePttRecording = false;
+        void stopRealtimePttCapture();
+      }
       // Persist the previous session's draft before switching.
       // If the user is browsing input history, exit that mode so the draft is saved.
       exitInputHistoryNavigation(domSessionId);
@@ -5767,11 +5775,290 @@ function main(): void {
     vscode.postMessage({ type: "stop" });
   }
 
+  let realtimePttRequested = false;
+  let realtimePttRecording = false;
+  let realtimePttMediaStream: MediaStream | null = null;
+  let realtimePttAudioContext: AudioContext | null = null;
+  let realtimePttSource: MediaStreamAudioSourceNode | null = null;
+  let realtimePttProcessor: ScriptProcessorNode | null = null;
+  let realtimePttSilentGain: GainNode | null = null;
+  let realtimePttShiftRightPressed = false;
+  let realtimePttShiftRightHoldTimer: ReturnType<typeof setTimeout> | null =
+    null;
+  const REALTIME_PTT_SHIFT_RIGHT_HOLD_MS = 220;
+
+  const setRealtimePttButtonState = (): void => {
+    pttBtn.classList.toggle("recording", realtimePttRecording);
+    pttStateEl.classList.toggle("recording", realtimePttRecording);
+    pttBtn.disabled =
+      !state.activeSession ||
+      state.activeSession.backendId !== "codex" ||
+      state.sending ||
+      state.reloading;
+    pttBtn.title = realtimePttRecording
+      ? "Release to stop"
+      : "Hold to talk (realtime)";
+    pttBtn.setAttribute(
+      "aria-label",
+      realtimePttRecording ? "Release to stop recording" : "Push to talk",
+    );
+    if (realtimePttRecording) {
+      pttStateEl.textContent = "● 音声認識中";
+    } else if (realtimePttRequested) {
+      pttStateEl.textContent = "録音開始中…";
+    } else {
+      pttStateEl.textContent = "";
+    }
+  };
+
+  const bytesToBase64 = (bytes: Uint8Array): string => {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const slice = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...slice);
+    }
+    return btoa(binary);
+  };
+
+  const stopRealtimePttCapture = async (): Promise<void> => {
+    const processor = realtimePttProcessor;
+    realtimePttProcessor = null;
+    if (processor) {
+      try {
+        processor.disconnect();
+      } catch {}
+      processor.onaudioprocess = null;
+    }
+
+    const source = realtimePttSource;
+    realtimePttSource = null;
+    if (source) {
+      try {
+        source.disconnect();
+      } catch {}
+    }
+
+    const gain = realtimePttSilentGain;
+    realtimePttSilentGain = null;
+    if (gain) {
+      try {
+        gain.disconnect();
+      } catch {}
+    }
+
+    const stream = realtimePttMediaStream;
+    realtimePttMediaStream = null;
+    if (stream) {
+      for (const t of stream.getTracks()) {
+        try {
+          t.stop();
+        } catch {}
+      }
+    }
+
+    const ctx = realtimePttAudioContext;
+    realtimePttAudioContext = null;
+    if (ctx) {
+      try {
+        await ctx.close();
+      } catch {}
+    }
+  };
+
+  const startRealtimePttCapture = async (): Promise<void> => {
+    if (!state.activeSession) return;
+    const sessionId = state.activeSession.id;
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        noiseSuppression: true,
+        echoCancellation: true,
+      },
+      video: false,
+    });
+
+    const AudioCtx =
+      (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) {
+      for (const t of stream.getTracks()) t.stop();
+      throw new Error("AudioContext is not supported in this environment.");
+    }
+    const audioContext: AudioContext = new AudioCtx();
+    const source = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(2048, 1, 1);
+    const silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
+
+    processor.onaudioprocess = (ev: AudioProcessingEvent) => {
+      if (!realtimePttRecording) return;
+      const ch0 = ev.inputBuffer.getChannelData(0);
+      if (!ch0 || ch0.length === 0) return;
+      const pcm = new Int16Array(ch0.length);
+      for (let i = 0; i < ch0.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch0[i] ?? 0));
+        pcm[i] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff);
+      }
+      const data = bytesToBase64(new Uint8Array(pcm.buffer));
+      vscode.postMessage({
+        type: "realtimePttAudioChunk",
+        sessionId,
+        data,
+        sampleRate: Math.trunc(audioContext.sampleRate),
+        numChannels: 1,
+        samplesPerChannel: pcm.length,
+      });
+    };
+
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+
+    realtimePttMediaStream = stream;
+    realtimePttAudioContext = audioContext;
+    realtimePttSource = source;
+    realtimePttProcessor = processor;
+    realtimePttSilentGain = silentGain;
+  };
+
+  const requestRealtimePttStart = (): void => {
+    if (!state.activeSession) {
+      showToast("info", "セッションが選択されていません。");
+      return;
+    }
+    if (state.activeSession.backendId !== "codex") {
+      showToast("info", "Push-to-talk is available for codex sessions only.");
+      return;
+    }
+    if (state.sending) {
+      showToast("info", "Turn実行中は音声入力を開始できません。");
+      return;
+    }
+    if (state.reloading) {
+      showToast("info", "Reload中は音声入力を開始できません。");
+      return;
+    }
+    if (
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== "function"
+    ) {
+      showToast("error", "この環境ではマイク入力が利用できません。");
+      return;
+    }
+    realtimePttRequested = true;
+    setRealtimePttButtonState();
+    vscode.postMessage({
+      type: "realtimePttStart",
+      sessionId: state.activeSession.id,
+    });
+  };
+
+  const requestRealtimePttStop = (): void => {
+    if (!state.activeSession) return;
+    realtimePttRequested = false;
+    setRealtimePttButtonState();
+    vscode.postMessage({
+      type: "realtimePttStop",
+      sessionId: state.activeSession.id,
+    });
+  };
+
+  const clearShiftRightHoldTimer = (): void => {
+    if (realtimePttShiftRightHoldTimer) {
+      clearTimeout(realtimePttShiftRightHoldTimer);
+      realtimePttShiftRightHoldTimer = null;
+    }
+  };
+
+  const isModifierOnlyKeyCode = (code: string): boolean =>
+    code === "ShiftLeft" ||
+    code === "ShiftRight" ||
+    code === "AltLeft" ||
+    code === "AltRight" ||
+    code === "ControlLeft" ||
+    code === "ControlRight" ||
+    code === "MetaLeft" ||
+    code === "MetaRight";
+
+  const handleShiftRightDown = (e: KeyboardEvent): void => {
+    if (e.code !== "ShiftRight") return;
+    if (e.repeat) return;
+    realtimePttShiftRightPressed = true;
+    clearShiftRightHoldTimer();
+    if (realtimePttRequested || realtimePttRecording) return;
+    realtimePttShiftRightHoldTimer = setTimeout(() => {
+      realtimePttShiftRightHoldTimer = null;
+      if (!realtimePttShiftRightPressed) return;
+      requestRealtimePttStart();
+    }, REALTIME_PTT_SHIFT_RIGHT_HOLD_MS);
+  };
+
+  const handleShiftRightUp = (e: KeyboardEvent): void => {
+    if (e.code !== "ShiftRight") return;
+    realtimePttShiftRightPressed = false;
+    clearShiftRightHoldTimer();
+    if (realtimePttRecording || realtimePttRequested) {
+      requestRealtimePttStop();
+    }
+  };
+
   sendBtn.addEventListener("click", () =>
     state.sending ? stopCurrentTurn() : sendCurrentInput(),
   );
   steerSendBtn.addEventListener("click", () => steerCurrentInput());
   queueSendBtn.addEventListener("click", () => queueCurrentInput());
+  pttBtn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    requestRealtimePttStart();
+  });
+  pttBtn.addEventListener("pointerup", (e) => {
+    e.preventDefault();
+    requestRealtimePttStop();
+  });
+  pttBtn.addEventListener("pointercancel", (e) => {
+    e.preventDefault();
+    requestRealtimePttStop();
+  });
+  pttBtn.addEventListener("pointerleave", (e) => {
+    if ((e as PointerEvent).buttons === 0) requestRealtimePttStop();
+  });
+  pttBtn.addEventListener("blur", () => {
+    if (realtimePttRecording || realtimePttRequested) requestRealtimePttStop();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      if (realtimePttRecording || realtimePttRequested) requestRealtimePttStop();
+    }
+  });
+  window.addEventListener("blur", () => {
+    realtimePttShiftRightPressed = false;
+    clearShiftRightHoldTimer();
+    if (realtimePttRecording || realtimePttRequested) requestRealtimePttStop();
+  });
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      const ke = e as KeyboardEvent;
+      if (ke.code === "ShiftRight") {
+        handleShiftRightDown(ke);
+        return;
+      }
+      if (!realtimePttShiftRightPressed) return;
+      if (isModifierOnlyKeyCode(ke.code)) return;
+      clearShiftRightHoldTimer();
+      if (realtimePttRecording || realtimePttRequested) requestRealtimePttStop();
+    },
+    true,
+  );
+  window.addEventListener(
+    "keyup",
+    (e) => {
+      handleShiftRightUp(e as KeyboardEvent);
+    },
+    true,
+  );
+  setRealtimePttButtonState();
 
   // Only stop from Esc when the input itself is focused.
   // (Do not bind a global Esc handler; that would conflict with VS Code keybindings.)
@@ -6062,6 +6349,7 @@ function main(): void {
       base64?: unknown;
       error?: unknown;
       data?: unknown;
+      recording?: unknown;
     };
     if (anyMsg.type === "toast") {
       const kind =
@@ -6137,6 +6425,42 @@ function main(): void {
           error:
             typeof anyMsg.error === "string" ? anyMsg.error : "Unknown error",
         });
+      }
+      return;
+    }
+    if (anyMsg.type === "realtimePttState") {
+      const sessionId =
+        typeof anyMsg.sessionId === "string" ? anyMsg.sessionId : null;
+      if (!sessionId) return;
+      if (!state.activeSession || state.activeSession.id !== sessionId) return;
+      const recording = Boolean(anyMsg.recording);
+      const error =
+        typeof anyMsg.error === "string" ? anyMsg.error.trim() : "";
+
+      if (recording && !realtimePttRecording) {
+        realtimePttRecording = true;
+        setRealtimePttButtonState();
+        void startRealtimePttCapture().catch((err) => {
+          const message =
+            err instanceof Error ? err.message : `Capture failed: ${String(err)}`;
+          showToast("error", message);
+          requestRealtimePttStop();
+        });
+      } else if (!recording && realtimePttRecording) {
+        realtimePttRecording = false;
+        setRealtimePttButtonState();
+        void stopRealtimePttCapture();
+      }
+
+      if (!recording) {
+        realtimePttRequested = false;
+      }
+      setRealtimePttButtonState();
+
+      if (error) showToast("error", error);
+      if (recording && !realtimePttRequested) {
+        // Pointer already released before start ack arrived.
+        requestRealtimePttStop();
       }
       return;
     }

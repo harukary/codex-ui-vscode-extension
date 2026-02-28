@@ -9,6 +9,7 @@ import { parse as shellParse } from "shell-quote";
 import * as vscode from "vscode";
 import { BackendManager } from "./backend/manager";
 import type { BackendTermination } from "./backend/manager";
+import type { RealtimeAudioChunkInput } from "./backend/manager";
 import { listAgentsFromDisk } from "./agents_disk";
 import type { AnyServerNotification } from "./backend/types";
 import type { ContentBlock } from "./generated/ContentBlock";
@@ -70,6 +71,8 @@ import { SessionPanelManager } from "./ui/session_panel_manager";
 import { SessionTreeDataProvider } from "./ui/session_tree";
 
 const REWIND_STEP_TIMEOUT_MS = 120_000;
+const REALTIME_PTT_PROMPT =
+  "Transcribe the user's speech into plain text for chat input. Return text only.";
 const LAST_ACTIVE_SESSION_KEY = "codex.lastActiveSessionId.v1";
 const DEFAULT_PROJECT_DOC_FILENAME = "AGENTS.md";
 
@@ -562,6 +565,11 @@ type SessionRuntime = {
   pendingUserInputQueue: QueuedUserInput[];
   pendingLocalUserBlockId: string | null;
   flushingQueuedUserInput: boolean;
+  realtimePttActive: boolean;
+  realtimePttCollecting: boolean;
+  realtimePttTranscript: string;
+  realtimePttFallbackTranscript: string;
+  realtimePttAudioChain: Promise<void> | null;
   actionCards: Map<string, ActionCardState>;
 };
 
@@ -981,6 +989,132 @@ export function activate(context: vscode.ExtensionContext): void {
     await steerUserInput(session, expandedText, activeTurnId);
   };
 
+  const getRealtimePttSession = (sessionId: string): Session => {
+    if (!sessions) throw new Error("sessions is not initialized");
+    const session = sessions.getById(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.backendId !== "codex") {
+      throw new Error("Realtime push-to-talk is supported for codex only.");
+    }
+    return session;
+  };
+
+  const handleRealtimePttStart = async (sessionId: string): Promise<void> => {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    const session = getRealtimePttSession(sessionId);
+    const rt = ensureRuntime(session.id);
+    if (rt.realtimePttActive) {
+      chatView?.postRealtimePttState({
+        sessionId: session.id,
+        recording: true,
+      });
+      return;
+    }
+
+    rt.realtimePttActive = true;
+    rt.realtimePttCollecting = true;
+    rt.realtimePttTranscript = "";
+    rt.realtimePttFallbackTranscript = "";
+    rt.realtimePttAudioChain = Promise.resolve();
+    schedulePersistRuntime(session.id);
+
+    try {
+      await backendManager.threadRealtimeStart(session, {
+        prompt: REALTIME_PTT_PROMPT,
+      });
+      chatView?.postRealtimePttState({
+        sessionId: session.id,
+        recording: true,
+      });
+    } catch (err) {
+      rt.realtimePttActive = false;
+      rt.realtimePttCollecting = false;
+      rt.realtimePttAudioChain = null;
+      const message = formatUnknownError(err);
+      outputChannel?.appendLine(
+        `[realtime-ptt] start failed: sessionId=${session.id} err=${message}`,
+      );
+      chatView?.postRealtimePttState({
+        sessionId: session.id,
+        recording: false,
+        error: message,
+      });
+      schedulePersistRuntime(session.id);
+    }
+  };
+
+  const handleRealtimePttAudioChunk = async (
+    sessionId: string,
+    chunk: RealtimeAudioChunkInput,
+  ): Promise<void> => {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    const bm = backendManager;
+    const session = getRealtimePttSession(sessionId);
+    const rt = ensureRuntime(session.id);
+    if (!rt.realtimePttCollecting) return;
+
+    rt.realtimePttAudioChain = (rt.realtimePttAudioChain ?? Promise.resolve())
+      .then(async () => {
+        if (!rt.realtimePttCollecting) return;
+        try {
+          await bm.threadRealtimeAppendAudio(session, chunk);
+        } catch (err) {
+          const message = formatUnknownError(err);
+          outputChannel?.appendLine(
+            `[realtime-ptt] appendAudio failed: sessionId=${session.id} err=${message}`,
+          );
+          rt.realtimePttCollecting = false;
+          rt.realtimePttActive = false;
+          rt.realtimePttAudioChain = null;
+          chatView?.postRealtimePttState({
+            sessionId: session.id,
+            recording: false,
+            error: message,
+          });
+          schedulePersistRuntime(session.id);
+        }
+      })
+      .catch(() => {});
+  };
+
+  const handleRealtimePttStop = async (sessionId: string): Promise<void> => {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    const session = getRealtimePttSession(sessionId);
+    const rt = ensureRuntime(session.id);
+    rt.realtimePttCollecting = false;
+
+    const chain = rt.realtimePttAudioChain;
+    rt.realtimePttAudioChain = null;
+    if (chain) await chain.catch(() => {});
+
+    let stopError: string | null = null;
+    if (rt.realtimePttActive) {
+      try {
+        await backendManager.threadRealtimeStop(session);
+      } catch (err) {
+        stopError = formatUnknownError(err);
+        outputChannel?.appendLine(
+          `[realtime-ptt] stop failed: sessionId=${session.id} err=${stopError}`,
+        );
+      }
+    }
+    rt.realtimePttActive = false;
+
+    const transcript = (
+      rt.realtimePttTranscript || rt.realtimePttFallbackTranscript
+    ).trim();
+    rt.realtimePttTranscript = "";
+    rt.realtimePttFallbackTranscript = "";
+    if (transcript) chatView?.insertIntoInput(transcript);
+
+    chatView?.postRealtimePttState({
+      sessionId: session.id,
+      recording: false,
+      error: stopError,
+    });
+    schedulePersistRuntime(session.id);
+  };
+
   chatView = new ChatViewProvider(
     context,
     () => buildChatState(),
@@ -989,6 +1123,10 @@ export function activate(context: vscode.ExtensionContext): void {
     async (text, images = [], rewind = null) =>
       await handleChatSend(text, images, rewind, { queueIfBusy: true }),
     async (text, rewind = null) => await handleChatSteer(text, rewind),
+    async (sessionId) => await handleRealtimePttStart(sessionId),
+    async (sessionId, chunk) =>
+      await handleRealtimePttAudioChunk(sessionId, chunk),
+    async (sessionId) => await handleRealtimePttStop(sessionId),
     async (session, args) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       const requestID = String(args.requestID ?? "").trim();
@@ -6560,6 +6698,11 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     pendingUserInputQueue: [],
     pendingLocalUserBlockId: null,
     flushingQueuedUserInput: false,
+    realtimePttActive: false,
+    realtimePttCollecting: false,
+    realtimePttTranscript: "",
+    realtimePttFallbackTranscript: "",
+    realtimePttAudioChain: null,
     actionCards: new Map(),
   };
   runtimeBySessionId.set(sessionId, rt);
@@ -6829,6 +6972,53 @@ function normalizeSessionTitle(title: string): string {
   return withoutShortId || "(untitled)";
 }
 
+function mergeRealtimeTranscript(existing: string, incoming: string): string {
+  const next = incoming.trim();
+  if (!next) return existing;
+  if (!existing) return next;
+  if (existing.endsWith(next)) return existing;
+  if (next.endsWith(existing)) return next;
+  return `${existing}\n${next}`;
+}
+
+function extractRealtimeTranscriptText(payload: unknown): string {
+  const parts: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    if (parts.length > 0 && parts[parts.length - 1] === trimmed) return;
+    parts.push(trimmed);
+  };
+
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > 6 || node == null) return;
+    if (typeof node === "string") {
+      push(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const x of node) visit(x, depth + 1);
+      return;
+    }
+    if (typeof node !== "object") return;
+
+    const obj = node as Record<string, unknown>;
+    push(obj["transcript"]);
+    push(obj["text"]);
+    push(obj["value"]);
+    push(obj["inputText"]);
+    push(obj["outputText"]);
+    const content = obj["content"];
+    if (Array.isArray(content)) {
+      for (const x of content) visit(x, depth + 1);
+    }
+  };
+
+  visit(payload, 0);
+  return parts.join("\n").trim();
+}
+
 function applyServerNotification(
   backendKey: string,
   sessionId: string,
@@ -6860,6 +7050,62 @@ function applyServerNotification(
         sessionTree?.refresh();
         chatView?.refresh();
       }
+      return;
+    }
+    case "thread/realtime/started": {
+      rt.realtimePttActive = true;
+      rt.realtimePttCollecting = true;
+      chatView?.postRealtimePttState({
+        sessionId,
+        recording: true,
+      });
+      return;
+    }
+    case "thread/realtime/itemAdded": {
+      if (!rt.realtimePttCollecting) return;
+      const text = extractRealtimeTranscriptText((n as any).params?.item);
+      if (!text) return;
+      rt.realtimePttTranscript = mergeRealtimeTranscript(
+        rt.realtimePttTranscript,
+        text,
+      );
+      rt.realtimePttFallbackTranscript = mergeRealtimeTranscript(
+        rt.realtimePttFallbackTranscript,
+        text,
+      );
+      return;
+    }
+    case "thread/realtime/error": {
+      const p = (n as any).params as {
+        error?: { message?: unknown } | unknown;
+        message?: unknown;
+      };
+      const fromNested =
+        typeof (p?.error as { message?: unknown } | undefined)?.message ===
+        "string"
+          ? String((p?.error as { message?: unknown }).message)
+          : "";
+      const fromTop = typeof p?.message === "string" ? String(p.message) : "";
+      const message =
+        (fromNested || fromTop || "Realtime transcription failed.").trim();
+      rt.realtimePttActive = false;
+      rt.realtimePttCollecting = false;
+      rt.realtimePttAudioChain = null;
+      chatView?.postRealtimePttState({
+        sessionId,
+        recording: false,
+        error: message,
+      });
+      return;
+    }
+    case "thread/realtime/closed": {
+      rt.realtimePttActive = false;
+      rt.realtimePttCollecting = false;
+      rt.realtimePttAudioChain = null;
+      chatView?.postRealtimePttState({
+        sessionId,
+        recording: false,
+      });
       return;
     }
     case "error": {

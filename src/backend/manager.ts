@@ -92,6 +92,13 @@ type NetworkPolicyApprovalDecision = {
   };
 };
 
+export type RealtimeAudioChunkInput = {
+  data: string;
+  sampleRate: number;
+  numChannels: number;
+  samplesPerChannel?: number | null;
+};
+
 function imageMimeFromPath(filePath: string): string | null {
   const ext = filePath.trim().toLowerCase().split(".").pop() ?? "";
   switch (ext) {
@@ -1907,6 +1914,93 @@ export class BackendManager implements vscode.Disposable {
       throw new Error("Backend is not running for this workspace folder");
 
     await proc.turnInterrupt({ threadId: session.threadId, turnId });
+  }
+
+  public async threadRealtimeStart(
+    session: Session,
+    args: { prompt: string; sessionId?: string | null },
+  ): Promise<void> {
+    if (session.backendId !== "codex") {
+      throw new Error("Realtime is supported for codex sessions only.");
+    }
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    await this.withTimeout(
+      "thread/realtime/start",
+      proc.threadRealtimeStart({
+        threadId: session.threadId,
+        prompt: args.prompt,
+        sessionId: args.sessionId ?? null,
+      }),
+      10_000,
+    );
+  }
+
+  public async threadRealtimeAppendAudio(
+    session: Session,
+    audio: RealtimeAudioChunkInput,
+  ): Promise<void> {
+    if (session.backendId !== "codex") {
+      throw new Error("Realtime is supported for codex sessions only.");
+    }
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    await this.withTimeout(
+      "thread/realtime/appendAudio",
+      proc.threadRealtimeAppendAudio({
+        threadId: session.threadId,
+        audio: {
+          data: audio.data,
+          sampleRate: audio.sampleRate,
+          numChannels: audio.numChannels,
+          samplesPerChannel: audio.samplesPerChannel ?? null,
+        },
+      }),
+      10_000,
+    );
+  }
+
+  public async threadRealtimeStop(session: Session): Promise<void> {
+    if (session.backendId !== "codex") {
+      throw new Error("Realtime is supported for codex sessions only.");
+    }
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    await this.withTimeout(
+      "thread/realtime/stop",
+      proc.threadRealtimeStop({ threadId: session.threadId }),
+      10_000,
+    );
   }
 
   public async threadRollback(
