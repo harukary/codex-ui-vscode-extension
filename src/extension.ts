@@ -715,14 +715,12 @@ export function activate(context: vscode.ExtensionContext): void {
       actions,
     });
     if (activeSessionId !== session.id) {
-      setActiveSession(session.id);
       chatView?.toast(
         "info",
-        "Approval required. Switched to the requesting session.",
+        "Approval required in another session. Select that session to respond.",
       );
     }
     chatView?.refresh();
-    void showCodexViewContainer();
 
     return await new Promise((resolve) => {
       rt.approvalResolvers.set(requestKey, resolve);
@@ -3937,12 +3935,10 @@ async function handleRequestUserInputInChat(
   }
   const requestKey = requestKeyFromSessionAndId(session.id, req.id);
   if (activeSessionId !== session.id) {
-    setActiveSession(session.id);
     chatView.toast(
       "info",
-      "Input required. Switched to the requesting session.",
+      "Input required in another session. Select that session to answer.",
     );
-    void showCodexViewContainer();
   }
   const questions = req.params.questions.map((q) => ({
     id: q.id,
@@ -7370,6 +7366,28 @@ function applyServerNotification(
       chatView?.refresh();
       return;
     }
+    case "item/plan/delta": {
+      const p = (n as any).params as {
+        itemId?: unknown;
+        turnId?: unknown;
+        delta?: unknown;
+      };
+      const itemId = String(p?.itemId ?? "").trim();
+      const turnId = String(p?.turnId ?? "").trim();
+      const delta = String(p?.delta ?? "");
+      if (!itemId || !delta) return;
+
+      const block = getOrCreateTurnAnchoredBlock(rt, itemId, turnId || null, () => ({
+        id: itemId,
+        type: "plan",
+        title: "Plan",
+        text: "",
+      }));
+      if (block.type !== "plan") return;
+      block.text += delta;
+      chatView?.postBlockUpsert(sessionId, block);
+      return;
+    }
     case "opencode/permission/asked": {
       const p = (n as any).params as {
         requestID?: unknown;
@@ -7497,6 +7515,19 @@ function applyItemLifecycle(
 ): void {
   const statusText = completed ? "completed" : "started";
   switch (item.type) {
+    case "plan": {
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
+        id: item.id,
+        type: "plan",
+        title: "Plan",
+        text: item.text ?? "",
+      }));
+      if (block.type === "plan") {
+        block.text = item.text ?? "";
+      }
+      chatView?.postBlockUpsert(sessionId, block);
+      break;
+    }
     case "reasoning": {
       const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,

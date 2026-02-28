@@ -4,3 +4,4 @@ src/generated
 # VS Code extension packages
 *.vsix
 references/
+reference/
