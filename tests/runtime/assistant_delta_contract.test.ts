@@ -15,12 +15,14 @@ describe("assistant delta contract", () => {
     expect(src).toContain("rt.pendingAssistantDeltas.set(id, prev ? prev + delta : delta);");
   });
 
-  it("does not anchor by turnId and keeps item order by first-seen append", async () => {
+  it("anchors tool items by turnId when possible", async () => {
     const filePath = path.resolve(__dirname, "../../src/extension.ts");
     const src = await fs.readFile(filePath, "utf8");
 
-    expect(src).toContain("void turnId;");
-    expect(src).toContain("rt.blockIndexById.set(id, rt.blocks.length);");
-    expect(src).toContain("rt.blocks.push(block);");
+    expect(src).toContain("let insertAt = rt.blocks.length;");
+    expect(src).toContain("if (turnId) {");
+    expect(src).toContain("candidateTurnId === turnId");
+    expect(src).toContain("rt.blocks.splice(insertAt, 0, block);");
+    expect(src).toContain("rebuildBlockIndex(rt);");
   });
 });

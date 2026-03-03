@@ -347,19 +347,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage({ type: "toast", kind, message });
   }
 
-  public postRealtimePttState(args: {
-    sessionId: string;
-    recording: boolean;
-    error?: string | null;
-  }): void {
-    this.view?.webview.postMessage({
-      type: "realtimePttState",
-      sessionId: args.sessionId,
-      recording: args.recording,
-      error: args.error ?? null,
-    });
-  }
-
   public async promptRequestUserInput(args: {
     sessionId: string;
     requestKey: string;
@@ -430,17 +417,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       text: string,
       rewind?: RewindRequest | null,
     ) => Promise<void>,
-    private readonly onRealtimePttStart: (sessionId: string) => Promise<void>,
-    private readonly onRealtimePttAudioChunk: (
-      sessionId: string,
-      chunk: {
-        data: string;
-        sampleRate: number;
-        numChannels: number;
-        samplesPerChannel: number | null;
-      },
-    ) => Promise<void>,
-    private readonly onRealtimePttStop: (sessionId: string) => Promise<void>,
     private readonly onOpencodePermissionReply: (
       session: Session,
       args: { requestID: string; reply: "once" | "always" | "reject" },
@@ -795,45 +771,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           error,
         });
       }
-      return;
-    }
-
-    if (type === "realtimePttStart") {
-      const sessionId = anyMsg["sessionId"];
-      if (typeof sessionId !== "string" || !sessionId) return;
-      await this.onRealtimePttStart(sessionId);
-      return;
-    }
-
-    if (type === "realtimePttAudioChunk") {
-      const sessionId = anyMsg["sessionId"];
-      const data = anyMsg["data"];
-      const sampleRate = anyMsg["sampleRate"];
-      const numChannels = anyMsg["numChannels"];
-      const samplesPerChannel = anyMsg["samplesPerChannel"];
-      if (typeof sessionId !== "string" || !sessionId) return;
-      if (typeof data !== "string" || !data) return;
-      if (typeof sampleRate !== "number" || !Number.isFinite(sampleRate)) return;
-      if (typeof numChannels !== "number" || !Number.isFinite(numChannels))
-        return;
-      const normalizedSamplesPerChannel =
-        typeof samplesPerChannel === "number" &&
-        Number.isFinite(samplesPerChannel)
-          ? Math.max(0, Math.trunc(samplesPerChannel))
-          : null;
-      await this.onRealtimePttAudioChunk(sessionId, {
-        data,
-        sampleRate: Math.max(1, Math.trunc(sampleRate)),
-        numChannels: Math.max(1, Math.trunc(numChannels)),
-        samplesPerChannel: normalizedSamplesPerChannel,
-      });
-      return;
-    }
-
-    if (type === "realtimePttStop") {
-      const sessionId = anyMsg["sessionId"];
-      if (typeof sessionId !== "string" || !sessionId) return;
-      await this.onRealtimePttStop(sessionId);
       return;
     }
 
@@ -1902,10 +1839,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         "markdown-it.min.js",
       ),
     );
+    const mermaidUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(
+        this.context.extensionUri,
+        "resources",
+        "vendor",
+        "mermaid.min.js",
+      ),
+    );
     const cacheBusted = (uri: vscode.Uri): vscode.Uri =>
       uri.with({ query: `v=${nonce}` });
     const clientScriptUriV = cacheBusted(clientScriptUri);
     const markdownItUriV = cacheBusted(markdownItUri);
+    const mermaidUriV = cacheBusted(mermaidUri);
 
     return `<!doctype html>
 <html lang="ja">
@@ -1938,10 +1884,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       button.iconBtn::before { content: "➤"; font-size: 14px; opacity: 0.95; }
       button.iconBtn[data-mode="stop"]::before { content: "■"; font-size: 12px; }
       button.iconBtn.settingsBtn::before { content: "⚙"; font-size: 14px; }
-      button.iconBtn.pttBtn::before { content: "🎤"; font-size: 14px; }
-      button.iconBtn.pttBtn.recording { border-color: rgba(220,60,60,0.70); background: rgba(220,60,60,0.20); }
-      .pttState { font-size: 11px; opacity: 0.85; min-width: 7.5em; white-space: nowrap; }
-      .pttState.recording { color: var(--vscode-errorForeground, #f14c4c); font-weight: 600; opacity: 1; }
       .footerBar { border-top: 1px solid rgba(127,127,127,0.25); padding: 8px 12px 10px; display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; position: relative; }
       .modelBar { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; margin: 0; min-width: 0; flex: 1 1 auto; overflow: hidden; }
       .modeBadge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(127,127,127,0.35); opacity: 0.85; white-space: nowrap; }
@@ -2070,8 +2012,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .md h3 { font-size: 1.1em; }
       .md code { font-family: var(--cm-editor-font-family); font-size: 0.95em; background: rgba(127,127,127,0.15); padding: 0 4px; border-radius: 4px; }
       .md pre code { background: transparent; padding: 0; }
-      .md pre { background: rgba(127,127,127,0.10); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
-      .md a { color: var(--vscode-textLink-foreground, rgba(0,120,212,0.9)); text-decoration: underline; }
+	      .md pre { background: rgba(127,127,127,0.10); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+	      .md .mermaidBlock { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: rgba(127,127,127,0.06); overflow-x: auto; }
+	      .md .mermaidBlock svg { display: block; max-width: 100%; height: auto; }
+	      .md .mermaidBlockError { font-size: 12px; color: var(--vscode-errorForeground, #f14c4c); margin-bottom: 8px; }
+	      .md .mermaidBlockSource { margin-top: 8px; }
+	      .md a { color: var(--vscode-textLink-foreground, rgba(0,120,212,0.9)); text-decoration: underline; }
       .md a:hover { color: var(--vscode-textLink-activeForeground, rgba(0,120,212,1)); }
       .md a, .md code { overflow-wrap: anywhere; }
       .composer { border-top: 1px solid rgba(127,127,127,0.3); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; position: relative; }
@@ -2199,8 +2145,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	      <div id="inputRow" class="inputRow">
         <input id="imageInput" type="file" accept="image/*" multiple style="display:none" />
         <button id="attach" class="iconBtn attachBtn" aria-label="Attach image" title="Attach image"></button>
-        <button id="ptt" class="iconBtn pttBtn" aria-label="Push to talk" title="Hold to talk (realtime)"></button>
-        <span id="pttState" class="pttState" aria-live="polite"></span>
         <textarea id="input" rows="1" placeholder="Type a message"></textarea>
         <button id="send" class="iconBtn" data-mode="send" aria-label="Send" title="Send (Esc: stop)"></button>
       </div>
@@ -2213,6 +2157,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	    </div>
 	    <div id="toast" class="toast"></div>
 	    <script nonce="${nonce}" src="${markdownItUriV}"></script>
+	    <script nonce="${nonce}" src="${mermaidUriV}"></script>
 	    <script nonce="${nonce}" src="${clientScriptUriV}"></script>
 	  </body>
 	</html>`;

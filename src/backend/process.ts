@@ -76,28 +76,6 @@ type TurnSteerResponse = {
   turnId: string;
 };
 
-type ThreadRealtimeStartParams = {
-  threadId: string;
-  prompt: string;
-  sessionId?: string | null;
-};
-
-type ThreadRealtimeAudioChunk = {
-  data: string;
-  sampleRate: number;
-  numChannels: number;
-  samplesPerChannel?: number | null;
-};
-
-type ThreadRealtimeAppendAudioParams = {
-  threadId: string;
-  audio: ThreadRealtimeAudioChunk;
-};
-
-type ThreadRealtimeStopParams = {
-  threadId: string;
-};
-
 export type ExperimentalFeatureEntry = {
   key: string;
   stage?: string | null;
@@ -395,33 +373,6 @@ export class BackendProcess implements vscode.Disposable {
       method: "turn/interrupt",
       params,
     });
-  }
-
-  public async threadRealtimeStart(
-    params: ThreadRealtimeStartParams,
-  ): Promise<Record<string, never>> {
-    return this.rpc.request<Record<string, never>>({
-      method: "thread/realtime/start",
-      params,
-    } as any);
-  }
-
-  public async threadRealtimeAppendAudio(
-    params: ThreadRealtimeAppendAudioParams,
-  ): Promise<Record<string, never>> {
-    return this.rpc.request<Record<string, never>>({
-      method: "thread/realtime/appendAudio",
-      params,
-    } as any);
-  }
-
-  public async threadRealtimeStop(
-    params: ThreadRealtimeStopParams,
-  ): Promise<Record<string, never>> {
-    return this.rpc.request<Record<string, never>>({
-      method: "thread/realtime/stop",
-      params,
-    } as any);
   }
 
   public async listModels(

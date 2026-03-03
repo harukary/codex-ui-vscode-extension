@@ -92,13 +92,6 @@ type NetworkPolicyApprovalDecision = {
   };
 };
 
-export type RealtimeAudioChunkInput = {
-  data: string;
-  sampleRate: number;
-  numChannels: number;
-  samplesPerChannel?: number | null;
-};
-
 function imageMimeFromPath(filePath: string): string | null {
   const ext = filePath.trim().toLowerCase().split(".").pop() ?? "";
   switch (ext) {
@@ -405,7 +398,9 @@ export class BackendManager implements vscode.Disposable {
               this.emitNotification(backendKey, session, {
                 method: "error",
                 params: {
-                  error: { message: `OpenCode event stream error: ${String(err)}` },
+                  error: {
+                    message: `OpenCode event stream error: ${String(err)}`,
+                  },
                   willRetry: false,
                 },
               });
@@ -674,8 +669,7 @@ export class BackendManager implements vscode.Disposable {
     };
     const res = await proc.threadStart(params);
     const rawName = (res.thread as unknown as Record<string, unknown>)["name"];
-    const threadName =
-      typeof rawName === "string" ? rawName.trim() : "";
+    const threadName = typeof rawName === "string" ? rawName.trim() : "";
     const threadPreview = String(res.thread.preview ?? "").trim();
     const initialTitle = threadName || threadPreview || folder.name;
 
@@ -1304,6 +1298,41 @@ export class BackendManager implements vscode.Disposable {
     return read.thread;
   }
 
+  public async readThreadForSession(
+    session: Session,
+    opts?: { includeTurns?: boolean },
+  ): Promise<Thread> {
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const oc = this.opencode.get(session.backendKey);
+    if (oc) {
+      return await this.buildThreadFromOpencodeSession(
+        session.threadId,
+        oc.client,
+      );
+    }
+
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    const read = await this.withTimeout(
+      "thread/read",
+      proc.threadRead({
+        threadId: session.threadId,
+        includeTurns: opts?.includeTurns ?? false,
+      }),
+      10_000,
+    );
+    return read.thread;
+  }
+
   public async reloadSession(
     session: Session,
     modelSettings?: ModelSettings,
@@ -1914,93 +1943,6 @@ export class BackendManager implements vscode.Disposable {
       throw new Error("Backend is not running for this workspace folder");
 
     await proc.turnInterrupt({ threadId: session.threadId, turnId });
-  }
-
-  public async threadRealtimeStart(
-    session: Session,
-    args: { prompt: string; sessionId?: string | null },
-  ): Promise<void> {
-    if (session.backendId !== "codex") {
-      throw new Error("Realtime is supported for codex sessions only.");
-    }
-    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
-    if (!folder) {
-      throw new Error(
-        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
-      );
-    }
-
-    await this.startForBackendId(folder, session.backendId);
-    const proc = this.processes.get(session.backendKey);
-    if (!proc)
-      throw new Error("Backend is not running for this workspace folder");
-
-    await this.withTimeout(
-      "thread/realtime/start",
-      proc.threadRealtimeStart({
-        threadId: session.threadId,
-        prompt: args.prompt,
-        sessionId: args.sessionId ?? null,
-      }),
-      10_000,
-    );
-  }
-
-  public async threadRealtimeAppendAudio(
-    session: Session,
-    audio: RealtimeAudioChunkInput,
-  ): Promise<void> {
-    if (session.backendId !== "codex") {
-      throw new Error("Realtime is supported for codex sessions only.");
-    }
-    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
-    if (!folder) {
-      throw new Error(
-        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
-      );
-    }
-
-    await this.startForBackendId(folder, session.backendId);
-    const proc = this.processes.get(session.backendKey);
-    if (!proc)
-      throw new Error("Backend is not running for this workspace folder");
-
-    await this.withTimeout(
-      "thread/realtime/appendAudio",
-      proc.threadRealtimeAppendAudio({
-        threadId: session.threadId,
-        audio: {
-          data: audio.data,
-          sampleRate: audio.sampleRate,
-          numChannels: audio.numChannels,
-          samplesPerChannel: audio.samplesPerChannel ?? null,
-        },
-      }),
-      10_000,
-    );
-  }
-
-  public async threadRealtimeStop(session: Session): Promise<void> {
-    if (session.backendId !== "codex") {
-      throw new Error("Realtime is supported for codex sessions only.");
-    }
-    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
-    if (!folder) {
-      throw new Error(
-        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
-      );
-    }
-
-    await this.startForBackendId(folder, session.backendId);
-    const proc = this.processes.get(session.backendKey);
-    if (!proc)
-      throw new Error("Backend is not running for this workspace folder");
-
-    await this.withTimeout(
-      "thread/realtime/stop",
-      proc.threadRealtimeStop({ threadId: session.threadId }),
-      10_000,
-    );
   }
 
   public async threadRollback(
@@ -3418,7 +3360,10 @@ export class BackendManager implements vscode.Disposable {
       );
       this.setActiveTurnState(p.threadId, null);
 
-      const completedSession = this.sessions.getByThreadId(backendKey, p.threadId);
+      const completedSession = this.sessions.getByThreadId(
+        backendKey,
+        p.threadId,
+      );
       if (completedSession) {
         this.onTurnCompleted?.(completedSession, p.turn.status, p.turn.id);
       }

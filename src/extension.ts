@@ -9,7 +9,6 @@ import { parse as shellParse } from "shell-quote";
 import * as vscode from "vscode";
 import { BackendManager } from "./backend/manager";
 import type { BackendTermination } from "./backend/manager";
-import type { RealtimeAudioChunkInput } from "./backend/manager";
 import { listAgentsFromDisk } from "./agents_disk";
 import type { AnyServerNotification } from "./backend/types";
 import type { ContentBlock } from "./generated/ContentBlock";
@@ -71,8 +70,6 @@ import { SessionPanelManager } from "./ui/session_panel_manager";
 import { SessionTreeDataProvider } from "./ui/session_tree";
 
 const REWIND_STEP_TIMEOUT_MS = 120_000;
-const REALTIME_PTT_PROMPT =
-  "Transcribe the user's speech into plain text for chat input. Return text only.";
 const LAST_ACTIVE_SESSION_KEY = "codex.lastActiveSessionId.v1";
 const DEFAULT_PROJECT_DOC_FILENAME = "AGENTS.md";
 
@@ -557,19 +554,11 @@ type SessionRuntime = {
       actions: ApprovalAction[];
     }
   >;
-  approvalResolvers: Map<
-    string,
-    (decision: UiApprovalDecision) => void
-  >;
+  approvalResolvers: Map<string, (decision: UiApprovalDecision) => void>;
   pendingAppMentions: Array<{ name: string; path: string }>;
   pendingUserInputQueue: QueuedUserInput[];
   pendingLocalUserBlockId: string | null;
   flushingQueuedUserInput: boolean;
-  realtimePttActive: boolean;
-  realtimePttCollecting: boolean;
-  realtimePttTranscript: string;
-  realtimePttFallbackTranscript: string;
-  realtimePttAudioChain: Promise<void> | null;
   actionCards: Map<string, ActionCardState>;
 };
 
@@ -686,7 +675,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const actions: ApprovalAction[] = [];
     if (req.method === "item/commandExecution/requestApproval") {
-      const proposed = Array.isArray(reqParams["proposedNetworkPolicyAmendments"])
+      const proposed = Array.isArray(
+        reqParams["proposedNetworkPolicyAmendments"],
+      )
         ? (reqParams["proposedNetworkPolicyAmendments"] as unknown[])
         : [];
       for (const cand of proposed) {
@@ -695,7 +686,8 @@ export function activate(context: vscode.ExtensionContext): void {
         const host = typeof c["host"] === "string" ? c["host"].trim() : "";
         const actionRaw =
           typeof c["action"] === "string" ? c["action"].trim() : "";
-        const action = actionRaw === "allow" || actionRaw === "deny" ? actionRaw : "";
+        const action =
+          actionRaw === "allow" || actionRaw === "deny" ? actionRaw : "";
         if (!host || !action) continue;
         actions.push({
           id: `network:${action}:${host}`,
@@ -989,132 +981,6 @@ export function activate(context: vscode.ExtensionContext): void {
     await steerUserInput(session, expandedText, activeTurnId);
   };
 
-  const getRealtimePttSession = (sessionId: string): Session => {
-    if (!sessions) throw new Error("sessions is not initialized");
-    const session = sessions.getById(sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
-    if (session.backendId !== "codex") {
-      throw new Error("Realtime push-to-talk is supported for codex only.");
-    }
-    return session;
-  };
-
-  const handleRealtimePttStart = async (sessionId: string): Promise<void> => {
-    if (!backendManager) throw new Error("backendManager is not initialized");
-    const session = getRealtimePttSession(sessionId);
-    const rt = ensureRuntime(session.id);
-    if (rt.realtimePttActive) {
-      chatView?.postRealtimePttState({
-        sessionId: session.id,
-        recording: true,
-      });
-      return;
-    }
-
-    rt.realtimePttActive = true;
-    rt.realtimePttCollecting = true;
-    rt.realtimePttTranscript = "";
-    rt.realtimePttFallbackTranscript = "";
-    rt.realtimePttAudioChain = Promise.resolve();
-    schedulePersistRuntime(session.id);
-
-    try {
-      await backendManager.threadRealtimeStart(session, {
-        prompt: REALTIME_PTT_PROMPT,
-      });
-      chatView?.postRealtimePttState({
-        sessionId: session.id,
-        recording: true,
-      });
-    } catch (err) {
-      rt.realtimePttActive = false;
-      rt.realtimePttCollecting = false;
-      rt.realtimePttAudioChain = null;
-      const message = formatUnknownError(err);
-      outputChannel?.appendLine(
-        `[realtime-ptt] start failed: sessionId=${session.id} err=${message}`,
-      );
-      chatView?.postRealtimePttState({
-        sessionId: session.id,
-        recording: false,
-        error: message,
-      });
-      schedulePersistRuntime(session.id);
-    }
-  };
-
-  const handleRealtimePttAudioChunk = async (
-    sessionId: string,
-    chunk: RealtimeAudioChunkInput,
-  ): Promise<void> => {
-    if (!backendManager) throw new Error("backendManager is not initialized");
-    const bm = backendManager;
-    const session = getRealtimePttSession(sessionId);
-    const rt = ensureRuntime(session.id);
-    if (!rt.realtimePttCollecting) return;
-
-    rt.realtimePttAudioChain = (rt.realtimePttAudioChain ?? Promise.resolve())
-      .then(async () => {
-        if (!rt.realtimePttCollecting) return;
-        try {
-          await bm.threadRealtimeAppendAudio(session, chunk);
-        } catch (err) {
-          const message = formatUnknownError(err);
-          outputChannel?.appendLine(
-            `[realtime-ptt] appendAudio failed: sessionId=${session.id} err=${message}`,
-          );
-          rt.realtimePttCollecting = false;
-          rt.realtimePttActive = false;
-          rt.realtimePttAudioChain = null;
-          chatView?.postRealtimePttState({
-            sessionId: session.id,
-            recording: false,
-            error: message,
-          });
-          schedulePersistRuntime(session.id);
-        }
-      })
-      .catch(() => {});
-  };
-
-  const handleRealtimePttStop = async (sessionId: string): Promise<void> => {
-    if (!backendManager) throw new Error("backendManager is not initialized");
-    const session = getRealtimePttSession(sessionId);
-    const rt = ensureRuntime(session.id);
-    rt.realtimePttCollecting = false;
-
-    const chain = rt.realtimePttAudioChain;
-    rt.realtimePttAudioChain = null;
-    if (chain) await chain.catch(() => {});
-
-    let stopError: string | null = null;
-    if (rt.realtimePttActive) {
-      try {
-        await backendManager.threadRealtimeStop(session);
-      } catch (err) {
-        stopError = formatUnknownError(err);
-        outputChannel?.appendLine(
-          `[realtime-ptt] stop failed: sessionId=${session.id} err=${stopError}`,
-        );
-      }
-    }
-    rt.realtimePttActive = false;
-
-    const transcript = (
-      rt.realtimePttTranscript || rt.realtimePttFallbackTranscript
-    ).trim();
-    rt.realtimePttTranscript = "";
-    rt.realtimePttFallbackTranscript = "";
-    if (transcript) chatView?.insertIntoInput(transcript);
-
-    chatView?.postRealtimePttState({
-      sessionId: session.id,
-      recording: false,
-      error: stopError,
-    });
-    schedulePersistRuntime(session.id);
-  };
-
   chatView = new ChatViewProvider(
     context,
     () => buildChatState(),
@@ -1123,10 +989,6 @@ export function activate(context: vscode.ExtensionContext): void {
     async (text, images = [], rewind = null) =>
       await handleChatSend(text, images, rewind, { queueIfBusy: true }),
     async (text, rewind = null) => await handleChatSteer(text, rewind),
-    async (sessionId) => await handleRealtimePttStart(sessionId),
-    async (sessionId, chunk) =>
-      await handleRealtimePttAudioChunk(sessionId, chunk),
-    async (sessionId) => await handleRealtimePttStop(sessionId),
     async (session, args) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       const requestID = String(args.requestID ?? "").trim();
@@ -1724,7 +1586,10 @@ export function activate(context: vscode.ExtensionContext): void {
       type ResumeLoadMoreItem = vscode.QuickPickItem & {
         entryType: "more";
       };
-      type ResumePickItem = ResumeControlItem | ResumeThreadItem | ResumeLoadMoreItem;
+      type ResumePickItem =
+        | ResumeControlItem
+        | ResumeThreadItem
+        | ResumeLoadMoreItem;
 
       const archivedButton: vscode.QuickInputButton = {
         iconPath: new vscode.ThemeIcon("archive"),
@@ -1748,6 +1613,7 @@ export function activate(context: vscode.ExtensionContext): void {
         let pageThreads: Thread[] = [];
         let activeThreadIds: string[] = [];
         let finalized = false;
+        let lastResetQuerySignature: string | null = null;
 
         const finish = (thread: Thread | null): void => {
           if (finalized) return;
@@ -1833,10 +1699,25 @@ export function activate(context: vscode.ExtensionContext): void {
         const fetchThreads = async (opts: {
           reset: boolean;
           debounced?: boolean;
+          force?: boolean;
         }): Promise<void> => {
+          const querySignature = JSON.stringify({
+            searchTerm,
+            sortKey,
+            archived,
+            sourceKinds: Array.isArray(sourceKinds) ? "all" : "interactive",
+          });
+          if (
+            opts.reset &&
+            !opts.force &&
+            lastResetQuerySignature === querySignature
+          ) {
+            return;
+          }
+          if (opts.reset) lastResetQuerySignature = querySignature;
+
           const seq = ++inFlight;
           qp.busy = true;
-          qp.enabled = false;
 
           if (opts.reset) {
             nextCursor = null;
@@ -1876,17 +1757,21 @@ export function activate(context: vscode.ExtensionContext): void {
             refreshItems();
           } catch (err) {
             if (seq !== inFlight || finalized) return;
-            output.appendLine(`[resume] Failed to list threads: ${String(err)}`);
+            output.appendLine(
+              `[resume] Failed to list threads: ${String(err)}`,
+            );
             void vscode.window.showErrorMessage("Failed to list history.");
             finish(null);
           } finally {
             if (seq !== inFlight || finalized) return;
             qp.busy = false;
-            qp.enabled = true;
           }
         };
 
-        const triggerRefresh = (opts?: { debounced?: boolean }): void => {
+        const triggerRefresh = (opts?: {
+          debounced?: boolean;
+          force?: boolean;
+        }): void => {
           if (debounce) {
             clearTimeout(debounce);
             debounce = null;
@@ -1894,11 +1779,15 @@ export function activate(context: vscode.ExtensionContext): void {
           if (opts?.debounced) {
             debounce = setTimeout(() => {
               debounce = null;
-              void fetchThreads({ reset: true, debounced: true });
-            }, 150);
+              void fetchThreads({
+                reset: true,
+                debounced: true,
+                force: opts?.force,
+              });
+            }, 450);
             return;
           }
-          void fetchThreads({ reset: true });
+          void fetchThreads({ reset: true, force: opts?.force });
         };
 
         qp.title = "Codex UI: Resume";
@@ -1972,7 +1861,7 @@ export function activate(context: vscode.ExtensionContext): void {
           finish(picked.thread);
         });
         qp.show();
-        void fetchThreads({ reset: true });
+        void fetchThreads({ reset: true, force: true });
       });
       if (!pickedThread) return;
 
@@ -3209,7 +3098,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "codex.renameSession",
       async (args?: unknown) => {
-        if (!backendManager) throw new Error("backendManager is not initialized");
+        if (!backendManager)
+          throw new Error("backendManager is not initialized");
         if (!sessions) throw new Error("sessions is not initialized");
 
         const session = args ? parseSessionArg(args, sessions) : null;
@@ -3259,7 +3149,9 @@ export function activate(context: vscode.ExtensionContext): void {
             chatView?.refresh();
           } catch (err) {
             const msg = formatUnknownError(err);
-            outputChannel?.appendLine(`[rename] thread/name/set failed: ${msg}`);
+            outputChannel?.appendLine(
+              `[rename] thread/name/set failed: ${msg}`,
+            );
             void vscode.window.showErrorMessage(
               `Failed to rename thread via app-server: ${msg}`,
             );
@@ -3294,7 +3186,8 @@ export function activate(context: vscode.ExtensionContext): void {
         const isNetworkDecision =
           typeof decision === "object" &&
           decision !== null &&
-          "applyNetworkPolicyAmendment" in (decision as Record<string, unknown>);
+          "applyNetworkPolicyAmendment" in
+            (decision as Record<string, unknown>);
         if (!isSimpleDecision && !isNetworkDecision) {
           return;
         }
@@ -4353,9 +4246,8 @@ async function handleSlashCommand(
       description?: string | null;
     }> = [];
     try {
-      remoteFeatures = await backendManager.listExperimentalFeaturesForSession(
-        session,
-      );
+      remoteFeatures =
+        await backendManager.listExperimentalFeaturesForSession(session);
     } catch (err) {
       outputChannel?.appendLine(
         `[experimental] experimentalFeature/list failed, using fallback: ${String(err)}`,
@@ -4368,8 +4260,7 @@ async function handleSlashCommand(
         {
           key: "shell_snapshot",
           displayName: "Shell snapshot",
-          description:
-            "Speed up execution by reducing login shell restarts",
+          description: "Speed up execution by reducing login shell restarts",
           enabled: Boolean(featuresConfig["shell_snapshot"]),
           defaultEnabled: false,
           stage: "unknown",
@@ -4393,39 +4284,40 @@ async function handleSlashCommand(
       ];
     }
 
-    const items: Array<vscode.QuickPickItem & { key: string; picked: boolean }> =
-      remoteFeatures
-        .map((f) => {
-      const key = String(f.key ?? "").trim();
-      const current = Boolean(
-        typeof f.enabled === "boolean"
-          ? f.enabled
-          : (featuresConfig as Record<string, unknown>)[key],
-      );
-      const stage =
-        typeof f.stage === "string" && f.stage.trim() ? f.stage.trim() : "";
-      const defaultEnabled = Boolean(f.defaultEnabled);
-      return {
-        label:
-          typeof f.displayName === "string" && f.displayName.trim()
-            ? f.displayName.trim()
-            : key,
-        description:
-          typeof f.description === "string" && f.description.trim()
-            ? f.description.trim()
-            : undefined,
-        detail: [
-          `features.${key}`,
-          stage ? `stage=${stage}` : "",
-          `default=${defaultEnabled ? "on" : "off"}`,
-        ]
-          .filter(Boolean)
-          .join(" · "),
-        picked: current,
-        key,
-      };
-    })
-        .filter((item) => item.key.length > 0);
+    const items: Array<
+      vscode.QuickPickItem & { key: string; picked: boolean }
+    > = remoteFeatures
+      .map((f) => {
+        const key = String(f.key ?? "").trim();
+        const current = Boolean(
+          typeof f.enabled === "boolean"
+            ? f.enabled
+            : (featuresConfig as Record<string, unknown>)[key],
+        );
+        const stage =
+          typeof f.stage === "string" && f.stage.trim() ? f.stage.trim() : "";
+        const defaultEnabled = Boolean(f.defaultEnabled);
+        return {
+          label:
+            typeof f.displayName === "string" && f.displayName.trim()
+              ? f.displayName.trim()
+              : key,
+          description:
+            typeof f.description === "string" && f.description.trim()
+              ? f.description.trim()
+              : undefined,
+          detail: [
+            `features.${key}`,
+            stage ? `stage=${stage}` : "",
+            `default=${defaultEnabled ? "on" : "off"}`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          picked: current,
+          key,
+        };
+      })
+      .filter((item) => item.key.length > 0);
 
     if (items.length === 0) {
       upsertBlock(session.id, {
@@ -5493,7 +5385,8 @@ function resolveSessionTitleFromThread(
   const name = threadNameFromThread(thread);
   if (name) return { title: normalizeSessionTitle(name), customTitle: true };
   const preview = String(thread.preview ?? "").trim();
-  if (preview) return { title: normalizeSessionTitle(preview), customTitle: false };
+  if (preview)
+    return { title: normalizeSessionTitle(preview), customTitle: false };
   return { title: normalizeSessionTitle(fallback), customTitle: false };
 }
 
@@ -5510,7 +5403,9 @@ function parseThreadStatusLite(raw: unknown): ThreadStatusLite | null {
   return { type: typeRaw.trim(), activeFlags: flags };
 }
 
-function formatThreadStatusText(status: ThreadStatusLite | null): string | null {
+function formatThreadStatusText(
+  status: ThreadStatusLite | null,
+): string | null {
   if (!status) return null;
   const t = status.type.trim();
   if (!t) return null;
@@ -6698,11 +6593,6 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     pendingUserInputQueue: [],
     pendingLocalUserBlockId: null,
     flushingQueuedUserInput: false,
-    realtimePttActive: false,
-    realtimePttCollecting: false,
-    realtimePttTranscript: "",
-    realtimePttFallbackTranscript: "",
-    realtimePttAudioChain: null,
     actionCards: new Map(),
   };
   runtimeBySessionId.set(sessionId, rt);
@@ -6972,51 +6862,35 @@ function normalizeSessionTitle(title: string): string {
   return withoutShortId || "(untitled)";
 }
 
-function mergeRealtimeTranscript(existing: string, incoming: string): string {
-  const next = incoming.trim();
-  if (!next) return existing;
-  if (!existing) return next;
-  if (existing.endsWith(next)) return existing;
-  if (next.endsWith(existing)) return next;
-  return `${existing}\n${next}`;
-}
-
-function extractRealtimeTranscriptText(payload: unknown): string {
-  const parts: string[] = [];
-  const push = (value: unknown): void => {
-    if (typeof value !== "string") return;
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    if (parts.length > 0 && parts[parts.length - 1] === trimmed) return;
-    parts.push(trimmed);
-  };
-
-  const visit = (node: unknown, depth: number): void => {
-    if (depth > 6 || node == null) return;
-    if (typeof node === "string") {
-      push(node);
-      return;
+function formatThreadSourceForLog(source: Thread["source"]): string {
+  if (typeof source === "string") return source;
+  if (source && typeof source === "object" && "subAgent" in source) {
+    const sub = (source as { subAgent: unknown }).subAgent;
+    if (typeof sub === "string") return `subAgent:${sub}`;
+    if (
+      sub &&
+      typeof sub === "object" &&
+      "thread_spawn" in (sub as Record<string, unknown>)
+    ) {
+      const spawn = (sub as { thread_spawn?: { depth?: unknown } })
+        .thread_spawn;
+      const depth =
+        typeof spawn?.depth === "number" ? Math.trunc(spawn.depth) : null;
+      return depth === null
+        ? "subAgent:thread_spawn"
+        : `subAgent:thread_spawn:${depth}`;
     }
-    if (Array.isArray(node)) {
-      for (const x of node) visit(x, depth + 1);
-      return;
+    if (
+      sub &&
+      typeof sub === "object" &&
+      "other" in (sub as Record<string, unknown>)
+    ) {
+      const label = String((sub as { other?: unknown }).other ?? "").trim();
+      return label ? `subAgent:other:${label}` : "subAgent:other";
     }
-    if (typeof node !== "object") return;
-
-    const obj = node as Record<string, unknown>;
-    push(obj["transcript"]);
-    push(obj["text"]);
-    push(obj["value"]);
-    push(obj["inputText"]);
-    push(obj["outputText"]);
-    const content = obj["content"];
-    if (Array.isArray(content)) {
-      for (const x of content) visit(x, depth + 1);
-    }
-  };
-
-  visit(payload, 0);
-  return parts.join("\n").trim();
+    return "subAgent";
+  }
+  return "unknown";
 }
 
 function applyServerNotification(
@@ -7050,62 +6924,6 @@ function applyServerNotification(
         sessionTree?.refresh();
         chatView?.refresh();
       }
-      return;
-    }
-    case "thread/realtime/started": {
-      rt.realtimePttActive = true;
-      rt.realtimePttCollecting = true;
-      chatView?.postRealtimePttState({
-        sessionId,
-        recording: true,
-      });
-      return;
-    }
-    case "thread/realtime/itemAdded": {
-      if (!rt.realtimePttCollecting) return;
-      const text = extractRealtimeTranscriptText((n as any).params?.item);
-      if (!text) return;
-      rt.realtimePttTranscript = mergeRealtimeTranscript(
-        rt.realtimePttTranscript,
-        text,
-      );
-      rt.realtimePttFallbackTranscript = mergeRealtimeTranscript(
-        rt.realtimePttFallbackTranscript,
-        text,
-      );
-      return;
-    }
-    case "thread/realtime/error": {
-      const p = (n as any).params as {
-        error?: { message?: unknown } | unknown;
-        message?: unknown;
-      };
-      const fromNested =
-        typeof (p?.error as { message?: unknown } | undefined)?.message ===
-        "string"
-          ? String((p?.error as { message?: unknown }).message)
-          : "";
-      const fromTop = typeof p?.message === "string" ? String(p.message) : "";
-      const message =
-        (fromNested || fromTop || "Realtime transcription failed.").trim();
-      rt.realtimePttActive = false;
-      rt.realtimePttCollecting = false;
-      rt.realtimePttAudioChain = null;
-      chatView?.postRealtimePttState({
-        sessionId,
-        recording: false,
-        error: message,
-      });
-      return;
-    }
-    case "thread/realtime/closed": {
-      rt.realtimePttActive = false;
-      rt.realtimePttCollecting = false;
-      rt.realtimePttAudioChain = null;
-      chatView?.postRealtimePttState({
-        sessionId,
-        recording: false,
-      });
       return;
     }
     case "error": {
@@ -7188,7 +7006,8 @@ function applyServerNotification(
         rt.stalledTurnNoticeAtMs = null;
         rt.lastTurnCompletedAtMs = Date.now();
         rt.activeTurnId = null;
-        rt.pendingLocalUserBlockId = nextPendingLocalUserBlockIdOnTurnCompleted();
+        rt.pendingLocalUserBlockId =
+          nextPendingLocalUserBlockIdOnTurnCompleted();
         rt.pendingInterrupt = false;
         const streamingIds = [...rt.streamingAssistantItemIds];
         rt.streamingAssistantItemIds.clear();
@@ -7324,7 +7143,9 @@ function applyServerNotification(
               error?: { message?: unknown; additionalDetails?: unknown } | null;
             }
           | undefined;
-        turnStatus = String(turn?.status ?? "").trim().toLowerCase();
+        turnStatus = String(turn?.status ?? "")
+          .trim()
+          .toLowerCase();
         if (turnStatus === "failed") {
           const turnId = String(turn?.id ?? "").trim();
           const message = String(turn?.error?.message ?? "").trim();
@@ -7623,12 +7444,17 @@ function applyServerNotification(
       const delta = String(p?.delta ?? "");
       if (!itemId || !delta) return;
 
-      const block = getOrCreateTurnAnchoredBlock(rt, itemId, turnId || null, () => ({
-        id: itemId,
-        type: "plan",
-        title: "Plan",
-        text: "",
-      }));
+      const block = getOrCreateTurnAnchoredBlock(
+        rt,
+        itemId,
+        turnId || null,
+        () => ({
+          id: itemId,
+          type: "plan",
+          title: "Plan",
+          text: "",
+        }),
+      );
       if (block.type !== "plan") return;
       block.text += delta;
       chatView?.postBlockUpsert(sessionId, block);
@@ -8793,10 +8619,27 @@ function getOrCreateTurnAnchoredBlock(
   const idx = rt.blockIndexById.get(id);
   if (idx !== undefined) return rt.blocks[idx]!;
 
-  void turnId;
   const block = create();
-  rt.blockIndexById.set(id, rt.blocks.length);
-  rt.blocks.push(block);
+  // Keep item cards grouped under their originating turn when turnId is known.
+  // This avoids late-arriving tool events being appended at the bottom.
+  let insertAt = rt.blocks.length;
+  if (turnId) {
+    for (let i = rt.blocks.length - 1; i >= 0; i--) {
+      const candidate = rt.blocks[i] as unknown;
+      const candidateTurnId =
+        candidate &&
+        typeof candidate === "object" &&
+        typeof (candidate as { turnId?: unknown }).turnId === "string"
+          ? String((candidate as { turnId: string }).turnId).trim()
+          : "";
+      if (candidateTurnId === turnId) {
+        insertAt = i + 1;
+        break;
+      }
+    }
+  }
+  rt.blocks.splice(insertAt, 0, block);
+  rebuildBlockIndex(rt);
   return block;
 }
 
