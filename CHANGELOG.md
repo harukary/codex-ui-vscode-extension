@@ -2,6 +2,42 @@
 
 この拡張はまだ初期段階です。互換性が壊れる変更が入る可能性があります。
 
+## 0.2.16
+
+- **Markdown / Rendering**
+  - チャットの Markdown 描画で Mermaid フェンス（```` ```mermaid ``` ````）をサポート
+  - Mermaid は Markdown 再描画後に実行し、`securityLevel: "strict"` で初期化
+  - Mermaid 描画失敗時はエラー表示と元ソース表示を残す
+  - file/url の自動リンク化処理が Mermaid の SVG/ブロック内部を変更しないよう除外
+
+- **Sub-agent UI**
+  - `collab`（Sub-agent）カードの初回挿入位置を `turnId` 基準に修正
+  - 非同期で遅れて到着した `collabAgentToolCall` がチャット末尾に溜まる問題を修正
+
+## 0.2.15
+
+- **Sessions / Title / Rename**
+  - 新規セッション作成時のタイトルを `folder.name` 固定ではなく thread の `name` / `preview` 優先で初期化
+  - `codex.renameSession` 実行時に `thread/name/set` を呼び出し、app-server 側スレッド名と UI セッション名を同期
+  - thread 更新時に codex セッションのタイトルを再評価して、thread 名変更をセッション一覧・タブへ反映
+
+- **Resume / History**
+  - Resume picker の検索更新をデバウンスし、同一クエリでの reset 再取得を抑制
+  - 初回表示時は `force` 付きで履歴取得し、確実に一覧をロード
+
+- **Session Resolution / Tree**
+  - イベントの `threadId` 解決で backendKey 不一致時のフォールバック（threadId 横断解決）を追加
+  - Session Tree の説明行に runtime 由来の thread 状態テキストを併記
+  - `SessionStore.getByThreadIdAcrossBackends` を追加し、重複 threadId ケースの曖昧解決を防止（テスト追加）
+
+- **Approvals / Experimental**
+  - approval 応答に `acceptForSession` を追加
+  - `/experimental` で backend の `experimentalFeature/list` 結果を優先し、失敗時のみローカル定義へフォールバック
+
+- **Packaging / Build**
+  - `scripts/vendor-runtime-deps.js` を追加し、実行時依存を `dist/node_modules` へ明示コピー
+  - Webview vendor 準備スクリプトを拡張し、`markdown-it` と `mermaid` を同時に取り込めるよう更新
+
 ## 0.2.14
 
 - **Backends**

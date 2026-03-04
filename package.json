@@ -1,6 +1,6 @@
 {
   "name": "codex-ui-vscode-extension",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "displayName": "Codex UI",
   "publisher": "harukary7518",
   "description": "Use Codex CLI (app-server) inside VS Code: sessions, chat, tools, diffs.",
@@ -268,6 +268,7 @@
     "@types/shell-quote": "^1.7.5",
     "@types/vscode": "^1.90.0",
     "markdown-it": "^14.1.0",
+    "mermaid": "^11.12.1",
     "prettier": "^3.6.2",
     "typescript": "^5.9.2",
     "vitest": "^4.0.18"
