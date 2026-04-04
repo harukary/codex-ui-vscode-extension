@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -46,6 +47,10 @@ import type { GetAccountRateLimitsResponse } from "../generated/v2/GetAccountRat
 import type { LoginAccountParams } from "../generated/v2/LoginAccountParams";
 import type { LoginAccountResponse } from "../generated/v2/LoginAccountResponse";
 import type { LogoutAccountResponse } from "../generated/v2/LogoutAccountResponse";
+import type { ApprovalsReviewer } from "../generated/v2/ApprovalsReviewer";
+import type { PluginInstallResponse } from "../generated/v2/PluginInstallResponse";
+import type { PluginListResponse } from "../generated/v2/PluginListResponse";
+import type { PluginUninstallResponse } from "../generated/v2/PluginUninstallResponse";
 import type { SkillsListEntry } from "../generated/v2/SkillsListEntry";
 import type { RemoteSkillSummary } from "../generated/v2/RemoteSkillSummary";
 import type { SkillsRemoteReadResponse } from "../generated/v2/SkillsRemoteReadResponse";
@@ -59,7 +64,8 @@ import type { ThreadSourceKind } from "../generated/v2/ThreadSourceKind";
 import type { Turn } from "../generated/v2/Turn";
 import type { AppInfo } from "../generated/v2/AppInfo";
 import type { AppsListResponse } from "../generated/v2/AppsListResponse";
-import type { CollaborationModeMask } from "../generated/CollaborationModeMask";
+import type { CollaborationModeMask } from "../generated/v2/CollaborationModeMask";
+import type { ServiceTier } from "../generated/ServiceTier";
 import type { AnyServerNotification } from "./types";
 import type { FuzzyFileSearchResponse } from "../generated/FuzzyFileSearchResponse";
 import type { ListMcpServerStatusResponse } from "../generated/v2/ListMcpServerStatusResponse";
@@ -77,6 +83,7 @@ import { computeRollbackNumTurnsForTargetTurn } from "./thread_rollback";
 type ModelSettings = {
   model: string | null;
   provider: string | null;
+  serviceTier?: ServiceTier | null;
   reasoning: string | null;
   agent?: string | null;
   personality?: Personality | null;
@@ -91,6 +98,74 @@ type NetworkPolicyApprovalDecision = {
     };
   };
 };
+
+const MIN_RECOMMENDED_CODEX_VERSION = [0, 116, 0] as const;
+
+type ParsedCodexVersion = {
+  raw: string;
+  major: number;
+  minor: number;
+  patch: number;
+};
+
+function parseCodexVersion(text: string): ParsedCodexVersion | null {
+  const raw = text.trim();
+  const match = raw.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return {
+    raw,
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  };
+}
+
+function compareCodexVersion(
+  version: ParsedCodexVersion,
+  minimum: readonly [number, number, number],
+): number {
+  if (version.major !== minimum[0]) return version.major - minimum[0];
+  if (version.minor !== minimum[1]) return version.minor - minimum[1];
+  return version.patch - minimum[2];
+}
+
+async function readCodexVersion(
+  command: string,
+  cwd: string,
+): Promise<ParsedCodexVersion | null> {
+  return await new Promise((resolve) => {
+    const child = spawn(command, ["--version"], {
+      cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const finish = (value: ParsedCodexVersion | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", () => finish(null));
+    child.once("close", (code) => {
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      finish(parseCodexVersion(stdout || stderr));
+    });
+  });
+}
 
 function imageMimeFromPath(filePath: string): string | null {
   const ext = filePath.trim().toLowerCase().split(".").pop() ?? "";
@@ -187,6 +262,7 @@ export class BackendManager implements vscode.Disposable {
   >();
   private readonly opencodePendingAssistantMessageIdsBySessionIdByBackendKey =
     new Map<string, Map<string, Set<string>>>();
+  private readonly warnedDeprecatedCodexVersionByBackendKey = new Set<string>();
 
   public onSessionAdded: ((session: Session) => void) | null = null;
   public onAssistantDelta:
@@ -555,6 +631,7 @@ export class BackendManager implements vscode.Disposable {
     const command = resolveBackendStartCommand(backendId, commands);
 
     const startPromise = (async () => {
+      await this.warnIfCodexVersionDeprecated(backendKey, command, folder);
       this.output.appendLine(
         `Starting backend (${backendId}): ${command} ${args.join(" ")} (cwd=${folder.uri.fsPath})`,
       );
@@ -585,6 +662,34 @@ export class BackendManager implements vscode.Disposable {
       startPromise.finally(() => this.startInFlight.delete(backendKey)),
     );
     await startPromise;
+  }
+
+  private async warnIfCodexVersionDeprecated(
+    backendKey: string,
+    command: string,
+    folder: vscode.WorkspaceFolder,
+  ): Promise<void> {
+    if (this.warnedDeprecatedCodexVersionByBackendKey.has(backendKey)) return;
+    this.warnedDeprecatedCodexVersionByBackendKey.add(backendKey);
+
+    const version = await readCodexVersion(command, folder.uri.fsPath);
+    if (!version) {
+      this.output.appendLine(
+        `[codex] Could not determine CLI version for ${command}; skipping deprecated-version warning.`,
+      );
+      return;
+    }
+    if (compareCodexVersion(version, MIN_RECOMMENDED_CODEX_VERSION) >= 0) {
+      this.output.appendLine(`[codex] Detected CLI version: ${version.raw}`);
+      return;
+    }
+
+    const recommended = MIN_RECOMMENDED_CODEX_VERSION.join(".");
+    const message =
+      `Detected Codex CLI ${version.raw}. Versions below ${recommended} are deprecated in this extension. ` +
+      `Core workflows may still run, but newer features and future changes will target ${recommended}+ first.`;
+    this.output.appendLine(`[codex] ${message}`);
+    void vscode.window.showWarningMessage(message);
   }
 
   public async listMcpServerStatus(
@@ -654,6 +759,7 @@ export class BackendManager implements vscode.Disposable {
     const params: ThreadStartParams = {
       model: modelSettings?.model ?? null,
       modelProvider: modelSettings?.provider ?? null,
+      serviceTier: modelSettings?.serviceTier ?? null,
       cwd: folder.uri.fsPath,
       approvalPolicy: null,
       sandbox: null,
@@ -666,6 +772,7 @@ export class BackendManager implements vscode.Disposable {
       ephemeral: null,
       dynamicTools: null,
       experimentalRawEvents: false,
+      persistExtendedHistory: true,
     };
     const res = await proc.threadStart(params);
     const rawName = (res.thread as unknown as Record<string, unknown>)["name"];
@@ -756,14 +863,17 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
 
-    const res: SkillsRemoteReadResponse = await proc.skillsRemoteRead({});
+    const res: SkillsRemoteReadResponse = await proc.skillsRemoteRead({
+      hazelnutScope: "personal",
+      productSurface: "codex",
+      enabled: false,
+    });
     return res.data ?? [];
   }
 
   public async downloadRemoteSkillForSession(
     session: Session,
     hazelnutId: string,
-    opts?: { isPreload?: boolean },
   ): Promise<SkillsRemoteWriteResponse> {
     if (session.backendId === "opencode") {
       throw new Error("opencode backend does not support remote skills");
@@ -781,9 +891,80 @@ export class BackendManager implements vscode.Disposable {
     if (!proc)
       throw new Error("Backend is not running for this workspace folder");
 
-    return await proc.skillsRemoteWrite({
-      hazelnutId,
-      isPreload: opts?.isPreload ?? false,
+    return await proc.skillsRemoteWrite({ hazelnutId });
+  }
+
+  public async installPluginForSession(args: {
+    session: Session;
+    marketplaceName: string;
+    pluginName: string;
+  }): Promise<PluginInstallResponse> {
+    if (args.session.backendId === "opencode") {
+      throw new Error("opencode backend does not support plugin/install");
+    }
+
+    const folder = this.resolveWorkspaceFolder(args.session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${args.session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, args.session.backendId);
+    const proc = this.processes.get(args.session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    return await proc.pluginInstall({
+      marketplacePath: args.marketplaceName,
+      pluginName: args.pluginName,
+    });
+  }
+
+  public async listPluginsForSession(session: Session): Promise<PluginListResponse> {
+    if (session.backendId === "opencode") {
+      throw new Error("opencode backend does not support plugin/list");
+    }
+
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    return await proc.pluginList({
+      cwds: [folder.uri.fsPath],
+    });
+  }
+
+  public async uninstallPluginForSession(args: {
+    session: Session;
+    pluginId: string;
+  }): Promise<PluginUninstallResponse> {
+    if (args.session.backendId === "opencode") {
+      throw new Error("opencode backend does not support plugin/uninstall");
+    }
+
+    const folder = this.resolveWorkspaceFolder(args.session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${args.session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, args.session.backendId);
+    const proc = this.processes.get(args.session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    return await proc.pluginUninstall({
+      pluginId: args.pluginId,
     });
   }
 
@@ -1227,8 +1408,10 @@ export class BackendManager implements vscode.Disposable {
         thread,
         model: "",
         modelProvider: "",
+        serviceTier: null,
         cwd: folder.uri.fsPath,
         approvalPolicy: "on-request" as AskForApproval,
+        approvalsReviewer: "user" as ApprovalsReviewer,
         sandbox: { type: "dangerFullAccess" } as SandboxPolicy,
         reasoningEffort: null,
       };
@@ -1246,6 +1429,7 @@ export class BackendManager implements vscode.Disposable {
       // thread/resume while a turn is in progress.
       model: null,
       modelProvider: null,
+      serviceTier: null,
       cwd: null,
       approvalPolicy: null,
       sandbox: null,
@@ -1253,6 +1437,7 @@ export class BackendManager implements vscode.Disposable {
       baseInstructions: null,
       developerInstructions: null,
       personality: null,
+      persistExtendedHistory: true,
     };
     return await proc.threadResume(params);
   }
@@ -1360,8 +1545,10 @@ export class BackendManager implements vscode.Disposable {
         thread,
         model: modelSettings?.model ?? "",
         modelProvider: modelSettings?.provider ?? "",
+        serviceTier: modelSettings?.serviceTier ?? null,
         cwd: folder.uri.fsPath,
         approvalPolicy: "on-request" as AskForApproval,
+        approvalsReviewer: "user" as ApprovalsReviewer,
         sandbox: { type: "dangerFullAccess" } as SandboxPolicy,
         reasoningEffort: null,
       };
@@ -1381,6 +1568,7 @@ export class BackendManager implements vscode.Disposable {
       path: null,
       model: modelSettings?.model ?? null,
       modelProvider: modelSettings?.provider ?? null,
+      serviceTier: modelSettings?.serviceTier ?? null,
       cwd: folder.uri.fsPath,
       approvalPolicy: null,
       sandbox: null,
@@ -1390,6 +1578,7 @@ export class BackendManager implements vscode.Disposable {
       baseInstructions: null,
       developerInstructions: null,
       personality: null,
+      persistExtendedHistory: true,
     };
     return await proc.threadResume(params);
   }
@@ -1869,6 +2058,7 @@ export class BackendManager implements vscode.Disposable {
       approvalPolicy: null,
       sandboxPolicy: null,
       model: collaborationMode ? null : (modelSettings?.model ?? null),
+      serviceTier: collaborationMode ? null : (modelSettings?.serviceTier ?? null),
       effort: collaborationMode ? null : effort,
       summary: null,
       personality: modelSettings?.personality ?? null,
@@ -3249,14 +3439,19 @@ export class BackendManager implements vscode.Disposable {
     return {
       id: String(s.id),
       preview: String(s.title ?? ""),
+      ephemeral: false,
       modelProvider: "",
       createdAt: Math.floor(createdMs / 1000),
       updatedAt: Math.floor(updatedMs / 1000),
-      path: "",
+      status: { type: "idle" },
+      path: null,
       cwd: String(s.directory ?? ""),
       cliVersion: "opencode",
       source: "unknown",
+      agentNickname: null,
+      agentRole: null,
       gitInfo: null,
+      name: typeof s.title === "string" ? s.title : null,
       turns: [],
     };
   }
@@ -4060,7 +4255,8 @@ type V2ApprovalRequest = Extract<
   {
     method:
       | "item/commandExecution/requestApproval"
-      | "item/fileChange/requestApproval";
+      | "item/fileChange/requestApproval"
+      | "item/permissions/requestApproval";
   }
 >;
 

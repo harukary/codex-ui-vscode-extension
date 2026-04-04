@@ -80,8 +80,17 @@ Supported commands (handled by the extension):
 - `/diff` - open latest diff
 - `/rename <title>` - rename session
 - `/skills` - browse skills
+- `/fast [on|off|fast|flex|status]` - set service tier (codex backend only)
+- `/plugins install <marketplace> <plugin>` - install plugin (codex backend only)
+- `/plugins list` - list installed plugins (codex backend only)
+- `/plugins uninstall <pluginId>` - uninstall a plugin (codex backend only)
 - `/agents` - browse agents (codex backend only)
 - `/help` - show help
+
+Codex backend notes:
+
+- Account settings support both browser login and device-code login.
+- MCP permission approvals and elicitation-based MCP tool approvals are handled in the extension.
 
 Custom prompts:
 
@@ -237,6 +246,7 @@ Example: `thread/started`
 
 - Unknown events are collected into a debug block ("Other events (debug)") so they remain inspectable.
 - MCP startup updates (`mcp_startup_update`) are shown only in the global notice (see 12.1) to avoid duplicate legacy blocks in sessions.
+- `skills/changed` invalidates the cached skill index and triggers a refresh.
 
 ## 13. Colors
 

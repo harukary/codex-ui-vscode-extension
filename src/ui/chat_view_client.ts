@@ -37,6 +37,7 @@ type Session = {
 type ModelState = {
   model: string | null;
   provider: string | null;
+  serviceTier?: "fast" | "flex" | null;
   reasoning: string | null;
   agent?: string | null;
 };
@@ -1509,7 +1510,15 @@ function main(): void {
     kind?: string;
     email?: string;
   }> = [];
-  let settingsLoginInFlight: { loginId: string; authUrl: string } | null = null;
+  let settingsLoginInFlight:
+    | { type: "chatgpt"; loginId: string; authUrl: string }
+    | {
+        type: "chatgptDeviceCode";
+        loginId: string;
+        verificationUrl: string;
+        userCode: string;
+      }
+    | null = null;
 
   let settingsOpencodeProviders: Array<{
     id: string;
@@ -1902,41 +1911,88 @@ function main(): void {
       loginRow.appendChild(loginInfo);
       sectionLogin.appendChild(loginRow);
 
-      const chatgptBtn = document.createElement("button");
-      chatgptBtn.className = "settingsBtn primary";
-      chatgptBtn.textContent = "Login with ChatGPT";
-      chatgptBtn.disabled = settingsBusy;
-      chatgptBtn.addEventListener("click", async () => {
+      const startChatgptLogin = async (mode: "browser" | "deviceCode") => {
         settingsBusy = true;
         renderSettings();
-        const res = await settingsRequest("accountLoginChatgptStart", {});
+        const res = await settingsRequest("accountLoginChatgptStart", { mode });
         settingsBusy = false;
         if (!res.ok) {
           showToast("error", res.error);
           renderSettings();
           return;
         }
-        const authUrl =
-          res.data && typeof (res.data as any).authUrl === "string"
-            ? String((res.data as any).authUrl)
+        const loginType =
+          res.data && typeof (res.data as any).type === "string"
+            ? String((res.data as any).type)
             : "";
         const loginId =
           res.data && typeof (res.data as any).loginId === "string"
             ? String((res.data as any).loginId)
             : "";
-        if (!authUrl || !loginId) {
-          showToast("error", "Login start returned invalid data.");
+        if (loginType === "chatgpt") {
+          const authUrl =
+            res.data && typeof (res.data as any).authUrl === "string"
+              ? String((res.data as any).authUrl)
+              : "";
+          if (!authUrl || !loginId) {
+            showToast("error", "Login start returned invalid data.");
+            renderSettings();
+            return;
+          }
+          settingsLoginInFlight = { type: "chatgpt", loginId, authUrl };
+          vscode.postMessage({ type: "openExternal", url: authUrl });
+          showToast("info", "Opened browser for ChatGPT login.");
           renderSettings();
           return;
         }
-        settingsLoginInFlight = { loginId, authUrl };
-        vscode.postMessage({ type: "openExternal", url: authUrl });
-        showToast("info", "Opened browser for ChatGPT login.");
+        if (loginType === "chatgptDeviceCode") {
+          const verificationUrl =
+            res.data && typeof (res.data as any).verificationUrl === "string"
+              ? String((res.data as any).verificationUrl)
+              : "";
+          const userCode =
+            res.data && typeof (res.data as any).userCode === "string"
+              ? String((res.data as any).userCode)
+              : "";
+          if (!verificationUrl || !userCode || !loginId) {
+            showToast("error", "Device code login returned invalid data.");
+            renderSettings();
+            return;
+          }
+          settingsLoginInFlight = {
+            type: "chatgptDeviceCode",
+            loginId,
+            verificationUrl,
+            userCode,
+          };
+          showToast("info", "Device code login started.");
+          renderSettings();
+          return;
+        }
+        showToast("error", "Login start returned invalid data.");
         renderSettings();
+      };
+
+      const browserBtn = document.createElement("button");
+      browserBtn.className = "settingsBtn primary";
+      browserBtn.textContent = "Login with Browser";
+      browserBtn.disabled = settingsBusy;
+      browserBtn.addEventListener("click", async () => {
+        await startChatgptLogin("browser");
       });
+
+      const deviceCodeBtn = document.createElement("button");
+      deviceCodeBtn.className = "settingsBtn";
+      deviceCodeBtn.textContent = "Login with Device Code";
+      deviceCodeBtn.disabled = settingsBusy;
+      deviceCodeBtn.addEventListener("click", async () => {
+        await startChatgptLogin("deviceCode");
+      });
+
       const chatgptRow = document.createElement("div");
-      chatgptRow.className = "settingsRow";
-      chatgptRow.appendChild(chatgptBtn);
+      chatgptRow.className = "settingsRow split";
+      chatgptRow.appendChild(browserBtn);
+      chatgptRow.appendChild(deviceCodeBtn);
       sectionLogin.appendChild(chatgptRow);
 
       const apiKeyInput = document.createElement("input");
@@ -1977,8 +2033,53 @@ function main(): void {
       if (settingsLoginInFlight) {
         const inflight = document.createElement("div");
         inflight.className = "settingsHelp";
-        inflight.textContent = `Login in progress…\nloginId=${settingsLoginInFlight.loginId}`;
+        if (settingsLoginInFlight.type === "chatgpt") {
+          inflight.textContent =
+            `Browser login in progress…\nloginId=${settingsLoginInFlight.loginId}`;
+        } else {
+          inflight.textContent =
+            `Device code login in progress…\nloginId=${settingsLoginInFlight.loginId}\n` +
+            `code=${settingsLoginInFlight.userCode}\n` +
+            `url=${settingsLoginInFlight.verificationUrl}`;
+        }
         sectionLogin.appendChild(inflight);
+        if (settingsLoginInFlight.type === "chatgptDeviceCode") {
+          const actionsRow = document.createElement("div");
+          actionsRow.className = "settingsRow split";
+
+          const openBtn = document.createElement("button");
+          openBtn.className = "settingsBtn";
+          openBtn.textContent = "Open verification page";
+          openBtn.disabled = settingsBusy;
+          const verificationUrl = settingsLoginInFlight.verificationUrl;
+          openBtn.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "openExternal",
+              url: verificationUrl,
+            });
+          });
+
+          const copyBtn = document.createElement("button");
+          copyBtn.className = "settingsBtn";
+          copyBtn.textContent = "Copy code";
+          copyBtn.disabled = settingsBusy;
+          copyBtn.addEventListener("click", async () => {
+            const code = settingsLoginInFlight?.type === "chatgptDeviceCode"
+              ? settingsLoginInFlight.userCode
+              : "";
+            if (!code) return;
+            try {
+              await navigator.clipboard.writeText(code);
+              showToast("success", "Copied device code.");
+            } catch {
+              showToast("error", "Failed to copy device code.");
+            }
+          });
+
+          actionsRow.appendChild(openBtn);
+          actionsRow.appendChild(copyBtn);
+          sectionLogin.appendChild(actionsRow);
+        }
       }
 
       sectionAcct.appendChild(sectionLogin);
@@ -2585,6 +2686,12 @@ function main(): void {
       kind: "slash",
     },
     {
+      insert: "/fast ",
+      label: "/fast",
+      detail: "Set service tier",
+      kind: "slash",
+    },
+    {
       insert: "/diff ",
       label: "/diff",
       detail: "Open Latest Diff",
@@ -2600,6 +2707,12 @@ function main(): void {
       insert: "/skills ",
       label: "/skills",
       detail: "Browse skills",
+      kind: "slash",
+    },
+    {
+      insert: "/plugins ",
+      label: "/plugins",
+      detail: "Install plugin",
       kind: "slash",
     },
     {
@@ -2637,7 +2750,7 @@ function main(): void {
         } as SuggestItem;
       })
       .filter(Boolean) as SuggestItem[];
-    return [...base, ...custom, ...ui];
+    return [...custom, ...base, ...ui];
   }
 
   const atSuggestions: SuggestItem[] = [
@@ -3564,11 +3677,13 @@ function main(): void {
       if (slashTok) {
         const query = slashTok.token.slice(1);
         const allSlash = buildSlashSuggestions();
-        if (
-          query.length === 0 ||
-          allSlash.some((s) => slashMatches(s.label, query))
-        ) {
-          const ranked = query ? rankByPrefix(allSlash, "/" + query) : allSlash;
+        const filtered = query
+          ? allSlash.filter((s) => slashMatches(s.label, query))
+          : allSlash;
+        if (filtered.length > 0) {
+          const ranked = query
+            ? rankByPrefix(filtered, "/" + query)
+            : filtered;
           const nextReplace = {
             from: slashTok.start,
             to: slashTok.end,
@@ -3778,6 +3893,7 @@ function main(): void {
     const ms = s.modelState || {
       model: null,
       provider: null,
+      serviceTier: null,
       reasoning: null,
     };
     const modeLabel =
@@ -3821,6 +3937,7 @@ function main(): void {
       const d = s.cliDefaultModelState || {
         model: null,
         provider: null,
+        serviceTier: null,
         reasoning: null,
       };
       const provider = d.provider ? String(d.provider).trim() : "";
@@ -3888,6 +4005,7 @@ function main(): void {
       const d = s.cliDefaultModelState || {
         model: null,
         provider: null,
+        serviceTier: null,
         reasoning: null,
       };
       const provider = d.provider ? String(d.provider).trim() : "";
@@ -3939,6 +4057,7 @@ function main(): void {
       const d = s.cliDefaultModelState || {
         model: null,
         provider: null,
+        serviceTier: null,
         reasoning: null,
       };
       const reasoning = d.reasoning ? String(d.reasoning).trim() : "";

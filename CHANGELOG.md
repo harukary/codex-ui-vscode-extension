@@ -4,6 +4,48 @@
 
 ## 0.2.16
 
+- **Codex 0.110**
+  - 最小サポート版を `codex >= 0.110.0` に更新
+  - `src/generated/v2` を `codex 0.110` に合わせて再生成し、protocol 差分へ追随
+  - `thread/compact/start`、`plugin/install`、`skills/remote/list`、`skills/remote/export`、`persistExtendedHistory` に対応
+
+- **Codex 0.116+ / Version Policy**
+  - `codex >= 0.116.0` を推奨 Stable として明記
+  - `0.116.0` 未満を extension 上では非推奨扱いに変更し、backend 起動時に `codex --version` を確認して警告表示
+  - `docs/codex-version-compat-checklist.md` と `docs/codex-app-server-0.110.0-to-0.116.0-response-sheet.md` を追加し、`0.110.0 -> 0.116.0` の app-server 差分調査と対応方針を整理
+
+- **Codex 0.118 / Protocol & Account**
+  - `references/openai-codex` と generated protocol を `codex-cli 0.118.0` に更新
+  - `account/login/start` の `chatgptDeviceCode` に対応
+  - Settings の Account UI に `Login with Browser` と `Login with Device Code` を追加
+  - device-code login の `verificationUrl` / `userCode` 表示、`Open verification page` / `Copy code` をサポート
+
+- **Plugins**
+  - generated protocol の `plugin/list` / `plugin/uninstall` に追従
+  - `/plugins list` と `/plugins uninstall <pluginId>` を追加
+  - plugin install / uninstall 後の skill index 再読込を改善
+
+- **Approvals / MCP**
+  - `item/permissions/requestApproval` を V2 approval として正しく処理するよう修正
+  - MCP tool approval の `mcpServer/elicitation/request` をサポートし、`Accept` / `Accept (For Session)` / `Decline` / `Cancel` を正しい response shape で返すよう更新
+  - MCP approval カードのタイトルと detail を見直し、要求された permission / connector / tool 情報を表示
+  - `mobile-mcp` などで `Accept` しても `error: {\"message\":\"user rejected MCP tool call\"}` になる問題を修正
+
+- **Slash Commands / Prompts**
+  - `/` 補完で `prompts:{command}` を常に先頭表示するよう変更
+  - `/` に続けて文字入力した場合は先頭一致する候補だけを表示するように見直し
+
+- **Service Tier / Fast Mode**
+  - session model state に `serviceTier`（`fast` / `flex` / default）を追加
+  - `/fast [on|off|fast|flex|status]` を追加し、codex session の service tier を slash command から切り替え可能に
+  - `turn/start` / `thread/start` / `thread/resume` に `serviceTier` と `persistExtendedHistory` を反映
+  - `/fast` 利用後に model/reasoning を default に戻した際、`serviceTier` の explicit override 判定が崩れる問題を修正
+
+- **Plugins / Skills**
+  - `/plugins install <marketplace> <plugin>` を追加し、marketplace 経由の plugin install 導線を追加
+  - `skills/changed` 通知を受けて skill index を再読込するよう更新
+  - remote skills 一覧取得を browse 用に見直し、有効済み項目だけに絞られないよう修正
+
 - **Markdown / Rendering**
   - チャットの Markdown 描画で Mermaid フェンス（```` ```mermaid ``` ````）をサポート
   - Mermaid は Markdown 再描画後に実行し、`securityLevel: "strict"` で初期化

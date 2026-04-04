@@ -23,6 +23,12 @@ import type { SkillsRemoteReadParams } from "../generated/v2/SkillsRemoteReadPar
 import type { SkillsRemoteReadResponse } from "../generated/v2/SkillsRemoteReadResponse";
 import type { SkillsRemoteWriteParams } from "../generated/v2/SkillsRemoteWriteParams";
 import type { SkillsRemoteWriteResponse } from "../generated/v2/SkillsRemoteWriteResponse";
+import type { PluginInstallParams } from "../generated/v2/PluginInstallParams";
+import type { PluginInstallResponse } from "../generated/v2/PluginInstallResponse";
+import type { PluginListParams } from "../generated/v2/PluginListParams";
+import type { PluginListResponse } from "../generated/v2/PluginListResponse";
+import type { PluginUninstallParams } from "../generated/v2/PluginUninstallParams";
+import type { PluginUninstallResponse } from "../generated/v2/PluginUninstallResponse";
 import type { ModelListParams } from "../generated/v2/ModelListParams";
 import type { ModelListResponse } from "../generated/v2/ModelListResponse";
 import type { ConfigReadParams } from "../generated/v2/ConfigReadParams";
@@ -56,6 +62,12 @@ import type { LogoutAccountResponse } from "../generated/v2/LogoutAccountRespons
 import type { CommandExecutionApprovalDecision } from "../generated/v2/CommandExecutionApprovalDecision";
 import type { FileChangeApprovalDecision } from "../generated/v2/FileChangeApprovalDecision";
 import type { FileChangeRequestApprovalResponse } from "../generated/v2/FileChangeRequestApprovalResponse";
+import type { GrantedPermissionProfile } from "../generated/v2/GrantedPermissionProfile";
+import type { McpServerElicitationRequestParams } from "../generated/v2/McpServerElicitationRequestParams";
+import type { McpServerElicitationRequestResponse } from "../generated/v2/McpServerElicitationRequestResponse";
+import type { PermissionsRequestApprovalResponse } from "../generated/v2/PermissionsRequestApprovalResponse";
+import type { PermissionGrantScope } from "../generated/v2/PermissionGrantScope";
+import type { PermissionsRequestApprovalParams } from "../generated/v2/PermissionsRequestApprovalParams";
 import type { ToolRequestUserInputResponse } from "../generated/v2/ToolRequestUserInputResponse";
 import type { FuzzyFileSearchParams } from "../generated/FuzzyFileSearchParams";
 import type { FuzzyFileSearchResponse } from "../generated/FuzzyFileSearchResponse";
@@ -260,7 +272,7 @@ export class BackendProcess implements vscode.Disposable {
     params: ThreadCompactParams,
   ): Promise<ThreadCompactResponse> {
     return this.rpc.request<ThreadCompactResponse>({
-      method: "thread/compact",
+      method: "thread/compact/start",
       params,
     });
   }
@@ -401,8 +413,8 @@ export class BackendProcess implements vscode.Disposable {
     params: SkillsRemoteReadParams,
   ): Promise<SkillsRemoteReadResponse> {
     return this.rpc.request<SkillsRemoteReadResponse>({
-      method: "skills/remote/read",
-      params,
+      method: "skills/remote/list" as any,
+      params: params as any,
     });
   }
 
@@ -410,7 +422,34 @@ export class BackendProcess implements vscode.Disposable {
     params: SkillsRemoteWriteParams,
   ): Promise<SkillsRemoteWriteResponse> {
     return this.rpc.request<SkillsRemoteWriteResponse>({
-      method: "skills/remote/write",
+      method: "skills/remote/export" as any,
+      params: params as any,
+    });
+  }
+
+  public async pluginInstall(
+    params: PluginInstallParams,
+  ): Promise<PluginInstallResponse> {
+    return this.rpc.request<PluginInstallResponse>({
+      method: "plugin/install",
+      params,
+    });
+  }
+
+  public async pluginList(
+    params: PluginListParams,
+  ): Promise<PluginListResponse> {
+    return this.rpc.request<PluginListResponse>({
+      method: "plugin/list",
+      params,
+    });
+  }
+
+  public async pluginUninstall(
+    params: PluginUninstallParams,
+  ): Promise<PluginUninstallResponse> {
+    return this.rpc.request<PluginUninstallResponse>({
+      method: "plugin/uninstall",
       params,
     });
   }
@@ -553,6 +592,67 @@ export class BackendProcess implements vscode.Disposable {
       return;
     }
 
+    if (isMcpServerElicitationRequest(req)) {
+      const supportsSessionPersist = mcpElicitationSupportsPersist(
+        req.params,
+        "session",
+      );
+
+      if (this.approvalsDefaultDecision !== "prompt") {
+        this.respondMcpServerElicitation(req.id, {
+          action:
+            this.approvalsDefaultDecision === "decline" ? "decline" : "cancel",
+          content: null,
+          _meta: null,
+        });
+        return;
+      }
+
+      const choice = await vscode.window.showWarningMessage(
+        "Codex is requesting MCP approval:",
+        {
+          modal: true,
+          detail: buildMcpServerElicitationDetail(req.params),
+        },
+        "Accept",
+        ...(supportsSessionPersist ? (["Accept (For Session)"] as const) : []),
+        "Decline",
+        "Cancel",
+      );
+
+      if (choice === "Accept") {
+        this.respondMcpServerElicitation(req.id, {
+          action: "accept",
+          content: null,
+          _meta: null,
+        });
+        return;
+      }
+      if (choice === "Accept (For Session)") {
+        this.respondMcpServerElicitation(req.id, {
+          action: "accept",
+          content: null,
+          _meta: { persist: "session" },
+        });
+        return;
+      }
+      if (choice === "Decline") {
+        this.respondMcpServerElicitation(req.id, {
+          action: "decline",
+          content: null,
+          _meta: null,
+        });
+        return;
+      }
+
+      this.respondMcpServerElicitation(req.id, {
+        action: "cancel",
+        content: null,
+        _meta: null,
+      });
+      return;
+    }
+
     if (this.approvalsDefaultDecision !== "prompt") {
       if (isV2ApprovalRequest(req)) {
         const decision =
@@ -613,6 +713,15 @@ export class BackendProcess implements vscode.Disposable {
       return;
     }
 
+    if (req.method === "item/permissions/requestApproval") {
+      const result =
+        typeof decision === "string"
+          ? buildPermissionsApprovalResponse(req.params, decision)
+          : (decision as PermissionsRequestApprovalResponse);
+      this.rpc.respond(req.id, result);
+      return;
+    }
+
     if (typeof decision === "object" && decision !== null) {
       throw new Error(
         "File change approvals do not support acceptWithExecpolicyAmendment",
@@ -632,6 +741,13 @@ export class BackendProcess implements vscode.Disposable {
     this.rpc.respond(id, result);
   }
 
+  public respondMcpServerElicitation(
+    id: RequestId,
+    result: McpServerElicitationRequestResponse,
+  ): void {
+    this.rpc.respond(id, result);
+  }
+
   public respondV1Approval(id: RequestId, decision: ReviewDecision): void {
     const result: ApplyPatchApprovalResponse | ExecCommandApprovalResponse = {
       decision,
@@ -645,29 +761,129 @@ type V2ApprovalRequest = Extract<
   {
     method:
       | "item/commandExecution/requestApproval"
-      | "item/fileChange/requestApproval";
+      | "item/fileChange/requestApproval"
+      | "item/permissions/requestApproval";
   }
 >;
 
 type V2ApprovalDecision =
   | CommandExecutionApprovalDecision
   | NetworkPolicyApprovalDecision
-  | FileChangeApprovalDecision;
+  | FileChangeApprovalDecision
+  | PermissionsRequestApprovalResponse;
 
 type V2ToolRequestUserInputRequest = Extract<
   ServerRequest,
   { method: "item/tool/requestUserInput" }
 >;
 
+type McpServerElicitationRequest = Extract<
+  ServerRequest,
+  { method: "mcpServer/elicitation/request" }
+>;
+
 function isV2ApprovalRequest(req: ServerRequest): req is V2ApprovalRequest {
   return (
     req.method === "item/commandExecution/requestApproval" ||
-    req.method === "item/fileChange/requestApproval"
+    req.method === "item/fileChange/requestApproval" ||
+    req.method === "item/permissions/requestApproval"
   );
+}
+
+function buildPermissionsApprovalResponse(
+  params: PermissionsRequestApprovalParams,
+  decision:
+    | CommandExecutionApprovalDecision
+    | NetworkPolicyApprovalDecision
+    | FileChangeApprovalDecision,
+): PermissionsRequestApprovalResponse {
+  if (typeof decision !== "string") {
+    throw new Error(
+      "Permission approvals do not support network policy amendments",
+    );
+  }
+
+  if (decision === "accept" || decision === "acceptForSession") {
+    return {
+      permissions: grantAllRequestedPermissions(params),
+      scope:
+        decision === "acceptForSession"
+          ? ("session" satisfies PermissionGrantScope)
+          : ("turn" satisfies PermissionGrantScope),
+    };
+  }
+
+  return {
+    permissions: {},
+    scope: "turn",
+  };
+}
+
+function grantAllRequestedPermissions(
+  params: PermissionsRequestApprovalParams,
+): GrantedPermissionProfile {
+  const granted: GrantedPermissionProfile = {};
+  if (params.permissions.network) granted.network = params.permissions.network;
+  if (params.permissions.fileSystem)
+    granted.fileSystem = params.permissions.fileSystem;
+  return granted;
+}
+
+function buildMcpServerElicitationDetail(
+  params: McpServerElicitationRequestParams,
+): string {
+  const lines = [
+    `server: ${params.serverName}`,
+    `mode: ${params.mode}`,
+    `message: ${params.message}`,
+  ];
+  const meta =
+    params._meta && typeof params._meta === "object" && !Array.isArray(params._meta)
+      ? (params._meta as Record<string, unknown>)
+      : null;
+  if (meta) {
+    const connectorName =
+      typeof meta["connector_name"] === "string" ? meta["connector_name"] : "";
+    const connectorId =
+      typeof meta["connector_id"] === "string" ? meta["connector_id"] : "";
+    const toolTitle =
+      typeof meta["tool_title"] === "string" ? meta["tool_title"] : "";
+    const toolDescription =
+      typeof meta["tool_description"] === "string"
+        ? meta["tool_description"]
+        : "";
+    if (connectorName || connectorId) {
+      lines.push(`connector: ${connectorName || connectorId}`);
+    }
+    if (toolTitle) lines.push(`tool: ${toolTitle}`);
+    if (toolDescription) lines.push(`toolDescription: ${toolDescription}`);
+  }
+  return lines.join("\n");
+}
+
+function mcpElicitationSupportsPersist(
+  params: McpServerElicitationRequestParams,
+  wanted: "session" | "always",
+): boolean {
+  const meta =
+    params._meta && typeof params._meta === "object" && !Array.isArray(params._meta)
+      ? (params._meta as Record<string, unknown>)
+      : null;
+  if (!meta) return false;
+  const persist = meta["persist"];
+  if (typeof persist === "string") return persist === wanted;
+  if (Array.isArray(persist)) return persist.includes(wanted);
+  return false;
 }
 
 function isV2ToolRequestUserInputRequest(
   req: ServerRequest,
 ): req is V2ToolRequestUserInputRequest {
   return req.method === "item/tool/requestUserInput";
+}
+
+function isMcpServerElicitationRequest(
+  req: ServerRequest,
+): req is McpServerElicitationRequest {
+  return req.method === "mcpServer/elicitation/request";
 }

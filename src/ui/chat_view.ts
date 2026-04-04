@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import type { ServiceTier } from "../generated/ServiceTier";
 
 import type { Session } from "../sessions";
 import { isCodexFamilyBackend } from "../session_backend";
@@ -250,15 +251,23 @@ type RewindRequest = {
 const EMPTY_MODEL_STATE: {
   model: string | null;
   provider: string | null;
+  serviceTier: ServiceTier | null;
   reasoning: string | null;
   agent: string | null;
-} = { model: null, provider: null, reasoning: null, agent: null };
+} = {
+  model: null,
+  provider: null,
+  serviceTier: null,
+  reasoning: null,
+  agent: null,
+};
 
 // Loaded from ~/.codex/config.toml (or equivalent). This is used only to label what "default"
 // means in the UI; it must not implicitly override per-session settings.
 let cliDefaultModelState: {
   model: string | null;
   provider: string | null;
+  serviceTier: ServiceTier | null;
   reasoning: string | null;
   agent: string | null;
 } = { ...EMPTY_MODEL_STATE };
@@ -286,6 +295,14 @@ export function setSessionModelState(
 
 export function isSessionModelOverrideExplicit(sessionId: string): boolean {
   return explicitModelOverrideBySessionId.has(sessionId);
+}
+
+export function setSessionModelOverrideExplicit(
+  sessionId: string,
+  explicit: boolean,
+): void {
+  if (explicit) explicitModelOverrideBySessionId.add(sessionId);
+  else explicitModelOverrideBySessionId.delete(sessionId);
 }
 
 export function setDefaultModelState(state: ModelState): void {
@@ -425,7 +442,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly onAccountLogout: (session: Session) => Promise<unknown>,
     private readonly onAccountLoginChatgptStart: (
       session: Session,
-    ) => Promise<{ authUrl: string; loginId: string }>,
+      mode: "browser" | "deviceCode",
+    ) => Promise<
+      | { type: "chatgpt"; authUrl: string; loginId: string }
+      | {
+          type: "chatgptDeviceCode";
+          loginId: string;
+          verificationUrl: string;
+          userCode: string;
+        }
+    >,
     private readonly onAccountLoginApiKey: (
       session: Session,
       apiKey: string,
@@ -1232,7 +1258,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         if (op === "accountLoginChatgptStart") {
-          const res = await this.onAccountLoginChatgptStart(active);
+          const mode =
+            anyMsg["mode"] === "deviceCode" ? "deviceCode" : "browser";
+          const res = await this.onAccountLoginChatgptStart(active, mode);
           await respondOk(res);
           return;
         }
@@ -1269,13 +1297,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (typeof sessionId !== "string" || !sessionId) return;
       const model = asNullableString(anyMsg["model"]);
       const provider = asNullableString(anyMsg["provider"]);
+      const serviceTierRaw = asNullableString(anyMsg["serviceTier"]);
+      const serviceTier =
+        serviceTierRaw === "fast" || serviceTierRaw === "flex"
+          ? serviceTierRaw
+          : null;
       const reasoning = asNullableString(anyMsg["reasoning"]);
       const agent = asNullableString(anyMsg["agent"]);
-      setSessionModelState(sessionId, { model, provider, reasoning, agent });
+      const prev = getSessionModelState(sessionId);
+      const nextState = {
+        model,
+        provider,
+        serviceTier: serviceTier ?? prev.serviceTier ?? null,
+        reasoning,
+        agent,
+      };
+      setSessionModelState(sessionId, nextState);
       // Only mark explicit overrides when the user picks a non-default value.
       // This lets us distinguish between user intent and (older) UI bugs that
       // accidentally wrote the backend's effective model into the selector state.
-      if (model || provider || reasoning || agent)
+      if (
+        nextState.model ||
+        nextState.provider ||
+        nextState.serviceTier ||
+        nextState.reasoning ||
+        nextState.agent
+      )
         explicitModelOverrideBySessionId.add(sessionId);
       else explicitModelOverrideBySessionId.delete(sessionId);
       this.refresh();

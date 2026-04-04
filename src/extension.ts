@@ -14,6 +14,7 @@ import type { AnyServerNotification } from "./backend/types";
 import type { ContentBlock } from "./generated/ContentBlock";
 import type { ImageContent } from "./generated/ImageContent";
 import type { Personality } from "./generated/Personality";
+import type { ServiceTier } from "./generated/ServiceTier";
 import type { CommandAction } from "./generated/v2/CommandAction";
 import type { Model } from "./generated/v2/Model";
 import type { SkillsListEntry } from "./generated/v2/SkillsListEntry";
@@ -30,7 +31,7 @@ import type { ThreadTokenUsage } from "./generated/v2/ThreadTokenUsage";
 import type { Turn } from "./generated/v2/Turn";
 import type { UserInput } from "./generated/v2/UserInput";
 import type { CollaborationMode } from "./generated/CollaborationMode";
-import type { CollaborationModeMask } from "./generated/CollaborationModeMask";
+import type { CollaborationModeMask } from "./generated/v2/CollaborationModeMask";
 import type { BackendId, Session } from "./sessions";
 import { SessionStore } from "./sessions";
 import {
@@ -60,6 +61,7 @@ import {
   hasSessionModelState,
   isSessionModelOverrideExplicit,
   setDefaultModelState,
+  setSessionModelOverrideExplicit,
   setSessionModelState,
   type ChatBlock,
   type ChatViewState,
@@ -657,6 +659,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const title =
       req.method === "item/commandExecution/requestApproval"
         ? "Command approval required"
+        : req.method === "item/permissions/requestApproval"
+          ? "Permission approval required"
         : "File change approval required";
     const detail = formatApprovalDetail(req.method, item, reason, req.params);
 
@@ -1025,15 +1029,27 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!backendManager) throw new Error("backendManager is not initialized");
       return await backendManager.logoutAccount(session);
     },
-    async (session) => {
+    async (session, mode) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       const res = await backendManager.loginAccount(session, {
-        type: "chatgpt",
+        type: mode === "deviceCode" ? "chatgptDeviceCode" : "chatgpt",
       });
-      if (res.type !== "chatgpt") {
-        throw new Error(`Unexpected login response: ${JSON.stringify(res)}`);
+      if (res.type === "chatgpt") {
+        return {
+          type: "chatgpt" as const,
+          authUrl: res.authUrl,
+          loginId: res.loginId,
+        };
       }
-      return { authUrl: res.authUrl, loginId: res.loginId };
+      if (res.type === "chatgptDeviceCode") {
+        return {
+          type: "chatgptDeviceCode" as const,
+          loginId: res.loginId,
+          verificationUrl: res.verificationUrl,
+          userCode: res.userCode,
+        };
+      }
+      throw new Error(`Unexpected login response: ${JSON.stringify(res)}`);
     },
     async (session, apiKey) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
@@ -2325,7 +2341,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       })();
 
-      const modelLine = `Model: ${settings.model ?? "default"} (reasoning ${settings.reasoning ?? "default"})`;
+      const modelLine = `Model: ${settings.model ?? "default"} (tier ${settings.serviceTier ?? "default"}, reasoning ${settings.reasoning ?? "default"})`;
       const sessionLine = `Session: ${session.threadId}`;
       const dirLine = directory ? `Directory: ${directory}` : null;
       if (!planLine) {
@@ -3721,7 +3737,7 @@ async function sendUserInput(
       settings: {
         model: finalModel,
         reasoning_effort: preset.reasoning_effort ?? null,
-        developer_instructions: preset.developer_instructions ?? null,
+        developer_instructions: null,
       },
     };
   }
@@ -3747,6 +3763,7 @@ async function sendUserInput(
       ? {
           model: modelState?.model ?? null,
           provider: modelState?.provider ?? null,
+          serviceTier: modelState?.serviceTier ?? null,
           reasoning: modelState?.reasoning ?? null,
           agent: modelState?.agent ?? null,
           personality,
@@ -4642,6 +4659,240 @@ async function handleSlashCommand(
     await showSkillsActionCard(session, { forceReload });
     return true;
   }
+  if (cmd === "fast") {
+    if (session.backendId !== "codex") {
+      upsertBlock(session.id, {
+        id: newLocalId("fastUnsupported"),
+        type: "info",
+        title: "Fast mode (codex only)",
+        text: "/fast is supported for codex sessions only.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    const current = getSessionModelState(session.id);
+    const normalized = arg.trim().toLowerCase();
+    let nextTier: ServiceTier | null;
+    if (!normalized) {
+      nextTier = current.serviceTier === "fast" ? null : "fast";
+    } else if (
+      normalized === "on" ||
+      normalized === "fast" ||
+      normalized === "enable"
+    ) {
+      nextTier = "fast";
+    } else if (normalized === "flex") {
+      nextTier = "flex";
+    } else if (
+      normalized === "off" ||
+      normalized === "disable" ||
+      normalized === "default"
+    ) {
+      nextTier = null;
+    } else if (normalized === "status") {
+      upsertBlock(session.id, {
+        id: newLocalId("fastStatus"),
+        type: "info",
+        title: "Service tier",
+        text: `Current tier: ${current.serviceTier ?? "default"}`,
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    } else {
+      upsertBlock(session.id, {
+        id: newLocalId("fastUsage"),
+        type: "error",
+        title: "Slash command error",
+        text: "Usage: /fast [on|off|fast|flex|status]",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    setSessionModelState(session.id, {
+      ...current,
+      serviceTier: nextTier,
+    });
+    setSessionModelOverrideExplicit(
+      session.id,
+      Boolean(
+        current.model ||
+          current.provider ||
+          nextTier ||
+          current.reasoning ||
+          current.agent,
+      ),
+    );
+    upsertBlock(session.id, {
+      id: newLocalId("fastSet"),
+      type: "info",
+      title: "Service tier",
+      text: `Set to ${nextTier ?? "default"}.`,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    return true;
+  }
+  if (cmd === "plugins") {
+    if (session.backendId !== "codex") {
+      upsertBlock(session.id, {
+        id: newLocalId("pluginsUnsupported"),
+        type: "info",
+        title: "Plugins (codex only)",
+        text: "/plugins is supported for codex sessions only.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+    if (!backendManager) throw new Error("backendManager is not initialized");
+
+    const args = arg.split(/\s+/).filter(Boolean);
+    const usage = [
+      "Usage:",
+      "  /plugins",
+      "  /plugins list",
+      "  /plugins install <marketplace> <plugin>",
+      "  /plugins uninstall <pluginId>",
+      "",
+      "Example:",
+      "  /plugins install local my-plugin",
+      "  /plugins uninstall local/my-plugin",
+    ].join("\n");
+    const sub = args[0] ?? "";
+    if (!sub) {
+      upsertBlock(session.id, {
+        id: newLocalId("pluginsHelp"),
+        type: "info",
+        title: "Plugins",
+        text: usage,
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+    if (sub === "list") {
+      try {
+        const res = await backendManager.listPluginsForSession(session);
+        const lines: string[] = [];
+        for (const marketplace of res.marketplaces) {
+          const displayName =
+            marketplace.interface?.displayName?.trim() || marketplace.name;
+          lines.push(`- marketplace: \`${marketplace.name}\` (${displayName})`);
+          if (marketplace.plugins.length === 0) {
+            lines.push("  plugins: (none)");
+            continue;
+          }
+          for (const plugin of marketplace.plugins) {
+            const status = [
+              plugin.installed ? "installed" : "not-installed",
+              plugin.enabled ? "enabled" : "disabled",
+            ].join(", ");
+            lines.push(`  - \`${plugin.id}\` (${plugin.name}) [${status}]`);
+          }
+        }
+        if (res.marketplaceLoadErrors.length > 0) {
+          lines.push("");
+          lines.push("Marketplace load errors:");
+          for (const err of res.marketplaceLoadErrors) {
+            lines.push(`- \`${err.marketplacePath}\`: ${err.message}`);
+          }
+        }
+        if (res.remoteSyncError) {
+          lines.push("");
+          lines.push(`Remote sync error: ${res.remoteSyncError}`);
+        }
+        upsertBlock(session.id, {
+          id: newLocalId("pluginsList"),
+          type: "info",
+          title: "Plugins",
+          text: lines.length > 0 ? lines.join("\n") : "(no marketplaces)",
+        });
+      } catch (err) {
+        upsertBlock(session.id, {
+          id: newLocalId("pluginsListError"),
+          type: "error",
+          title: "Plugin list failed",
+          text: formatUnknownError(err),
+        });
+      }
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (sub === "install" && args.length === 3) {
+      const marketplaceName = args[1] ?? "";
+      const pluginName = args[2] ?? "";
+      try {
+        await backendManager.installPluginForSession({
+          session,
+          marketplaceName,
+          pluginName,
+        });
+        await refreshSkillIndexForSession(session, { forceReload: true });
+        upsertBlock(session.id, {
+          id: newLocalId("pluginInstalled"),
+          type: "info",
+          title: "Plugin installed",
+          text: `${marketplaceName}/${pluginName}`,
+        });
+        chatView?.refresh();
+        schedulePersistRuntime(session.id);
+      } catch (err) {
+        upsertBlock(session.id, {
+          id: newLocalId("pluginInstallError"),
+          type: "error",
+          title: "Plugin install failed",
+          text: formatUnknownError(err),
+        });
+        chatView?.refresh();
+        schedulePersistRuntime(session.id);
+      }
+      return true;
+    }
+
+    if (sub === "uninstall" && args.length === 2) {
+      const pluginId = args[1] ?? "";
+      try {
+        await backendManager.uninstallPluginForSession({
+          session,
+          pluginId,
+        });
+        await refreshSkillIndexForSession(session, { forceReload: true });
+        upsertBlock(session.id, {
+          id: newLocalId("pluginUninstalled"),
+          type: "info",
+          title: "Plugin uninstalled",
+          text: pluginId,
+        });
+      } catch (err) {
+        upsertBlock(session.id, {
+          id: newLocalId("pluginUninstallError"),
+          type: "error",
+          title: "Plugin uninstall failed",
+          text: formatUnknownError(err),
+        });
+      }
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    upsertBlock(session.id, {
+      id: newLocalId("pluginsUsage"),
+      type: "error",
+      title: "Slash command error",
+      text: usage,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    return true;
+  }
   if (cmd === "agents") {
     await vscode.commands.executeCommand("codex.showAgents", {
       sessionId: session.id,
@@ -4828,9 +5079,11 @@ async function handleSlashCommand(
         "- /personality: Set personality",
         "- /debug-config: Show config details",
         "- /experimental: Toggle experimental features",
+        "- /fast [on|off|fast|flex|status]: Set service tier",
         "- /diff: Open Latest Diff",
         "- /rename <title>: Rename session",
         "- /skills [--reload]: Browse skills",
+        "- /plugins install <marketplace> <plugin>: Install plugin",
         mineSelected
           ? "- /agents: Browse agents"
           : "- /agents: Browse agents (codex sessions only)",
@@ -5172,6 +5425,28 @@ async function showSkillsActionCard(
   schedulePersistRuntime(session.id);
 }
 
+async function refreshSkillIndexForSession(
+  session: Session,
+  opts?: { forceReload?: boolean },
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  chatView?.invalidateSkillIndex(session.id);
+  const entries = await backendManager.listSkillsForSession(session, {
+    forceReload: opts?.forceReload ?? false,
+  });
+  const entry = entries[0] ?? null;
+  const skills = entry?.skills ?? [];
+  chatView?.postSkillIndex(
+    session.id,
+    skills.map((s) => ({
+      name: s.name,
+      description: s.description,
+      scope: s.scope,
+      path: s.path,
+    })),
+  );
+}
+
 async function showDebugConfigActionCard(
   session: Session,
   opts?: { cardId?: string },
@@ -5336,7 +5611,7 @@ async function handleActionCardAction(args: {
         id: newLocalId("remoteSkillDownloaded"),
         type: "info",
         title: "Remote skill downloaded",
-        text: `${res.name} → ${res.path}`,
+        text: `${action.remote.name} → ${res.path}`,
       });
       chatView?.invalidateSkillIndex(session.id);
       await showSkillsActionCard(session, {
@@ -5654,6 +5929,7 @@ function setActiveSession(
     setSessionModelState(sessionId, {
       model: null,
       provider: null,
+      serviceTier: null,
       reasoning: null,
       agent: null,
     });
@@ -5919,9 +6195,10 @@ async function readModelStateFromConfig(
     const parsed = parseToml(raw) as Record<string, unknown>;
     const model = pickString(parsed["model"]);
     const provider = pickString(parsed["model_provider"]);
+    const serviceTier = normalizeServiceTier(parsed["service_tier"]);
     const reasoning = pickString(parsed["model_reasoning_effort"]);
-    if (!model && !provider && !reasoning) return null;
-    return { model, provider, reasoning, agent: null };
+    if (!model && !provider && !serviceTier && !reasoning) return null;
+    return { model, provider, serviceTier, reasoning, agent: null };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     output.appendLine(
@@ -5933,6 +6210,10 @@ async function readModelStateFromConfig(
 
 function pickString(v: unknown): string | null {
   return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+
+function normalizeServiceTier(v: unknown): ServiceTier | null {
+  return v === "fast" || v === "flex" ? v : null;
 }
 
 function formatHumanCount(n: number): string {
@@ -6623,6 +6904,9 @@ function getUiDefaultModelState(session: Session | null): ModelState {
       return {
         model: cfg.model ?? null,
         provider: cfg.model_provider ?? null,
+        serviceTier: normalizeServiceTier(
+          (cfg as Record<string, unknown>)["service_tier"],
+        ),
         reasoning: cfg.model_reasoning_effort ?? null,
         agent: null,
       };
@@ -6923,6 +7207,21 @@ function applyServerNotification(
         rt.threadStatus = status;
         sessionTree?.refresh();
         chatView?.refresh();
+      }
+      return;
+    }
+    case "skills/changed": {
+      const session = sessions?.getById(sessionId) ?? null;
+      if (session) {
+        void refreshSkillIndexForSession(session, { forceReload: true }).catch(
+          (err) => {
+            outputChannel?.appendLine(
+              `[skills] Failed to refresh skills after skills/changed: ${String(err)}`,
+            );
+          },
+        );
+      } else {
+        chatView?.invalidateSkillIndex(sessionId);
       }
       return;
     }
@@ -9352,10 +9651,17 @@ function applyGlobalNotification(
           : null;
       if (session && !isSessionModelOverrideExplicit(session.id)) {
         const st = getSessionModelState(session.id);
-        if (st.model || st.provider || st.reasoning || st.agent) {
+        if (
+          st.model ||
+          st.provider ||
+          st.serviceTier ||
+          st.reasoning ||
+          st.agent
+        ) {
           setSessionModelState(session.id, {
             model: null,
             provider: null,
+            serviceTier: null,
             reasoning: null,
             agent: null,
           });
@@ -9720,31 +10026,17 @@ function applyCodexEvent(
   }
 
   if (type === "skills_update_available" || type === "skillsUpdateAvailable") {
-    chatView?.invalidateSkillIndex(sessionId);
-    if (backendManager) {
-      const session = sessions?.getById(sessionId) ?? null;
-      if (session) {
-        void backendManager
-          .listSkillsForSession(session, { forceReload: true })
-          .then((entries) => {
-            const entry = entries[0] ?? null;
-            const skills = entry?.skills ?? [];
-            chatView?.postSkillIndex(
-              session.id,
-              skills.map((s) => ({
-                name: s.name,
-                description: s.description,
-                scope: s.scope,
-                path: s.path,
-              })),
-            );
-          })
-          .catch((err) => {
-            outputChannel?.appendLine(
-              `[skills] Failed to refresh skills after update: ${String(err)}`,
-            );
-          });
-      }
+    const session = sessions?.getById(sessionId) ?? null;
+    if (session) {
+      void refreshSkillIndexForSession(session, { forceReload: true }).catch(
+        (err) => {
+          outputChannel?.appendLine(
+            `[skills] Failed to refresh skills after update: ${String(err)}`,
+          );
+        },
+      );
+    } else {
+      chatView?.invalidateSkillIndex(sessionId);
     }
     return;
   }
@@ -10090,6 +10382,61 @@ function formatApprovalDetail(
     if (method === "item/fileChange/requestApproval") {
       const paramsGrantRoot = anyParams["grantRoot"];
       if (typeof paramsGrantRoot === "string") grantRoot = paramsGrantRoot;
+    }
+    if (method === "item/permissions/requestApproval") {
+      const permissions =
+        typeof anyParams["permissions"] === "object" &&
+        anyParams["permissions"] !== null
+          ? (anyParams["permissions"] as Record<string, unknown>)
+          : null;
+      const network =
+        permissions &&
+        typeof permissions["network"] === "object" &&
+        permissions["network"] !== null
+          ? (permissions["network"] as Record<string, unknown>)
+          : null;
+      const fileSystem =
+        permissions &&
+        typeof permissions["fileSystem"] === "object" &&
+        permissions["fileSystem"] !== null
+          ? (permissions["fileSystem"] as Record<string, unknown>)
+          : null;
+      if (network) {
+        const kind =
+          typeof network["kind"] === "string" ? network["kind"] : "network";
+        const rules = Array.isArray(network["rules"])
+          ? (network["rules"] as unknown[])
+              .map((rule) => {
+                if (typeof rule !== "object" || rule === null) return "";
+                const rr = rule as Record<string, unknown>;
+                const action =
+                  typeof rr["action"] === "string" ? rr["action"] : "";
+                const host = typeof rr["host"] === "string" ? rr["host"] : "";
+                return action && host ? `${action} ${host}` : "";
+              })
+              .filter(Boolean)
+          : [];
+        lines.push(
+          rules.length > 0
+            ? `permissions.network: ${kind} (${rules.join(", ")})`
+            : `permissions.network: ${kind}`,
+        );
+      }
+      if (fileSystem) {
+        const read = Array.isArray(fileSystem["read"])
+          ? (fileSystem["read"] as unknown[]).filter(
+              (v): v is string => typeof v === "string",
+            )
+          : [];
+        const write = Array.isArray(fileSystem["write"])
+          ? (fileSystem["write"] as unknown[]).filter(
+              (v): v is string => typeof v === "string",
+            )
+          : [];
+        if (read.length > 0) lines.push(`permissions.read: ${read.join(", ")}`);
+        if (write.length > 0)
+          lines.push(`permissions.write: ${write.join(", ")}`);
+      }
     }
     if (method === "item/commandExecution/requestApproval") {
       const networkCtx =

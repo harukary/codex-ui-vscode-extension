@@ -363,8 +363,11 @@ export class OpencodeHttpClient {
           // Encode `providerID:modelID` so we can recover both on send.
           model: key,
           upgrade: null,
+          upgradeInfo: null,
+          availabilityNux: null,
           displayName: `${providerName} / ${m.name}`,
           description: "",
+          hidden: false,
           supportedReasoningEfforts: effortsInOrder.map((effort) => ({
             reasoningEffort: effort as any,
             description: "",
@@ -479,6 +482,7 @@ export class OpencodeHttpClient {
       return {
         root,
         path: filePath,
+        match_type: "file" as const,
         file_name: path.basename(filePath),
         score: 0,
         indices: null,

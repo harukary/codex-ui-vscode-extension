@@ -23,7 +23,8 @@ Important notes:
 
 This extension **does not bundle any CLI**. Install the backends you want to use and make sure they are available in your `PATH`:
 
-- `codex` (for the `codex` backend)
+- `codex` `>= 0.110.0` (for the `codex` backend)
+- Recommended stable: `codex` `>= 0.116.0`
 - `opencode` (for the `opencode` backend)
 
 Or set absolute paths via settings (see below).
@@ -41,7 +42,12 @@ Or set absolute paths via settings (see below).
 
 - **Rewind/Edit**: supported for `codex` and `opencode` sessions.
 - **Accounts / login UI**: available on `codex` sessions (`opencode` does not use the same account flow).
+- **ChatGPT login**: on `codex` sessions, Settings supports both browser login and device-code login.
 - **Account create/switch** (`account/list`, `account/switch`) is not supported in this extension.
+- **Fast tier**: use `/fast` to switch the codex session service tier (`fast`, `flex`, or default).
+- **Plugins**: use `/plugins install <marketplace> <plugin>`, `/plugins list`, and `/plugins uninstall <pluginId>` on codex sessions.
+- **MCP approvals**: MCP permission requests and MCP elicitation-based tool approvals are supported in the codex backend.
+- **Codex version policy**: versions below `0.116.0` are treated as deprecated. They may still work for basic flows, but new features and compatibility work target `0.116.0+`.
 - **OpenCode tool output**: rendered as Step/Tool cards optimized to avoid tool-spam.
 
 ## Settings
