@@ -4,9 +4,9 @@ This document describes the current behavior of the extension (what it does toda
 
 ## 1. Terminology
 
-- **Backend**: Codex CLI running `app-server`.
+- **Backend**: One of the supported CLI integrations (`codex`, `codez`, `opencode`).
 - **Session**: A chat session tracked by the extension (mapped to a backend thread).
-- **Thread**: Backend concept (thread id, persisted by Codex CLI).
+- **Thread**: Backend concept (thread id, persisted by the selected backend).
 - **Block**: A rendered item in the chat log (user/assistant/reasoning/tool/etc).
 
 ## 2. Views
@@ -18,7 +18,9 @@ The extension contributes a **Codex UI** activity bar container with:
 
 ## 3. Backend lifecycle
 
-- The backend command defaults to `codex` and args default to `["app-server"]`.
+- `codex` defaults to command `codex` + args `["app-server"]`.
+- `codez` defaults to command `codez` + args `["app-server"]`.
+- `opencode` defaults to command `opencode` + args `["serve"]`.
 - The extension can start a backend per workspace folder (keyed by the workspace folder URI).
 - If a backend is already running for a workspace folder, the extension reuses it.
 - The extension avoids noisy notifications for backend start/reuse.

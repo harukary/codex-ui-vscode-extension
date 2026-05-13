@@ -74,9 +74,11 @@ Or set absolute paths via settings (see below).
 2. (Re)generate protocol bindings (if missing / after protocol changes)
 
    ```bash
-   cd ../codex-rs && cargo build -p codex-cli
-   cd ../vscode-extension && pnpm run regen:protocol
+   pnpm run regen:protocol
    ```
+
+   - `regen:protocol` は `CODEX_BIN` / `--codex-bin` / `codex` の順で解決する。
+   - `codex` が `PATH` に無い場合は `pnpm run regen:protocol -- --codex-bin /absolute/path/to/codex` か `CODEX_BIN=/absolute/path/to/codex pnpm run regen:protocol` を使う。
 
 3. Build
 
@@ -84,7 +86,13 @@ Or set absolute paths via settings (see below).
    pnpm run compile
    ```
 
-4. Run in VS Code
+4. Run unit tests
+
+   ```bash
+   pnpm run test:unit
+   ```
+
+5. Run in VS Code
    - Open this repo in VS Code
    - Run the debug configuration: **Run Extension (Codex UI)**
 
